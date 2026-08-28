@@ -1,0 +1,36 @@
+{
+  "default": "complete",
+  "overrides": {
+    "asset_G501": {
+      "analyses": "inconclusive",
+      "rms": "unavailable",
+      "data_quality": "partial",
+      "baseline": "partial"
+    },
+    "asset_C710": {
+      "rms": "complete"
+    },
+    "asset_S420": {
+      "analyses": "conflict"
+    },
+    "asset_M208": {
+      "analyses": "partial"
+    },
+    "asset_M605": {
+      "spectrum": "partial"
+    },
+    "asset_V301": {
+      "data_quality": "partial"
+    },
+    "asset_M205": {
+      "analyses": "conflict"
+    }
+  },
+  "distribution": {
+    "complete": 0.6,
+    "partial": 0.15,
+    "inconclusive": 0.1,
+    "conflict": 0.08,
+    "unavailable": 0.07
+  }
+}

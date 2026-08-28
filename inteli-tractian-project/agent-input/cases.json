@@ -1,0 +1,138 @@
+[
+  {
+    "id": "case_tkt_inv_04",
+    "ticket_id": "TKT-INV-04",
+    "company_id": "comp_mineracao_andes",
+    "user_id": "usr_pedro",
+    "asset_id": "asset_G501",
+    "message": "O redutor da correia transportadora quebrou ontem e eu não recebi nenhum aviso. Por quê?"
+  },
+  {
+    "id": "case_tkt_inv_05",
+    "ticket_id": "TKT-INV-05",
+    "company_id": "comp_petro_delta",
+    "user_id": "usr_sofia",
+    "asset_id": "asset_C710",
+    "message": "Tô vendo o RMS do compressor subindo há duas semanas, mas não recebi insight nenhum. Cadê o diagnóstico?"
+  },
+  {
+    "id": "case_tkt_inv_06",
+    "ticket_id": "TKT-INV-06",
+    "company_id": "comp_acme",
+    "user_id": "usr_bruno",
+    "asset_id": "asset_S420",
+    "message": "Recebi um insight dizendo desbalanceamento no spindle, mas a máquina tá rodando lisa. Isso não é nada."
+  },
+  {
+    "id": "case_tkt_inv_07",
+    "ticket_id": "TKT-INV-07",
+    "company_id": "comp_texfil",
+    "user_id": "usr_raul",
+    "asset_id": "asset_M605",
+    "message": "A vibração do motor subiu de uma hora pra outra. Pode ser problema elétrico?"
+  },
+  {
+    "id": "case_tkt_inv_08",
+    "ticket_id": "TKT-INV-08",
+    "company_id": "comp_cimento_vale",
+    "user_id": "usr_carla",
+    "asset_id": "asset_M205",
+    "message": "O sistema falou desalinhamento, mas o relatório do especialista diz base solta. Em quem eu acredito?"
+  },
+  {
+    "id": "case_tkt_inv_09",
+    "ticket_id": "TKT-INV-09",
+    "company_id": "comp_aurora",
+    "user_id": "usr_lucas",
+    "asset_id": "asset_B204",
+    "message": "Já troquei o rolamento faz três dias, mas o insight continua dizendo falha. Tá desatualizado."
+  },
+  {
+    "id": "case_tkt_inv_10",
+    "ticket_id": "TKT-INV-10",
+    "company_id": "comp_papel_sul",
+    "user_id": "usr_marta",
+    "asset_id": "asset_V301",
+    "message": "A qualidade do sinal do sensor do ventilador tá péssima. Posso confiar no insight?"
+  },
+  {
+    "id": "case_tkt_inv_11",
+    "ticket_id": "TKT-INV-11",
+    "company_id": "comp_forja_br",
+    "user_id": "usr_ana",
+    "asset_id": "asset_M102",
+    "message": "Esse motor de corrente contínua é antigo. O modelo de vocês atende esse tipo?"
+  },
+  {
+    "id": "case_tkt_inv_11b",
+    "ticket_id": "TKT-INV-11b",
+    "company_id": "comp_cimento_vale",
+    "user_id": "usr_gustavo",
+    "asset_id": "asset_M208",
+    "message": "O sistema apontou falta de lubrificação no motor, mas a gente instalou ele semana passada — ainda nem tem histórico. Como detecta sem baseline?"
+  },
+  {
+    "id": "case_tkt_exe_12",
+    "ticket_id": "TKT-EXE-12",
+    "company_id": "comp_aurora",
+    "user_id": "usr_lucas",
+    "asset_id": "asset_B204",
+    "message": "Troquei o rolamento da bomba. Reprocessa a análise pra ver se melhorou."
+  },
+  {
+    "id": "case_tkt_exe_16",
+    "ticket_id": "TKT-EXE-16",
+    "company_id": "comp_mineracao_andes",
+    "user_id": "usr_pedro",
+    "asset_id": "asset_G501",
+    "message": "Isso aqui ultrapassa o suporte remoto — preciso de campo. Encaminha pra alguém."
+  },
+  {
+    "id": "case_tkt_ctx_01",
+    "ticket_id": "TKT-CTX-01",
+    "company_id": "comp_forja_br",
+    "user_id": "usr_ana",
+    "asset_id": "asset_M101",
+    "message": "Qual o procedimento pra trocar o rolamento do motor principal da forja? Tem alguma orientação de间隙 e torque?"
+  },
+  {
+    "id": "case_tkt_ctx_02",
+    "ticket_id": "TKT-CTX-02",
+    "company_id": "comp_aurora",
+    "user_id": "usr_lucas",
+    "asset_id": "asset_B204",
+    "message": "O relatório fala em BPFO. O que é isso? E por que aparece no meu espectro?"
+  },
+  {
+    "id": "case_tkt_ctx_03",
+    "ticket_id": "TKT-CTX-03",
+    "company_id": "comp_papel_sul",
+    "user_id": "usr_marta",
+    "asset_id": "asset_V301",
+    "message": "O sistema marcou alarme no ventilador. A partir de qual valor de RMS vocês consideram alarme? É uma tabela fixa?"
+  },
+  {
+    "id": "case_tkt_exe_13",
+    "ticket_id": "TKT-EXE-13",
+    "company_id": "comp_petro_delta",
+    "user_id": "usr_sofia",
+    "asset_id": "asset_C710",
+    "message": "Esse compressor tá com comportamento estranho e o insight não convence. Quero que um especialista da Tractian veja."
+  },
+  {
+    "id": "case_tkt_exe_14",
+    "ticket_id": "TKT-EXE-14",
+    "company_id": "comp_papel_sul",
+    "user_id": "usr_helena",
+    "asset_id": "asset_V301",
+    "message": "Esse ventilador não é mais crítico pra produção. Muda a criticidade pra média."
+  },
+  {
+    "id": "case_tkt_exe_15",
+    "ticket_id": "TKT-EXE-15",
+    "company_id": "comp_acme",
+    "user_id": "usr_carla",
+    "asset_id": "asset_S420",
+    "message": "Esse insight nunca acerta pro spindle de alta rotação. Treina de novo com os dados daqui."
+  }
+]

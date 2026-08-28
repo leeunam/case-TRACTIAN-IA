@@ -1,0 +1,642 @@
+openapi: 3.1.0
+info:
+  title: Tractian Industrial Support API (Challenge Inteli)
+  description: |
+    API industrial simplificada para o Challenge "Engenharia e Avaliação de Agentes Industriais".
+    Dados sintéticos, anonimizados. Serve como contexto comum às duas partes do projeto
+    (construção e avaliação do agente).
+
+    ## Comportamento probabilístico
+    Os endpoints de **consulta** (GET) podem retornar variações controladas por `seed`:
+    - `complete` — retorno completo
+    - `partial` — informação parcial (campos/etapas faltantes)
+    - `inconclusive` — resultado inconclusivo
+    - `conflict` — conflito entre fontes
+    - `unavailable` — indisponibilidade temporária
+
+    O `seed` (query param) torna o comportamento determinístico para reprodutibilidade na
+    avaliação. Sem `seed`, o comportamento é amostrado por uma distribuição fixa.
+
+    ## Ações de alto impacto
+    As operações de escrita (POST/PATCH de impacto) exigem **parâmetros válidos + `justification`**
+    (string ≥ 20 chars justificando a ação). Uma chamada aceita representa a execução e retorna
+    sucesso, **sem ciclo adicional de status**.
+
+    ## Autenticação
+    `x-user-id` header identifica a pessoa usuária (perfil/permissões) do contexto. Sem token.
+  version: 0.1.0
+  contact:
+    name: TRACTIAN x Inteli — Challenge
+servers:
+  - url: http://localhost:8000
+    description: Ambiente local de demonstração
+
+# ---------------------------------------------------------------------------
+# Convenções de resposta
+#   - Cada GET de consulta pode envolver o corpo em um envelope {status, data, mode, notes?}
+#     onde `mode` ∈ complete|partial|inconclusive|conflict|unavailable reflete o comportamento.
+#   - `notes` descreve o que falta / o motivo do conflito / indisponibilidade.
+# ---------------------------------------------------------------------------
+
+components:
+  securitySchemes:
+    UserContext:
+      type: apiKey
+      in: header
+      name: x-user-id
+      description: ID da pessoa usuária (define perfil/permissões e contexto de empresa).
+
+  parameters:
+    Seed:
+      name: seed
+      in: query
+      description: Semente para tornar o comportamento probabilístico determinístico.
+      required: false
+      schema: { type: string }
+
+  schemas:
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, examples: [VALIDATION_ERROR, UNAUTHORIZED, CONFLICT, UNAVAILABLE] }
+        message: { type: string }
+
+    Company:
+      type: object
+      properties:
+        id: { type: string, examples: [comp_forja_br] }
+        name: { type: string, examples: [Forja Brasil] }
+        segment: { type: string, examples: [metalurgia] }
+        timezone: { type: string, examples: [America/Sao_Paulo] }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, examples: [usr_001] }
+        name: { type: string, examples: [Ana Mantovani] }
+        role: { type: string, enum: [operator, mechanic, reliability_analyst, maintenance_manager, coordinator, engineer, electrician] }
+        permissions:
+          type: array
+          items: { type: string, enum: [read, action_low, action_high, escalate] }
+        company_id: { type: string }
+
+    AssetConfig:
+      type: object
+      description: Configuração técnica do ativo (usada em contexto de diagnóstico).
+      properties:
+        machine_type: { type: string, examples: [motor_induction, motor_dc, pump, compressor, gearbox, fan, spindle, conveyor] }
+        rotation_rpm: { type: number, examples: [1780] }
+        bearing_specs:
+          type: object
+          properties:
+            part_number: { type: string, examples: [NU 310] }
+            bpfo_hz: { type: number }
+            bpfi_hz: { type: number }
+            bsf_hz: { type: number }
+            ftf_hz: { type: number }
+        line_frequency_hz: { type: number, examples: [60] }
+
+    Baseline:
+      type: object
+      description: |
+        Estado "normal" aprendido do próprio ativo/ponto (aprendizado prévio do estado normal;
+        falhas por desvio são detectadas comparando o sinal atual a este baseline). Não usa normas ISO.
+        Falhas sintomáticas (ex.: lubrificação) não dependem de baseline.
+      properties:
+        asset_id: { type: string }
+        point_id: { type: string }
+        state: { type: string, enum: [learning, established, invalidated] }
+        detection_mode: { type: string, enum: [baseline, symptom], description: "baseline = detecção por desvio; symptom = detecção sintomática (lubrificação)" }
+        established_at: { type: string, format: date-time, nullable: true }
+        invalidated_at: { type: string, format: date-time, nullable: true }
+        invalidation_reason: { type: string, nullable: true, examples: [maintenance_intervention, config_change] }
+        features:
+          type: array
+          description: Bandas/métricas que compõem o baseline com seus valores de referência.
+          items:
+            type: object
+            properties:
+              feature: { type: string, examples: [rms_mm_s, bpfo_amplitude, shock_pulse] }
+              reference: { type: number }
+              tolerance: { type: number }
+        learnable: { type: boolean, description: "Se o modelo consegue aprender baseline para este ativo/tipo" }
+
+    Asset:
+      type: object
+      properties:
+        id: { type: string, examples: [asset_M101] }
+        name: { type: string, examples: [Motor principal da forja] }
+        company_id: { type: string }
+        criticality: { type: string, enum: [low, medium, high, critical] }
+        hierarchy:
+          type: object
+          properties:
+            plant: { type: string }
+            line: { type: string }
+            parent_asset_id: { type: string, nullable: true }
+        points:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              location: { type: string, examples: [DE, NDE, axial] }
+              sensor_status: { type: string, enum: [online, offline, degraded] }
+        config: { $ref: '#/components/schemas/AssetConfig' }
+
+    Analysis:
+      type: object
+      description: Diagnóstico automático (insight) do modelo.
+      properties:
+        id: { type: string, examples: [an_9901] }
+        asset_id: { type: string }
+        point_id: { type: string }
+        type: { type: string, examples: [imbalance, misalignment, bearing_fault, electrical_fault, looseness, lubrication] }
+        detection_mode: { type: string, enum: [baseline, symptom], description: "baseline = desvio do estado normal aprendido; symptom = presença do sintoma (ex.: lubrificação)" }
+        severity: { type: string, enum: [none, low, medium, high, critical] }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        baseline_state_at_detection: { type: string, enum: [learning, established, invalidated, not_applicable], description: "Estado do baseline quando a detecção ocorreu (not_applicable p/ falhas sintomáticas)" }
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              metric: { type: string, examples: [bpfo_amplitude] }
+              value: { type: number }
+              reference: { type: number, nullable: true, description: "Valor de referência do baseline (null p/ detecção sintomática)" }
+              note: { type: string }
+        limitations:
+          type: array
+          items: { type: string, examples: [low_signal_quality, coverage_partial, baseline_learning, baseline_invalidated] }
+        model_version: { type: string }
+        created_at: { type: string, format: date-time }
+        status: { type: string, enum: [current, stale, pending, inconclusive] }
+
+    RmsSeries:
+      type: object
+      properties:
+        asset_id: { type: string }
+        point_id: { type: string }
+        unit: { type: string, examples: [mm/s] }
+        baseline_reference: { type: number, nullable: true, description: "RMS de referência do baseline aprendido (mm/s); null se baseline em learning ou falha sintomática" }
+        baseline_state: { type: string, enum: [learning, established, invalidated, not_applicable] }
+        alarm_threshold: { type: number, nullable: true, description: "Limiar de alarme derivado do baseline (reference + tolerância)" }
+        samples:
+          type: array
+          items:
+            type: object
+            properties:
+              ts: { type: string, format: date-time }
+              value: { type: number }
+
+    Spectrum:
+      type: object
+      description: Espectro FFT simplificado (picos relevantes + bandas).
+      properties:
+        asset_id: { type: string }
+        point_id: { type: string }
+        frequency_resolution_hz: { type: number }
+        peaks:
+          type: array
+          items:
+            type: object
+            properties:
+              freq_hz: { type: number }
+              amplitude_mm_s: { type: number }
+              note: { type: string, nullable: true } # ex.: "1x", "BPFO", "2x line"
+        bands_missing:
+          type: array
+          items: { type: string } # presente apenas em modo partial
+        collected_at: { type: string, format: date-time }
+
+    DataQuality:
+      type: object
+      properties:
+        asset_id: { type: string }
+        point_id: { type: string }
+        completeness: { type: number, minimum: 0, maximum: 1 }
+        freshness_minutes: { type: integer } # minutos desde última amostra válida
+        snr_db: { type: number }
+        staleness_flag: { type: boolean }
+
+    Model:
+      type: object
+      properties:
+        id: { type: string, examples: [mdl_vib_v3] }
+        version: { type: string, examples: [3.2.1] }
+        coverage:
+          type: array
+          items:
+            type: object
+            properties:
+              machine_type: { type: string }
+              supported: { type: boolean, enum: [true, false] }
+              can_learn_baseline: { type: boolean, description: "Se o modelo consegue aprender baseline para este tipo (false → só detecção sintomática)" }
+              note: { type: string, nullable: true }
+        requirements:
+          type: object
+          properties:
+            min_completeness: { type: number }
+            min_snr_db: { type: number }
+            min_rotation_rpm: { type: number, nullable: true }
+        processing_state: { type: string, enum: [idle, running, pending, delayed, failed] }
+        last_run_at: { type: string, format: date-time, nullable: true }
+
+    KnowledgeDoc:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [procedure, glossary, guidance] }
+        title: { type: string }
+        body: { type: string }
+        tags: { type: array, items: { type: string } }
+
+    QueryEnvelope:
+      type: object
+      description: Envelope de consulta com modo probabilístico.
+      properties:
+        mode: { type: string, enum: [complete, partial, inconclusive, conflict, unavailable] }
+        notes: { type: string, nullable: true }
+        data: {} # payload específico do endpoint
+
+    ActionRequest:
+      type: object
+      required: [justification]
+      properties:
+        justification:
+          type: string
+          minLength: 20
+          description: Justificativa da ação (≥ 20 caracteres).
+        params:
+          type: object
+          description: Parâmetros específicos da ação.
+          additionalProperties: true
+
+    ActionResult:
+      type: object
+      properties:
+        accepted: { type: boolean }
+        action_id: { type: string }
+        message: { type: string }
+
+paths:
+
+  # ---- Contexto ---------------------------------------------------------
+  /companies/{companyId}:
+    get:
+      tags: [Contexto]
+      operationId: getCompany
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: companyId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Empresa.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryEnvelope' }
+        '404': { description: Não encontrado. }
+
+  /companies/{companyId}/assets:
+    get:
+      tags: [Contexto]
+      operationId: listAssetsByCompany
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: companyId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Lista de ativos da empresa. }
+
+  /users/me:
+    get:
+      tags: [Contexto]
+      operationId: getCurrentUser
+      security: [{ UserContext: [] }]
+      responses:
+        '200':
+          description: Pessoa usuária autenticada (perfil/permissões).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  # ---- Ativos -----------------------------------------------------------
+  /assets/{assetId}:
+    get:
+      tags: [Ativos]
+      operationId: getAsset
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: assetId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Ativo com config técnica e hierarquia.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryEnvelope' }
+
+  /assets/{assetId}:
+    patch:
+      tags: [Ativos]
+      operationId: updateAssetConfig
+      description: Altera criticidade/configuração técnica. Ação de impacto.
+      security: [{ UserContext: [] }]
+      parameters:
+        - name: assetId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/ActionRequest'
+                - type: object
+                  properties:
+                    changes:
+                      type: object
+                      properties:
+                        criticality: { type: string, enum: [low, medium, high, critical] }
+                        config: { $ref: '#/components/schemas/AssetConfig' }
+      responses:
+        '200':
+          description: Configuração atualizada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionResult' }
+        '400': { description: Justificativa ausente/inválida. }
+        '403': { description: Sem permissão (action_high). }
+
+  # ---- Análises ---------------------------------------------------------
+  /assets/{assetId}/analyses:
+    get:
+      tags: [Análises]
+      operationId: listAnalyses
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: assetId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [current, stale, pending, inconclusive] }
+      responses:
+        '200': { description: Lista de análises do ativo. }
+
+  /analyses/{analysisId}:
+    get:
+      tags: [Análises]
+      operationId: getAnalysis
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: analysisId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Detalhe da análise (evidência, confiança, limitações).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryEnvelope' }
+
+  /analyses/{analysisId}/reprocess:
+    post:
+      tags: [Análises]
+      operationId: reprocessAnalysis
+      description: Reprocessa análise. Ação de impacto; exige justificativa. Sucesso sem ciclo de status.
+      security: [{ UserContext: [] }]
+      parameters:
+        - name: analysisId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActionRequest' }
+      responses:
+        '200':
+          description: Reprocesso aceito.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionResult' }
+        '400': { description: Justificativa ausente/inválida. }
+
+  /analyses/{analysisId}/request-specialist:
+    post:
+      tags: [Análises]
+      operationId: requestSpecialistAnalysis
+      description: Solicita análise especializada. Ação de impacto; exige justificativa.
+      security: [{ UserContext: [] }]
+      parameters:
+        - name: analysisId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActionRequest' }
+      responses:
+        '200':
+          description: Acionamento aceito.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionResult' }
+
+  # ---- Dados técnicos ---------------------------------------------------
+  /assets/{assetId}/baseline:
+    get:
+      tags: [Dados técnicos]
+      operationId: getBaseline
+      description: |
+        Estado "normal" aprendido do ativo/ponto. Permite explicar por que um insight não foi
+        gerado (baseline em `learning`), por que está desatualizado (`invalidated` após manutenção)
+        e como uma falha foi detectada (desvio vs. `symptom`). Falhas sintomáticas (lubrificação)
+        retornam `detection_mode = symptom` e `learnable = false`.
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: assetId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: point_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Baseline aprendido.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryEnvelope' }
+
+  /assets/{assetId}/rms:
+    get:
+      tags: [Dados técnicos]
+      operationId: getRmsSeries
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: assetId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: point_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Série temporal de RMS.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryEnvelope' }
+
+  /assets/{assetId}/spectrum:
+    get:
+      tags: [Dados técnicos]
+      operationId: getSpectrum
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: assetId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: point_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Espectro FFT.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryEnvelope' }
+
+  /assets/{assetId}/data-quality:
+    get:
+      tags: [Dados técnicos]
+      operationId: getDataQuality
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: assetId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Qualidade/frescor dos dados.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryEnvelope' }
+
+  # ---- Modelos ----------------------------------------------------------
+  /models/{modelId}:
+    get:
+      tags: [Modelos]
+      operationId: getModel
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: modelId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Versão, cobertura, requisitos, estado de processamento.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryEnvelope' }
+
+  /models/{modelId}/request-retraining:
+    post:
+      tags: [Modelos]
+      operationId: requestRetraining
+      description: Solicita retreinamento. Ação de alto impacto; exige justificativa forte.
+      security: [{ UserContext: [] }]
+      parameters:
+        - name: modelId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActionRequest' }
+      responses:
+        '200':
+          description: Solicitação aceita.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionResult' }
+
+  # ---- Conhecimento -----------------------------------------------------
+  /knowledge/search:
+    get:
+      tags: [Conhecimento]
+      operationId: searchKnowledge
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+        - name: type
+          in: query
+          schema: { type: string, enum: [procedure, glossary, guidance] }
+      responses:
+        '200': { description: Documentos relevantes. }
+
+  /knowledge/{docId}:
+    get:
+      tags: [Conhecimento]
+      operationId: getKnowledgeDoc
+      parameters:
+        - $ref: '#/components/parameters/Seed'
+        - name: docId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Documento de conhecimento. }
+
+  # ---- Ações / Escalonamento -------------------------------------------
+  /cases/{caseId}/escalate:
+    post:
+      tags: [Ações]
+      operationId: escalateCase
+      description: Encaminha o caso para análise humana. Ação de impacto; exige justificativa.
+      security: [{ UserContext: [] }]
+      parameters:
+        - name: caseId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActionRequest' }
+      responses:
+        '200':
+          description: Escalonamento aceito.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionResult' }
+
+security:
+  - UserContext: []
