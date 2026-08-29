@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** simulador FastAPI, dados, contrato, cenários e 39 testes estão disponíveis. Agente LangGraph, persistência, observabilidade e avaliação ainda serão implementados conforme [`TASKS.md`](./TASKS.md).
+> **Estado atual:** simulador FastAPI, dados, contrato, cenários e 59 testes estão disponíveis. A persistência idempotente da Fase 1 está concluída; agente LangGraph, checkpointer, observabilidade e avaliação ainda serão implementados conforme [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -46,11 +46,15 @@ O **ledger de evidências** vive no estado da execução e associa afirmações 
 
 ### Persistência e idempotência
 
-- SQLite será usado como checkpointer no desenvolvimento; PostgreSQL é a evolução esperada.
-- A primeira ação idempotente será `POST /analyses/{analysisId}/reprocess`.
-- A aplicação gera a `Idempotency-Key`, salva antes da chamada e reutiliza em retries.
-- Mesma chave e mesmo payload retornam a resposta original; mesma chave e payload diferente retornam `409 Conflict`.
-- A garantia precisa ser atômica e testada também com concorrência e timeout depois da ação, mas antes da resposta.
+- SQLite armazena a idempotência no desenvolvimento e também será usado pelo futuro checkpointer; PostgreSQL é a evolução esperada.
+- O arquivo usa `IDEMPOTENCY_DB_PATH`; sem a variável, fica em `.run/idempotency.sqlite3`. `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS` altera o limite de processamento, cujo padrão é 300 segundos.
+- O primeiro alvo de idempotência é `POST /analyses/{analysisId}/reprocess`.
+- A API exige uma `Idempotency-Key` de 1 a 255 caracteres sem espaços, reserva a intenção antes da ação, persiste respostas concluídas em SQLite e faz replay mesmo após recriar o armazenamento; mesma chave com payload diferente retorna `409 Conflict`.
+- O futuro cliente do agente gerará uma chave nova para cada intenção, a guardará antes da primeira chamada e reutilizará essa chave somente em retries do mesmo pedido.
+- A reserva é atômica: enquanto a primeira chamada está em execução, uma chamada concorrente com a mesma intenção recebe `409 IDEMPOTENCY_IN_PROGRESS` e não cria outra ação. Uma falha inesperada durante a ação marca o resultado como `uncertain`; retries recebem `409 IDEMPOTENCY_OUTCOME_UNKNOWN` em vez de repetir a ação.
+- Um registro `processing` com mais de 300 segundos, ou o limite definido em `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS`, muda para `uncertain` sem repetir a ação.
+- Registros vencidos são removidos sob demanda depois de 7 dias; a mesma chave, após esse prazo, inicia uma nova execução. O horário de criação identifica cada geração e impede que um trabalho antigo altere a reserva nova.
+- Se a resposta se perde depois do commit, o retry recupera a resposta persistida sem repetir a ação.
 
 ### Modelos
 

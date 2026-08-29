@@ -20,3 +20,8 @@ class ActionResult(BaseModel):
     accepted: bool = True
     action_id: str
     message: str
+
+
+class Error(BaseModel):
+    code: str
+    message: str

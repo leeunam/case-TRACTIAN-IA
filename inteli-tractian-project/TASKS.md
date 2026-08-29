@@ -41,7 +41,7 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 - [x] Simulador FastAPI, dados e empacotamento do benchmark.
 - [x] Contrato, schema, cenários e vocabulário reunidos.
-- [x] Suíte-base com 39 testes.
+- [x] Suíte-base inicial com 39 testes.
 - [x] Arquitetura e ordem de aprendizagem definidas.
 
 ## Fase 1 — idempotência do reprocessamento
@@ -50,14 +50,34 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decidir durante a etapa:** tabela SQLite, formato da chave, retenção, representação da resposta persistida e ponto exato usado para simular timeout.
 
-- [ ] Exigir `Idempotency-Key` em `POST /analyses/{analysisId}/reprocess`.
-- [ ] Persistir chave, usuário, método, endpoint, hash do payload, status e resposta original.
-- [ ] Retornar a resposta original para mesma chave e mesmo payload.
-- [ ] Retornar `409 Conflict` para mesma chave e payload diferente.
-- [ ] Garantir atomicidade para duas requisições concorrentes.
-- [ ] Testar primeira execução, replay, conflito, concorrência e timeout após a ação/commit antes da resposta.
+**Decisões implementadas:** a API exige `Idempotency-Key` de 1 a 255 caracteres sem espaços; valores ausentes ou inválidos retornam `400 VALIDATION_ERROR`. Uma nova intenção usa uma nova chave, enquanto retries do mesmo pedido reutilizam a chave. O desenho abaixo descreve a persistência entregue.
 
-**Aceite:** nenhum retry ou acesso concorrente cria dois trabalhos para a mesma intenção.
+**Persistência entregue:**
+
+- Criar `api/app/idempotency.py` com `sqlite3`, separado do armazenamento Parquet e sem ORM.
+- Usar `IDEMPOTENCY_DB_PATH`; na ausência da variável, gravar em `.run/idempotency.sqlite3`. Testes usam um arquivo temporário isolado. SQLite continua sendo a opção de desenvolvimento; PostgreSQL permanece a evolução futura.
+- Manter registros por 7 dias desde a primeira solicitação e remover vencidos sob demanda, dentro de uma nova operação.
+- Aceitar chaves de 1 a 255 caracteres sem espaços e diferenciar maiúsculas de minúsculas. O futuro cliente backend, não a pessoa usuária nem o LLM, gera e persiste antes da chamada uma chave no formato `tractian-agent:<uuid>`.
+- Tratar a chave como protocolo, não como credencial. Autenticação e permissão protegem a ação; no simulador, `x-user-id` continua sendo apenas uma aproximação da identidade de produção.
+- Identificar unicamente o pedido por pessoa autenticada, método, endpoint completo e chave idempotente, com restrição `UNIQUE` no SQLite sobre essa combinação.
+- Calcular `payload_hash` como `sha256:v1:<digest>` sobre JSON canônico com chaves ordenadas, sem alterar valores nem persistir o payload original.
+- Persistir `idempotency_key`, `user_id`, `method`, `endpoint`, `payload_hash`, `status`, `response_status`, `response_body`, `created_at`, `updated_at` e `expires_at`, com instantes em UTC.
+- Usar os estados `processing`, `completed` e `uncertain`. Reservar e confirmar `processing` antes da ação; confirmar `completed` e a resposta antes de responder ao cliente.
+- Considerar `processing` vencido após `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS`, com padrão de 300 segundos, e convertê-lo para `uncertain` sem repetir a ação.
+- Repetir status HTTP e corpo JSON originais quando chave, escopo e hash coincidirem em um registro `completed`.
+- Retornar `409 IDEMPOTENCY_PAYLOAD_CONFLICT` para mesma chave e escopo com hash diferente, `409 IDEMPOTENCY_IN_PROGRESS` para processamento ativo e `409 IDEMPOTENCY_OUTCOME_UNKNOWN` para resultado incerto.
+- Em falha inesperada durante a ação, retornar `500`, marcar `uncertain` e bloquear repetição automática. Erros anteriores à reserva não são persistidos.
+- Simular perda de resposta somente nos testes, depois do commit e antes da entrega ao cliente; não expor flag ou header de falha em produção.
+- Construir em fatias verticais: primeira execução/replay, conflito, reinicialização, concorrência, resultado incerto, expiração e timeout após commit, sempre um ciclo `RED → GREEN` por comportamento.
+
+- [x] Exigir `Idempotency-Key` em `POST /analyses/{analysisId}/reprocess`.
+- [x] Persistir chave, usuário, método, endpoint, hash do payload, status e resposta original.
+- [x] Retornar a resposta original para mesma chave e mesmo payload.
+- [x] Retornar `409 Conflict` para mesma chave e payload diferente.
+- [x] Garantir atomicidade para duas requisições concorrentes.
+- [x] Testar primeira execução, replay, conflito, concorrência e timeout após a ação/commit antes da resposta.
+
+**Aceite:** durante a janela de retenção de 7 dias, nenhum retry ou acesso concorrente cria dois trabalhos para a mesma intenção. Após esse prazo, a chave pode iniciar uma nova execução, mas uma geração antiga não pode alterar o registro da nova.
 
 ## Fase 2 — contratos e cliente da API
 

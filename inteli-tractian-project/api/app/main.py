@@ -5,15 +5,23 @@ envelope probabilístico {mode, notes, data}; ações de impacto exigem justific
 """
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import store
-from .models import ActionResult
+from .idempotency import (
+    IdempotencyStore,
+    canonical_payload_hash,
+    get_idempotency_store,
+)
+from .models import ActionResult, Error
 from .prob import Mode, envelope, resolve_mode
 
 app = FastAPI(
@@ -197,20 +205,189 @@ def get_analysis(analysis_id: str, seed: str | None = Depends(_seed)):
     return envelope(data, mode, notes)
 
 
-@app.post("/analyses/{analysis_id}/reprocess", tags=["Análises"])
+@app.post(
+    "/analyses/{analysis_id}/reprocess",
+    tags=["Análises"],
+    responses={
+        400: {
+            "model": Error,
+            "description": "Idempotency-Key ou justificativa ausente/inválida.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "validationError": {
+                            "summary": "Header ausente ou inválido",
+                            "value": {
+                                "code": "VALIDATION_ERROR",
+                                "message": (
+                                    "Header Idempotency-Key ausente ou inválido."
+                                ),
+                            },
+                        }
+                    }
+                }
+            },
+        },
+        409: {
+            "model": Error,
+            "description": (
+                "Idempotency-Key reutilizada com payload diferente ou ainda "
+                "em processamento; também indica resultado anterior incerto."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "payloadConflict": {
+                            "summary": "Mesma chave, payload diferente",
+                            "value": {
+                                "code": "IDEMPOTENCY_PAYLOAD_CONFLICT",
+                                "message": (
+                                    "Idempotency-Key já usada com payload diferente."
+                                ),
+                            },
+                        },
+                        "inProgress": {
+                            "summary": "A mesma intenção ainda está em andamento",
+                            "value": {
+                                "code": "IDEMPOTENCY_IN_PROGRESS",
+                                "message": (
+                                    "Já existe um processamento em andamento "
+                                    "para esta chave."
+                                ),
+                            },
+                        },
+                        "outcomeUnknown": {
+                            "summary": "Resultado anterior incerto",
+                            "value": {
+                                "code": "IDEMPOTENCY_OUTCOME_UNKNOWN",
+                                "message": (
+                                    "O resultado da tentativa anterior é incerto; "
+                                    "verifique antes de repetir."
+                                ),
+                            },
+                        },
+                    }
+                }
+            },
+        },
+        500: {
+            "model": Error,
+            "description": "Falha inesperada durante o processamento.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "internalError": {
+                            "summary": "Falha interna sem exposição de detalhes",
+                            "value": {
+                                "code": "INTERNAL_ERROR",
+                                "message": "Erro interno durante o processamento.",
+                            },
+                        }
+                    }
+                }
+            },
+        },
+    },
+)
 def reprocess_analysis(
     analysis_id: str,
     body: dict[str, Any],
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key",
+        description=(
+            "Identifica uma intenção de reprocessamento e deve ser reutilizada "
+            "somente em retries do mesmo pedido. Deve ter de 1 a 255 "
+            "caracteres e não conter espaços."
+        ),
+        min_length=1,
+        max_length=255,
+        pattern=r"^\S+$",
+    ),
     user: dict[str, Any] = Depends(require_permission("action_low")),
+    idempotency_store: IdempotencyStore = Depends(get_idempotency_store),
 ):
     analysis = store.get_analysis(analysis_id)
     if not analysis:
         raise HTTPException(404, "Análise não encontrada.")
     _require_justification(body)
-    return ActionResult(
-        action_id=f"act_{uuid.uuid4().hex[:8]}",
-        message=f"Reprocesso da análise {analysis_id} aceito. Sucesso sem ciclo de status.",
-    ).model_dump()
+    payload_hash = canonical_payload_hash(body)
+    reservation = idempotency_store.reserve(
+        idempotency_key=idempotency_key,
+        user_id=user["id"],
+        method=request.method,
+        endpoint=request.url.path,
+        payload_hash=payload_hash,
+    )
+    if reservation.decision == "payload_conflict":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "IDEMPOTENCY_PAYLOAD_CONFLICT",
+                "message": "Idempotency-Key já usada com payload diferente.",
+            },
+        )
+    if reservation.decision == "in_progress":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "IDEMPOTENCY_IN_PROGRESS",
+                "message": "Já existe um processamento em andamento para esta chave.",
+            },
+        )
+    if reservation.decision == "outcome_unknown":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "IDEMPOTENCY_OUTCOME_UNKNOWN",
+                "message": "O resultado da tentativa anterior é incerto; verifique antes de repetir.",
+            },
+        )
+    if reservation.decision == "replay":
+        existing_record = reservation.record
+        if (
+            existing_record.response_status is None
+            or existing_record.response_body is None
+        ):
+            raise RuntimeError("Resposta idempotente concluída está incompleta.")
+        return JSONResponse(
+            status_code=existing_record.response_status,
+            content=json.loads(existing_record.response_body),
+        )
+    if reservation.decision != "execute":
+        raise RuntimeError(
+            f"Decisão idempotente não reconhecida: {reservation.decision}"
+        )
+
+    try:
+        response_body = ActionResult(
+            action_id=f"act_{uuid.uuid4().hex[:8]}",
+            message=(
+                f"Reprocesso da análise {analysis_id} aceito. "
+                "Sucesso sem ciclo de status."
+            ),
+        ).model_dump()
+        idempotency_store.complete(
+            idempotency_key=idempotency_key,
+            user_id=user["id"],
+            method=request.method,
+            endpoint=request.url.path,
+            payload_hash=payload_hash,
+            reservation_created_at=reservation.record.created_at,
+            response_status=200,
+            response_body=response_body,
+        )
+    except Exception:
+        idempotency_store.mark_uncertain(
+            idempotency_key=idempotency_key,
+            user_id=user["id"],
+            method=request.method,
+            endpoint=request.url.path,
+            payload_hash=payload_hash,
+            reservation_created_at=reservation.record.created_at,
+        )
+        raise
+    return response_body
 
 
 @app.post("/analyses/{analysis_id}/request-specialist", tags=["Análises"])
@@ -390,9 +567,52 @@ def _require_justification(body: dict[str, Any]) -> None:
 
 @app.exception_handler(HTTPException)
 async def _http_handler(_: Request, exc: HTTPException) -> JSONResponse:
+    if (
+        isinstance(exc.detail, dict)
+        and isinstance(exc.detail.get("code"), str)
+        and isinstance(exc.detail.get("message"), str)
+    ):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "code": exc.detail["code"],
+                "message": exc.detail["message"],
+            },
+        )
     return JSONResponse(
         status_code=exc.status_code,
         content={"code": _err_code(exc.status_code), "message": exc.detail},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    has_idempotency_key_error = any(
+        error.get("loc") == ("header", "Idempotency-Key")
+        for error in exc.errors()
+    )
+    if has_idempotency_key_error:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "VALIDATION_ERROR",
+                "message": "Header Idempotency-Key ausente ou inválido.",
+            },
+        )
+    return await request_validation_exception_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def _internal_error_handler(_: Request, __: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": "INTERNAL_ERROR",
+            "message": "Erro interno durante o processamento.",
+        },
     )
 
 

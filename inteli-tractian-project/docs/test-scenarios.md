@@ -65,7 +65,9 @@ inspecionado no retorno. Os IDs referenciam `agent-input/cases.json`,
 - **Contexto inicial:** Petro Delta · Analista de Confiabilidade (perms: read, action_low) ·
   Compressor C-710.
 - **Política:**
-  - Reprocesso exige permissão `action_low` + justificativa.
+  - Reprocesso exige permissão `action_low`, justificativa e `Idempotency-Key` de 1 a 255
+    caracteres sem espaços.
+  - Nova intenção usa chave nova; retry do mesmo pedido reutiliza a chave.
   - Distinguir "modelo atrasado" de "dados ruins": ações diferentes.
 - **Trajetória esperada:**
   1. `GET /assets/asset_C710/rms` ? tendência de subida + `baseline_state=established`,
@@ -77,12 +79,12 @@ inspecionado no retorno. Os IDs referenciam `agent-input/cases.json`,
   5. `GET /assets/asset_C710/data-quality` ? completeness aceitável (descarta "dados ruins").
 - **Resolução esperada:** **investigar → agir**. Explicar que o baseline está established e o RMS
   ultrapassou o limiar derivado, mas o modelo está com processamento atrasado, logo o insight não
-  foi emitido. Recomendar/acionar reprocesso (`POST /analyses/{id}/reprocess` com justificativa)
-  ou escalar se a janela de risco for alta.
+  foi emitido. Recomendar/acionar reprocesso (`POST /analyses/{id}/reprocess` com justificativa e
+  `Idempotency-Key`) ou escalar se a janela de risco for alta.
 - **Variações a testar:** `seed` com `analyses=pending`; variação onde `data-quality` baixo muda a
   conclusão para "dados não fiáveis".
 - **Critério de sucesso (P1):** distingue atraso de modelo de problema de dados; usa o
-  `alarm_threshold` derivado do baseline; aciona reprocesso com justificativa válida.
+  `alarm_threshold` derivado do baseline; aciona reprocesso com justificativa e chave válidas.
 - **Métricas (P2):** acurácia do diagnóstico; uso correto de baseline vs. qualidade; qualidade da
   justificativa da ação; robustez à variação que inverte a conclusão.
 
@@ -205,21 +207,29 @@ inspecionado no retorno. Os IDs referenciam `agent-input/cases.json`,
 - **Contexto inicial:** Cervejaria Aurora · Mecânico (perms: read, action_low) · Bomba B-204.
 - **Política:**
   - Reprocesso exige justificativa (≥ 20 chars) baseada em evidência (intervenção realizada).
+  - Reprocesso exige `Idempotency-Key` de 1 a 255 caracteres sem espaços; nova intenção usa
+    chave nova e retry reutiliza a chave.
   - Reprocesso aceito = sucesso, sem ciclo de status; validar com nova consulta.
 - **Trajetória esperada:**
   1. `GET /analyses/{id}` ? `status=stale`, `created_at` antigo.
   2. `GET /assets/asset_B204/baseline` ? `state=invalidated`, `invalidation_reason=
      maintenance_intervention`.
   3. `GET /assets/asset_B204/rms` ? RMS caiu pós-intervenção (sadia).
-  4. `POST /analyses/{id}/reprocess` (justification: "rolamento trocado em DD/MM; baseline
-     invalidated; RMS já em nível sadio") ? `accepted=true`.
+  4. `POST /analyses/{id}/reprocess` (`Idempotency-Key` nova; justification: "rolamento trocado
+     em DD/MM; baseline invalidated; RMS já em nível sadio") ? `accepted=true`.
   5. `GET /analyses/{id}` ? atualizada (pós-reprocesso).
 - **Resolução esperada:** **investigar → agir**. Explicar que o insight stale media contra baseline
   invalidated; reprocessar com justificativa; confirmar atualização.
 - **Variações a testar:** reprocesso **sem justificativa** (esperado: 400); justificativa fraca;
-  `seed` com `analyses=partial` na revalidação.
+  `Idempotency-Key` ausente, vazia, com espaços ou mais de 255 caracteres (esperado: 400);
+  mesma chave com payload diferente
+  (esperado: 409); retry concorrente da mesma intenção enquanto a ação está em andamento
+  (esperado: `409 IDEMPOTENCY_IN_PROGRESS`, sem duplicar a ação); falha inesperada depois da
+  reserva seguida de retry (esperado: `409 IDEMPOTENCY_OUTCOME_UNKNOWN`, sem repetir a ação);
+  perda da resposta depois do commit seguida de retry (esperado: replay da resposta persistida,
+  sem repetir a ação); `seed` com `analyses=partial` na revalidação.
 - **Critério de sucesso (P1):** identifica baseline invalidated + staleness; reprocessa com
-  justificativa válida; valida pós-ação; lida com rejeição por justificativa ausente.
+  justificativa e chave válidas; valida pós-ação; lida com rejeição por justificativa ou chave ausente.
 - **Métricas (P2):** acurácia dos argumentos da ação; tratamento de falha (400); uso de evidências;
   rastreabilidade da trajetória.
 
@@ -483,7 +493,7 @@ esperada. Achados e correções aplicadas durante a auditoria:
 | CEN-04 (M208) | ✓ lubrificação sintomática válida com baseline learning | — |
 | CEN-05 (M605) | ✓ inferência incerta | Espectro partial não dropa mais `peaks` (sinaliza via `bands_missing`); banda de 2x f-linha ausente nos dados; análise an_9910 rebaixada a `inconclusive` com confiança baixa |
 | CEN-06 (M205) | ✓ conflito misalignment vs. looseness, subharmônicos sustentam looseness | — |
-| CEN-07 (B204) | ✓ stale + baseline invalidated, reprocesso aceito com justificativa, 400 sem justificativa | — |
+| CEN-07 (B204) | ✓ stale + baseline invalidated, reprocesso aceito com justificativa e chave, 400 sem justificativa ou chave | — |
 | CEN-08 (V301) | ✓ tensão confiança×qualidade concreta | `data_quality` partial preserva `snr_db`; modelo retorna `requirements` como objeto (alinha com contrato) |
 | CEN-09 (M102) | ✓ motor DC suportado mas `can_learn_baseline=false` | — |
 | CEN-10 (G501) | ✓ escalonamento justificado, 403 sem permissão | — |

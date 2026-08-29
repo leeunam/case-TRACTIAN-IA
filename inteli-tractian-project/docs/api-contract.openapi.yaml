@@ -60,7 +60,7 @@ components:
       type: object
       required: [code, message]
       properties:
-        code: { type: string, examples: [VALIDATION_ERROR, UNAUTHORIZED, CONFLICT, UNAVAILABLE] }
+        code: { type: string, examples: [VALIDATION_ERROR, UNAUTHORIZED, IDEMPOTENCY_PAYLOAD_CONFLICT, IDEMPOTENCY_IN_PROGRESS, IDEMPOTENCY_OUTCOME_UNKNOWN, INTERNAL_ERROR, UNAVAILABLE] }
         message: { type: string }
 
     Company:
@@ -424,6 +424,15 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Identifica uma intenção de reprocessamento e deve ser reutilizada somente em retries do mesmo pedido. Deve ter de 1 a 255 caracteres e não conter espaços.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '^\S+$'
       requestBody:
         required: true
         content:
@@ -435,7 +444,49 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ActionResult' }
-        '400': { description: Justificativa ausente/inválida. }
+        '400':
+          description: Idempotency-Key ou justificativa ausente/inválida.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                validationError:
+                  summary: Header ausente ou inválido
+                  value:
+                    code: VALIDATION_ERROR
+                    message: Header Idempotency-Key ausente ou inválido.
+        '409':
+          description: Idempotency-Key reutilizada com payload diferente ou ainda em processamento; também indica resultado anterior incerto.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                payloadConflict:
+                  summary: Mesma chave, payload diferente
+                  value:
+                    code: IDEMPOTENCY_PAYLOAD_CONFLICT
+                    message: Idempotency-Key já usada com payload diferente.
+                inProgress:
+                  summary: A mesma intenção ainda está em andamento
+                  value:
+                    code: IDEMPOTENCY_IN_PROGRESS
+                    message: Já existe um processamento em andamento para esta chave.
+                outcomeUnknown:
+                  summary: Resultado anterior incerto
+                  value:
+                    code: IDEMPOTENCY_OUTCOME_UNKNOWN
+                    message: O resultado da tentativa anterior é incerto; verifique antes de repetir.
+        '500':
+          description: Falha inesperada durante o processamento.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                internalError:
+                  summary: Falha interna sem exposição de detalhes
+                  value:
+                    code: INTERNAL_ERROR
+                    message: Erro interno durante o processamento.
 
   /analyses/{analysisId}/request-specialist:
     post:
