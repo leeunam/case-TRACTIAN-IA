@@ -110,6 +110,18 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decidir:** agrupamento das tools, limites de tamanho, retries seguros e quais campos entram no retorno normalizado.
 
+**Decisões aprovadas:**
+
+- Expor tools LangChain reais por intenção de consulta, sem uma tool genérica que aceite URL, método ou caminho. O catálogo inicial terá `get_asset`, `list_asset_analyses`, `get_analysis`, `get_baseline`, `get_rms_series`, `get_spectrum`, `get_data_quality`, `get_model`, `search_knowledge` e `get_knowledge_document`.
+- Manter cada adapter LangChain fino: nome, descrição, schema público, contexto injetado e conversão do retorno. A operação determinística em Python valida escopo e significado, chama o `IndustrialApiClient` e normaliza a observação; ela não recria transporte nem autorização da API.
+- Obter identidade, empresa, permissões, ativo central, cliente HTTP, `seed` de avaliação e modelo industrial configurado por contexto confiável. Esses dados não fazem parte dos argumentos visíveis ao modelo. `get_current_user` é uma consulta interna da fronteira de entrada, não uma tool do LLM.
+- Usar argumentos Pydantic específicos e restritos. IDs aceitam somente o prefixo e os caracteres esperados; filtros usam valores fechados. Paths, método, headers e modelo de resposta ficam fixos em código.
+- Aplicar menor acesso antes da chamada: consultas de ativo ficam limitadas ao ativo central; respostas completas também confirmam empresa e relação com o recurso pai antes de serem expostas. Conhecimento é global no escopo atual, e o modelo consultado é o configurado no runtime.
+- Retornar conteúdo JSON compacto e normalizado para o modelo e um artifact JSON serializável para código, trace, ledger e avaliações futuras. O artifact não contém headers, identidade, cliente ou resposta HTTP bruta. Qualquer redução declara `truncated=true` e a quantidade omitida; não há truncamento silencioso.
+- Não executar retry dentro das tools. Cada tentativa e cada falha permanecem explícitas para a futura política do LangGraph.
+- Preservar `mode`, `notes` e todo `ApiError`; validação inválida impede HTTP e exceção inesperada de programação não é convertida em sucesso.
+- Construir em fatias verticais `RED → GREEN`, começando por `get_asset`, e testar contrato público, escopo, chamada fixa, modos, erros, conteúdo/artifact e integração mínima com `ToolNode` sem criar ainda o agente completo.
+
 - [ ] Implementar tools de consulta necessárias aos cenários.
 - [ ] Validar IDs, filtros e identidade antes da chamada.
 - [ ] Manter resposta bruta fora do prompt quando a forma normalizada for suficiente.
