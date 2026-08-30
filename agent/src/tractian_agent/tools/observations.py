@@ -55,8 +55,8 @@ def _normalize_partial_key(key: str) -> str:
 def assert_safe_partial_json(value: JsonValue) -> None:
     """Recusa recursivamente contexto confiável e envelope HTTP em JSON parcial.
 
-    A regra inspeciona somente nomes de campos, nunca conteúdo textual, para não
-    tentar inferir segredos ou dados de domínio pelos seus valores.
+    A regra inspeciona nomes de campos e a finitude de números, mas nunca tenta
+    inferir segredos ou dados de domínio a partir de conteúdo textual.
     """
     if isinstance(value, Mapping):
         for key, nested_value in value.items():
