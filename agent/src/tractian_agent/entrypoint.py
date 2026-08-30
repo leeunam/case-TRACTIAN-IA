@@ -3,18 +3,34 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import AbstractAsyncContextManager
 from typing import Literal, Protocol
 
+from langgraph.graph import START
+
 from tractian_agent.contracts import SupportRequest
+from tractian_agent.graph import MINIMAL_GRAPH_STEP_COUNT
 from tractian_agent.state import AgentState, ThreadScope
 from tractian_agent.tools.runtime import ReadToolRuntime
 
 
+class AgentInvocationProtocolError(RuntimeError):
+    """Checkpoint válido, mas incompatível com a operação solicitada."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class GraphStateSnapshot(Protocol):
     values: Mapping[str, object]
+    config: dict[str, object]
+    next: tuple[str, ...]
 
 
 class AgentGraph(Protocol):
+    def thread_lock(self, thread_id: str) -> AbstractAsyncContextManager[None]: ...
+
     async def aget_state(
         self,
         config: dict[str, object],
@@ -22,11 +38,20 @@ class AgentGraph(Protocol):
 
     async def ainvoke(
         self,
-        input: dict[str, object],
+        input: dict[str, object] | None,
         config: dict[str, object],
         *,
+        context: ReadToolRuntime,
         durability: Literal["sync"],
     ) -> Mapping[str, object]: ...
+
+    async def aupdate_state(
+        self,
+        config: dict[str, object],
+        values: dict[str, object],
+        *,
+        as_node: str | None = None,
+    ) -> dict[str, object]: ...
 
 
 def _require_opaque_id(value: str, *, name: str) -> str:
@@ -55,39 +80,74 @@ async def invoke_agent(
     execution_id = _require_opaque_id(execution_id, name="execution_id")
     config: dict[str, object] = {"configurable": {"thread_id": thread_id}}
 
-    snapshot = await graph.aget_state(config)
-    persisted_values = snapshot.values
-    if persisted_values:
-        persisted = AgentState.model_validate(persisted_values)
-        state = persisted.continue_with(
-            request=request,
-            identity=runtime.identity,
-            permissions=runtime.permissions,
-            request_id=request_id,
-            execution_id=execution_id,
-        )
-    else:
-        state = AgentState(
-            request=request,
-            identity=runtime.identity,
-            permissions=runtime.permissions,
-            request_id=request_id,
-            thread_id=thread_id,
-            execution_id=execution_id,
-            thread_scope=ThreadScope(
+    async with graph.thread_lock(thread_id):
+        snapshot = await graph.aget_state(config)
+        persisted_values = snapshot.values
+        if persisted_values:
+            persisted = AgentState.model_validate(persisted_values)
+            new_request = request_id != persisted.request_id
+            state = persisted.continue_with(
+                request=request,
+                identity=runtime.identity,
+                permissions=runtime.permissions,
+                request_id=request_id,
+                execution_id=execution_id,
+                step_limit=step_limit,
+            )
+            if not new_request and persisted.final_result is not None:
+                if snapshot.next:
+                    raise AgentInvocationProtocolError(
+                        "TERMINAL_WITH_PENDING_WORK",
+                        "checkpoint terminal ainda possui trabalho pendente",
+                    )
+                return persisted
+            if new_request:
+                config = await graph.aupdate_state(
+                    snapshot.config,
+                    state.model_dump(mode="json"),
+                    as_node=START,
+                )
+                invocation_input = None
+            else:
+                if not snapshot.next:
+                    raise AgentInvocationProtocolError(
+                        "NON_TERMINAL_WITHOUT_PENDING_WORK",
+                        "checkpoint não terminal não possui trabalho pendente",
+                    )
+                if state.step_limit < MINIMAL_GRAPH_STEP_COUNT:
+                    raise AgentInvocationProtocolError(
+                        "STEP_LIMIT_EXHAUSTED",
+                        "checkpoint parcial esgotou o orçamento de passos",
+                    )
+                config = await graph.aupdate_state(
+                    snapshot.config,
+                    state.model_dump(mode="json"),
+                )
+                invocation_input = None
+        else:
+            state = AgentState(
+                request=request,
+                identity=runtime.identity,
+                permissions=runtime.permissions,
+                request_id=request_id,
                 thread_id=thread_id,
-                case_id=request.case_id,
-                company_id=runtime.identity.company_id,
-                user_id=runtime.identity.user_id,
-            ),
-            step_limit=step_limit,
-        )
+                execution_id=execution_id,
+                thread_scope=ThreadScope(
+                    thread_id=thread_id,
+                    case_id=request.case_id,
+                    company_id=runtime.identity.company_id,
+                    user_id=runtime.identity.user_id,
+                ),
+                step_limit=step_limit,
+            )
+            invocation_input = state.model_dump(mode="json")
 
-    result = await graph.ainvoke(
-        state.model_dump(mode="json"),
-        config,
-        durability="sync",
-    )
+        result = await graph.ainvoke(
+            invocation_input,
+            config,
+            context=runtime,
+            durability="sync",
+        )
     if not isinstance(result, Mapping):
         raise TypeError("o grafo devolveu estado inválido")
     return AgentState.model_validate(result)

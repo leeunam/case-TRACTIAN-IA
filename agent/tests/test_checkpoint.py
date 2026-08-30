@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
+import tractian_agent.checkpoint as checkpoint_module
 from tractian_agent.checkpoint import create_checkpoint_serializer, open_checkpointer
 
 
@@ -33,16 +34,37 @@ def test_default_checkpointer_path_creates_parent_and_closes_connection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.chdir(tmp_path)
+    project_root = Path(__file__).resolve().parents[2]
+    assert checkpoint_module.DEFAULT_CHECKPOINT_PATH == (
+        project_root / ".run/agent-checkpoints.sqlite3"
+    )
+
+    foreign_cwd = tmp_path / "foreign-cwd"
+    foreign_cwd.mkdir()
+    temporary_default = tmp_path / "project-root/.run/agent-checkpoints.sqlite3"
+    monkeypatch.setattr(
+        checkpoint_module,
+        "DEFAULT_CHECKPOINT_PATH",
+        temporary_default,
+    )
+    monkeypatch.chdir(foreign_cwd)
 
     async def scenario():
         async with open_checkpointer() as saver:
             await saver.aget({"configurable": {"thread_id": "path_probe"}})
-            assert Path(".run/agent-checkpoints.sqlite3").is_file()
+            assert temporary_default.is_file()
+            assert not Path(".run/agent-checkpoints.sqlite3").exists()
             with pytest.raises(TypeError, match="not msgpack serializable"):
                 saver.serde.dumps_typed(_PickleOnly())
 
         with pytest.raises(ValueError, match="no active connection"):
             await saver.conn.execute("SELECT 1")
+
+        explicit_path = Path("explicit/checkpoints.sqlite3")
+        async with open_checkpointer(explicit_path) as explicit_saver:
+            await explicit_saver.aget(
+                {"configurable": {"thread_id": "explicit_path_probe"}}
+            )
+        assert (foreign_cwd / explicit_path).is_file()
 
     asyncio.run(scenario())

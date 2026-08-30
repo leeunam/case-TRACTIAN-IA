@@ -502,6 +502,7 @@ class AgentState(FrozenStateModel):
         permissions: frozenset[Permission],
         request_id: str,
         execution_id: str,
+        step_limit: int | None = None,
     ) -> AgentState:
         """Cria uma invocação no mesmo thread, validando novamente seu escopo."""
         if execution_id == self.execution_id:
@@ -525,6 +526,7 @@ class AgentState(FrozenStateModel):
             data.update(
                 decision=None,
                 step_count=0,
+                step_limit=self.step_limit if step_limit is None else step_limit,
                 pending_proposal=None,
                 approval=None,
                 final_result=None,

@@ -10,7 +10,8 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 
-DEFAULT_CHECKPOINT_PATH = Path(".run/agent-checkpoints.sqlite3")
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_CHECKPOINT_PATH = PROJECT_ROOT / ".run/agent-checkpoints.sqlite3"
 
 
 def create_checkpoint_serializer() -> JsonPlusSerializer:
@@ -24,10 +25,10 @@ def create_checkpoint_serializer() -> JsonPlusSerializer:
 
 @asynccontextmanager
 async def open_checkpointer(
-    path: str | Path = DEFAULT_CHECKPOINT_PATH,
+    path: str | Path | None = None,
 ) -> AsyncIterator[AsyncSqliteSaver]:
     """Mantém saver e conexão abertos somente dentro do contexto assíncrono."""
-    checkpoint_path = Path(path)
+    checkpoint_path = DEFAULT_CHECKPOINT_PATH if path is None else Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
         saver.serde = create_checkpoint_serializer()

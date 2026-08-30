@@ -314,9 +314,11 @@ def test_same_request_resume_requires_identical_request_and_preserves_progress()
         permissions=frozenset({"read"}),
         request_id="req_01",
         execution_id="exec_02",
+        step_limit=99,
     )
 
     assert resumed.step_count == 2
+    assert resumed.step_limit == 3
     assert resumed.decision is AgentDecision.ACT
     assert resumed.pending_proposal is not None
     assert resumed.approval == approval
@@ -391,6 +393,7 @@ def test_new_request_preserves_audit_and_intents_but_resets_transient_state():
         permissions=frozenset({"read"}),
         request_id="req_02",
         execution_id="exec_02",
+        step_limit=7,
     )
 
     assert continued.messages == state.messages
@@ -400,6 +403,7 @@ def test_new_request_preserves_audit_and_intents_but_resets_transient_state():
     assert continued.intents == state.intents
     assert continued.decision is None
     assert continued.step_count == 0
+    assert continued.step_limit == 7
     assert continued.pending_proposal is None
     assert continued.approval is None
     assert continued.final_result is None

@@ -366,19 +366,27 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decisões implementadas nesta fatia:** o desenvolvimento usa
 `AsyncSqliteSaver.from_conn_string` em contexto assíncrono, no caminho padrão
-`.run/agent-checkpoints.sqlite3`, com serializer sem fallback de pickle nem
-módulos JSON/MsgPack arbitrários. A fronteira Python exige `ReadToolRuntime` e
-`thread_id`, cria ou continua o `AgentState` e chama o grafo sempre com
-`durability="sync"`; cliente e demais objetos do runtime não entram no
-checkpoint. O grafo acíclico `ingest → route → finish` consome três passos e
-somente produz um resultado determinístico explícito, sem LLM, tool produtiva
-ou efeito. Threads não expiram nem são removidos automaticamente nesta fatia;
-a remoção disponível é `adelete_thread(thread_id)`. Intenções preexistentes são
-apenas preservadas, inclusive `expires_at` e chave, sem geração ou reuso.
+da raiz do projeto `.run/agent-checkpoints.sqlite3`, com serializer sem fallback
+de pickle nem módulos JSON/MsgPack arbitrários. A fronteira Python exige
+`ReadToolRuntime` e `thread_id`; o grafo declara esse runtime como
+`context_schema`, recebe o mesmo objeto em `context` e nunca persiste cliente,
+seed ou contexto. O trecho `aget_state → decisão/update → ainvoke` é serializado
+por lock local efêmero de cada `thread_id`, ligado ao ciclo de vida do grafo;
+threads distintos não se bloqueiam, e não há promessa de lease multiprocesso.
+Criação e retomada executável usam `durability="sync"`. Nova `request_id` zera o
+progresso e aplica novo `step_limit`; a mesma request parcial retoma somente os
+nós pendentes e preserva orçamento, enquanto orçamento insuficiente produz erro
+de protocolo. A mesma request já terminal é replay imutável de entrega, sem
+novo `ainvoke` nem alteração do checkpoint. O grafo acíclico
+`ingest → route → finish` consome três passos e somente produz um resultado
+determinístico explícito, sem LLM, tool produtiva ou efeito. Threads não expiram
+nem são removidos automaticamente nesta fatia; a remoção disponível é
+`adelete_thread(thread_id)`. Intenções preexistentes são apenas preservadas,
+inclusive `expires_at` e chave, sem geração ou reuso.
 
-**Evidência desta fatia:** os 13 testes novos de checkpoint, grafo e fronteira,
-os 314 testes focados com os contratos herdados e o `make test` completo
-passaram; a execução global totalizou 59 testes da API e 719 do agente, com
+**Evidência desta fatia:** os 21 testes de checkpoint, grafo e fronteira, os
+322 testes focados com os contratos herdados e o `make test` completo passaram;
+a execução global totalizou 59 testes da API e 727 do agente, com
 somente o aviso de depreciação já conhecido do `python_multipart`.
 
 **Arquivos:** adicionar `langgraph-checkpoint-sqlite>=3.1.1,<3.2`; criar `agent/src/tractian_agent/checkpoint.py`, `agent/src/tractian_agent/graph.py`, `agent/src/tractian_agent/entrypoint.py` e testes focados; atualizar lock.
@@ -386,7 +394,7 @@ somente o aviso de depreciação já conhecido do `python_multipart`.
 **Contrato e testes:**
 
 - Usar `AsyncSqliteSaver` com contexto assíncrono, conexão sempre fechada e serializer restrito a tipos seguros.
-- O caminho padrão de desenvolvimento é `.run/agent-checkpoints.sqlite3`; testes usam arquivo temporário.
+- O caminho padrão de desenvolvimento é `.run/agent-checkpoints.sqlite3`, ancorado na raiz do projeto; testes usam arquivo temporário.
 - A primeira fronteira é função Python assíncrona; ela exige `thread_id`, contexto autenticado e sempre invoca/retoma com `durability="sync"`.
 - Grafo mínimo determinístico prova `ingest → route → finish`, encerra um caso simples de leitura e respeita limite de passos; não finge possuir planner ou writer.
 - Estado sobrevive ao fechamento e reabertura do saver; threads distintos não compartilham estado; contexto não é serializado.
