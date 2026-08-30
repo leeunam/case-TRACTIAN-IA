@@ -73,3 +73,38 @@ A ordenação da lista usa `created_at` descendente e conserva a ordem original
 quando há empate. O artifact de lista inclui as contagens também no outcome,
 enquanto os indicadores universais de truncamento permanecem no nível superior
 do artifact já definido pela fundação. Não há preocupação bloqueante conhecida.
+
+## Correção após revisão independente
+
+### RED → GREEN
+
+A revisão identificou que o simulador mantém `data.analyses` mesmo em
+`partial` e `conflict`; a versão inicial preservava essa lista bruta em
+`partial_data`. Foram adicionadas regressões para a forma real do envelope,
+cortes degradados 21/201, validação de linhas fora das janelas, campos
+ausentes, escopo/status/duplicatas, `reference=null` sintomático, o código 404
+real `NOT_FOUND` e `model.id` aninhado no detalhe parcial. Antes da correção,
+o foco terminou com `6 failed, 33 passed`.
+
+### Implementação corrigida
+
+- Em modo degradado com `analyses`, a tool valida e projeta cada linha antes de
+  qualquer corte. O prompt recebe no máximo 20 resumos; o artifact recebe no
+  máximo 200 resumos, ambos com contagens e truncamento explícitos. Evidências,
+  versão de modelo e qualquer outro campo bruto não são copiados.
+- Flags seguros de topo, como `conflict` e `inconclusive`, continuam em
+  `partial_data`, mas sem a chave `analyses`. Linhas realmente incompletas
+  preservam somente os campos de resumo presentes — a ferramenta não cria
+  `null` ou defaults.
+- `asset_id` segue validado recursivamente no dado degradado. Em detalhe,
+  `id` e `analysis_id` são conferidos apenas no objeto raiz para não confundir
+  IDs de objetos aninhados, como `model.id`, com o recurso solicitado.
+- `AnalysisId` passou a ser reexportado por `tools/identifiers.py`, mantendo o
+  mesmo schema público restrito e preparando o reuso em tools de escrita.
+
+| Comando | Resultado da correção |
+| --- | --- |
+| `rtk uv run --project agent pytest agent/tests/test_analysis_tools.py -q` | 43 passed |
+| `rtk uv run --project agent pytest agent/tests -q` | 204 passed |
+| `rtk make test` | API: 59 passed (1 aviso externo de depreciação); agente: 204 passed |
+| `rtk git diff --check` | passed |

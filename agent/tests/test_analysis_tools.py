@@ -192,6 +192,25 @@ def test_detail_calls_exact_fixed_endpoint_and_keeps_complete_analysis():
     assert result.content.evidence[0].note == "BPFO acima do baseline"
 
 
+def test_detail_accepts_nullable_evidence_reference_for_symptomatic_detection():
+    payload = _analysis_payload()
+    payload.update(
+        {
+            "type": "lubrication",
+            "detection_mode": "symptom",
+            "baseline_state_at_detection": "not_applicable",
+        }
+    )
+    payload["evidence"][0]["reference"] = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+
+    result = _run(_detail(_runtime(handler)))
+
+    assert result.content.evidence[0].reference is None
+
+
 @pytest.mark.parametrize(
     ("operation", "arguments"),
     [
@@ -354,13 +373,161 @@ def test_list_declares_the_prompt_cut_at_twenty_one_items():
     assert result.artifact.truncated is False
 
 
+def test_degraded_list_projects_real_simulator_rows_without_raw_evidence_or_model_fields():
+    first = _analysis_payload(analysis_id="an_9901", created_at="2026-01-01T00:00:00+00:00")
+    second = _analysis_payload(analysis_id="an_9902", created_at="2026-01-02T00:00:00+00:00")
+    second.pop("evidence")
+    second.pop("model_version")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "conflict",
+                "notes": "Análises em conflito.",
+                "data": {"analyses": [first, second], "conflict": True},
+            },
+        )
+
+    result = _run(_list(_runtime(handler)))
+
+    assert result.content.model_dump() == {
+        "mode": "conflict",
+        "notes": "Análises em conflito.",
+        "analyses": [
+            {
+                "id": "an_9902",
+                "asset_id": "asset_M101",
+                "point_id": "pt_M101_de",
+                "type": "bearing_fault",
+                "severity": "high",
+                "confidence": 0.78,
+                "status": "current",
+                "created_at": "2026-01-02T00:00:00+00:00",
+                "limitations": ["processing_delayed"],
+            },
+            {
+                "id": "an_9901",
+                "asset_id": "asset_M101",
+                "point_id": "pt_M101_de",
+                "type": "bearing_fault",
+                "severity": "high",
+                "confidence": 0.78,
+                "status": "current",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "limitations": ["processing_delayed"],
+            },
+        ],
+        "total_analyses": 2,
+        "returned_analyses": 2,
+        "omitted_analyses": 0,
+        "truncated": False,
+        "partial_data": {"conflict": True},
+    }
+    assert result.artifact.outcome.partial_data == {"conflict": True}
+    assert len(result.artifact.outcome.analyses) == 2
+    assert "evidence" not in result.artifact.outcome.analyses[0]
+    assert "model_version" not in result.artifact.outcome.analyses[0]
+
+
+def test_degraded_list_validates_all_rows_before_21_and_201_cuts_and_declares_counts():
+    rows = [
+        _analysis_payload(
+            analysis_id=f"an_{index}",
+            created_at=(datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=index)).isoformat(),
+        )
+        for index in range(201)
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"mode": "partial", "notes": "Dados parciais.", "data": {"analyses": rows, "inconclusive": True}},
+        )
+
+    result = _run(_list(_runtime(handler)))
+
+    assert result.content.returned_analyses == 20
+    assert result.content.omitted_analyses == 181
+    assert result.content.truncated is True
+    assert result.artifact.outcome.returned_analyses == 200
+    assert result.artifact.outcome.omitted_analyses == 1
+    assert result.artifact.truncated is True
+    assert result.artifact.omitted_items == 1
+
+
+@pytest.mark.parametrize(
+    ("rows", "status", "match"),
+    [
+        ([_analysis_payload(analysis_id="an_1"), _analysis_payload(analysis_id="an_1")], None, "duplicado"),
+        ([_analysis_payload(asset_id="asset_other")], None, "fora do escopo"),
+        ([_analysis_payload(status="stale")], "current", "filtro"),
+        ([{**_analysis_payload(), "status": None}], "current", "status inválido"),
+    ],
+)
+def test_degraded_list_rejects_duplicate_scope_and_filter_violations_outside_windows(
+    rows: list[dict[str, object]], status: str | None, match: str
+):
+    rows = rows * 201
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"mode": "partial", "notes": None, "data": {"analyses": rows}})
+
+    with pytest.raises(ValueError, match=match):
+        _run(_list(_runtime(handler), status=status))
+
+
+@pytest.mark.parametrize(
+    ("bad_row", "status", "match"),
+    [
+        (_analysis_payload(analysis_id="an_0"), None, "duplicado"),
+        (_analysis_payload(asset_id="asset_other"), None, "fora do escopo"),
+        (_analysis_payload(status="stale"), "current", "filtro"),
+    ],
+)
+def test_degraded_list_checks_a_bad_row_after_the_artifact_window(
+    bad_row: dict[str, object], status: str | None, match: str
+):
+    rows = [
+        _analysis_payload(
+            analysis_id=f"an_{index}",
+            created_at=(datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=index)).isoformat(),
+        )
+        for index in range(201)
+    ]
+    rows.append(bad_row)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"mode": "partial", "notes": None, "data": {"analyses": rows}})
+
+    with pytest.raises(ValueError, match=match):
+        _run(_list(_runtime(handler), status=status))
+
+
+def test_degraded_list_keeps_missing_summary_fields_absent_without_inventing_nulls():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "partial",
+                "notes": "Linha parcial.",
+                "data": {"analyses": [{"id": "an_9901", "asset_id": "asset_M101"}]},
+            },
+        )
+
+    result = _run(_list(_runtime(handler)))
+
+    assert result.content.analyses == [{"id": "an_9901", "asset_id": "asset_M101"}]
+    assert result.artifact.outcome.analyses == [{"id": "an_9901", "asset_id": "asset_M101"}]
+
+
 @pytest.mark.parametrize(
     ("operation", "data", "match"),
     [
         ("list", {"asset_id": None}, "ativo fora do escopo"),
         ("list", {"nested": [{"asset_id": "asset_other"}]}, "ativo fora do escopo"),
         ("detail", {"id": None}, "identificador nulo"),
-        ("detail", {"nested": {"analysis_id": "an_other"}}, "identificador"),
+        ("detail", {"id": "an_other"}, "identificador"),
         ("detail", {"asset_id": "asset_other"}, "ativo fora do escopo"),
     ],
 )
@@ -394,15 +561,31 @@ def test_degraded_data_and_api_errors_are_preserved_without_retry():
     assert partial.artifact.outcome.partial_data == {"observed": True}
 
     def error_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={"code": "ANALYSIS_NOT_FOUND", "message": "Análise ausente."})
+        return httpx.Response(404, json={"code": "NOT_FOUND", "message": "Análise ausente."})
 
     error = _run(_detail(_runtime(error_handler)))
     assert error.error == ApiError(
         category=ApiErrorCategory.API,
-        code="ANALYSIS_NOT_FOUND",
+        code="NOT_FOUND",
         message="Análise ausente.",
         status_code=404,
     )
+
+
+def test_degraded_detail_ignores_nested_model_id_but_checks_top_level_id():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "partial",
+                "notes": "Detalhe incompleto.",
+                "data": {"id": "an_9901", "model": {"id": "mdl_vib_v3"}},
+            },
+        )
+
+    result = _run(_detail(_runtime(handler)))
+
+    assert result.artifact.outcome.partial_data == {"id": "an_9901", "model": {"id": "mdl_vib_v3"}}
 
 
 def test_adapters_return_model_content_and_reject_unknown_arguments():

@@ -12,3 +12,8 @@ PointId = Annotated[
     str,
     StringConstraints(pattern=r"^pt_[A-Za-z0-9_-]{1,64}$"),
 ]
+
+AnalysisId = Annotated[
+    str,
+    StringConstraints(pattern=r"^an_[A-Za-z0-9_-]{1,64}$"),
+]

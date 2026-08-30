@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Annotated, Literal
+import math
+from typing import Literal
 
 from langchain.tools import tool
 from langgraph.prebuilt import ToolRuntime
@@ -11,7 +12,6 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
-    StringConstraints,
     TypeAdapter,
     ValidationError,
     field_validator,
@@ -19,13 +19,9 @@ from pydantic import (
 
 from tractian_agent.contracts import ApiError, ResponseMode, StrictModel
 
-from .identifiers import AssetId, PointId
+from .identifiers import AnalysisId, AssetId, PointId
 from .observations import ToolArtifact, ToolOutcome, ToolSource, assert_safe_partial_json
 from .runtime import ReadToolRuntime
-AnalysisId = Annotated[
-    str,
-    StringConstraints(pattern=r"^an_[A-Za-z0-9_-]{1,64}$"),
-]
 AnalysisStatus = Literal["current", "stale", "pending", "inconclusive"]
 AnalysisType = Literal[
     "none",
@@ -42,7 +38,10 @@ BaselineStateAtDetection = Literal[
 ]
 _ANALYSIS_ID = TypeAdapter(AnalysisId)
 _ASSET_ID = TypeAdapter(AssetId)
+_POINT_ID = TypeAdapter(PointId)
 _STATUS = TypeAdapter(AnalysisStatus)
+_TYPE = TypeAdapter(AnalysisType)
+_SEVERITY = TypeAdapter(AnalysisSeverity)
 
 
 def _validate_asset_id(value: object) -> AssetId:
@@ -155,8 +154,19 @@ class AnalysisListModelContent(StrictModel):
     truncated: bool
 
 
+class DegradedAnalysisListModelContent(StrictModel):
+    mode: ResponseMode
+    notes: str | None
+    analyses: list[dict[str, JsonValue]]
+    total_analyses: int = Field(ge=0)
+    returned_analyses: int = Field(ge=0)
+    omitted_analyses: int = Field(ge=0)
+    truncated: bool
+    partial_data: JsonValue
+
+
 class AnalysisListToolOutcome(ToolOutcome):
-    analyses: list[AnalysisArtifact] | None = None
+    analyses: list[AnalysisArtifact] | list[dict[str, JsonValue]] | None = None
     total_analyses: int | None = Field(default=None, ge=0)
     returned_analyses: int | None = Field(default=None, ge=0)
     omitted_analyses: int | None = Field(default=None, ge=0)
@@ -167,7 +177,7 @@ class AnalysisListToolArtifact(ToolArtifact):
 
 
 class ListAssetAnalysesResult(StrictModel):
-    content: AnalysisListModelContent | None
+    content: AnalysisListModelContent | DegradedAnalysisListModelContent | None
     artifact: AnalysisListToolArtifact
     error: ApiError | None = None
 
@@ -296,12 +306,7 @@ def _detail_common(analysis_id: str, path: str) -> dict[str, object]:
     }
 
 
-def _assert_degraded_scope(
-    data: JsonValue,
-    *,
-    runtime: ReadToolRuntime,
-    requested_analysis_id: str | None = None,
-) -> None:
+def _assert_degraded_scope(data: JsonValue, *, runtime: ReadToolRuntime) -> None:
     assert_safe_partial_json(data)
     pending: list[JsonValue] = [data]
     while pending:
@@ -311,21 +316,122 @@ def _assert_degraded_scope(
                 asset_id = current["asset_id"]
                 if asset_id is None or asset_id != runtime.central_asset_id:
                     raise ValueError("A resposta degradada contém um ativo fora do escopo.")
-            if requested_analysis_id is not None:
-                for key in ("id", "analysis_id"):
-                    if key in current:
-                        analysis_id = current[key]
-                        if analysis_id is None:
-                            raise ValueError("A resposta degradada contém um identificador nulo.")
-                        try:
-                            validated_id = _validate_analysis_id(analysis_id)
-                        except ValidationError as exc:
-                            raise ValueError("A resposta degradada contém um identificador inválido.") from exc
-                        if validated_id != requested_analysis_id:
-                            raise ValueError("A resposta degradada contém um identificador diferente do solicitado.")
             pending.extend(current.values())
         elif isinstance(current, list):
             pending.extend(current)
+
+
+def _assert_degraded_detail_id(data: JsonValue, requested_analysis_id: str) -> None:
+    """Valida somente IDs do recurso principal, nunca IDs de objetos aninhados."""
+    if not isinstance(data, Mapping):
+        return
+    for key in ("id", "analysis_id"):
+        if key not in data:
+            continue
+        analysis_id = data[key]
+        if analysis_id is None:
+            raise ValueError("A resposta degradada contém um identificador nulo.")
+        try:
+            validated_id = _validate_analysis_id(analysis_id)
+        except ValidationError as exc:
+            raise ValueError("A resposta degradada contém um identificador inválido.") from exc
+        if validated_id != requested_analysis_id:
+            raise ValueError("A resposta degradada contém um identificador diferente do solicitado.")
+
+
+def _validate_degraded_summary_item(item: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+    """Projeta somente os campos seguros que estiverem presentes em uma linha parcial."""
+    projected: dict[str, JsonValue] = {}
+    try:
+        if "id" in item:
+            projected["id"] = _validate_analysis_id(item["id"])
+        if "asset_id" in item:
+            projected["asset_id"] = _validate_asset_id(item["asset_id"])
+        if "point_id" in item:
+            projected["point_id"] = _POINT_ID.validate_python(item["point_id"], strict=True)
+        if "type" in item:
+            projected["type"] = _TYPE.validate_python(item["type"], strict=True)
+        if "severity" in item:
+            projected["severity"] = _SEVERITY.validate_python(item["severity"], strict=True)
+        if "confidence" in item:
+            confidence = TypeAdapter(float).validate_python(item["confidence"], strict=True)
+            if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                raise ValueError("A resposta degradada contém confiança inválida.")
+            projected["confidence"] = confidence
+        if "status" in item:
+            try:
+                projected["status"] = _STATUS.validate_python(
+                    item["status"], strict=True
+                )
+            except ValidationError as exc:
+                raise ValueError("A resposta degradada contém status inválido.") from exc
+        if "created_at" in item:
+            created_at = item["created_at"]
+            if not isinstance(created_at, str):
+                raise ValueError("A resposta degradada contém timestamp inválido.")
+            _parse_timestamp(created_at)
+            projected["created_at"] = created_at
+        if "limitations" in item:
+            limitations = item["limitations"]
+            if not isinstance(limitations, list) or not all(
+                isinstance(value, str) for value in limitations
+            ):
+                raise ValueError("A resposta degradada contém limitações inválidas.")
+            projected["limitations"] = limitations
+    except ValidationError as exc:
+        raise ValueError("A resposta degradada contém campo de resumo inválido.") from exc
+    return projected
+
+
+def _ordered_degraded_summaries(
+    summaries: list[dict[str, JsonValue]],
+) -> list[dict[str, JsonValue]]:
+    dated: list[tuple[int, datetime, dict[str, JsonValue]]] = []
+    undated: list[dict[str, JsonValue]] = []
+    for index, summary in enumerate(summaries):
+        created_at = summary.get("created_at")
+        if isinstance(created_at, str):
+            dated.append((index, _parse_timestamp(created_at), summary))
+        else:
+            undated.append(summary)
+    return [
+        summary
+        for _, _, summary in sorted(dated, key=lambda item: (item[1], -item[0]), reverse=True)
+    ] + undated
+
+
+def _normalize_degraded_list(
+    data: JsonValue,
+    *,
+    status: AnalysisStatus | None,
+    runtime: ReadToolRuntime,
+) -> tuple[list[dict[str, JsonValue]], JsonValue]:
+    if not isinstance(data, Mapping):
+        raise ValueError("A resposta degradada contém uma lista de análises inválida.")
+    analyses = data["analyses"]
+    if not isinstance(analyses, list):
+        raise ValueError("A resposta degradada contém uma lista de análises inválida.")
+    seen_ids: set[str] = set()
+    summaries: list[dict[str, JsonValue]] = []
+    for item in analyses:
+        if not isinstance(item, Mapping):
+            raise ValueError("A resposta degradada contém uma análise inválida.")
+        summary = _validate_degraded_summary_item(item)
+        if "asset_id" in summary:
+            _assert_analysis_asset(summary["asset_id"], runtime)
+        if "id" in summary:
+            analysis_id = summary["id"]
+            if analysis_id in seen_ids:
+                raise ValueError("A resposta degradada contém um identificador de análise duplicado.")
+            seen_ids.add(analysis_id)
+        if status is not None:
+            if "status" not in summary:
+                raise ValueError("A resposta degradada não informa o status solicitado.")
+            if summary["status"] != status:
+                raise ValueError("A resposta degradada contém uma análise que não respeita o filtro de status.")
+        summaries.append(summary)
+    flags = {key: value for key, value in data.items() if key != "analyses"}
+    return _ordered_degraded_summaries(summaries), flags
 
 
 async def execute_list_asset_analyses(
@@ -354,6 +460,41 @@ async def execute_list_asset_analyses(
         )
     if result.mode is not ResponseMode.COMPLETE:
         _assert_degraded_scope(result.data, runtime=runtime)
+        if isinstance(result.data, Mapping) and "analyses" in result.data:
+            summaries, flags = _normalize_degraded_list(
+                result.data, status=status, runtime=runtime
+            )
+            total = len(summaries)
+            artifact_analyses = summaries[:200]
+            prompt_analyses = summaries[:20]
+            artifact_omitted = total - len(artifact_analyses)
+            prompt_omitted = total - len(prompt_analyses)
+            return ListAssetAnalysesResult(
+                content=DegradedAnalysisListModelContent(
+                    mode=result.mode,
+                    notes=result.notes,
+                    analyses=prompt_analyses,
+                    total_analyses=total,
+                    returned_analyses=len(prompt_analyses),
+                    omitted_analyses=prompt_omitted,
+                    truncated=prompt_omitted > 0,
+                    partial_data=flags,
+                ),
+                artifact=AnalysisListToolArtifact(
+                    **common,
+                    outcome=AnalysisListToolOutcome(
+                        mode=result.mode,
+                        notes=result.notes,
+                        partial_data=flags,
+                        analyses=artifact_analyses,
+                        total_analyses=total,
+                        returned_analyses=len(artifact_analyses),
+                        omitted_analyses=artifact_omitted,
+                    ),
+                    truncated=artifact_omitted > 0,
+                    omitted_items=artifact_omitted,
+                ),
+            )
         return ListAssetAnalysesResult(
             content=None,
             artifact=AnalysisListToolArtifact(
@@ -430,9 +571,8 @@ async def execute_get_analysis(
             ),
         )
     if result.mode is not ResponseMode.COMPLETE:
-        _assert_degraded_scope(
-            result.data, runtime=runtime, requested_analysis_id=analysis_id
-        )
+        _assert_degraded_scope(result.data, runtime=runtime)
+        _assert_degraded_detail_id(result.data, analysis_id)
         return GetAnalysisResult(
             content=None,
             artifact=AnalysisDetailToolArtifact(
