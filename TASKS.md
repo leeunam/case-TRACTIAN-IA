@@ -110,12 +110,38 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decidir:** agrupamento das tools, limites de tamanho, retries seguros e quais campos entram no retorno normalizado.
 
-- [ ] Implementar tools de consulta necessárias aos cenários.
-- [ ] Validar IDs, filtros e identidade antes da chamada.
-- [ ] Manter resposta bruta fora do prompt quando a forma normalizada for suficiente.
-- [ ] Testar escolha isolada, argumentos e tratamento de cada erro relevante.
+**Decisões implementadas:**
 
-**Aceite:** tools de leitura são determinísticas nas bordas e não escondem falhas da API.
+- Expor tools LangChain reais por intenção de consulta, sem uma tool genérica que aceite URL, método ou caminho. O catálogo inicial terá `get_asset`, `list_asset_analyses`, `get_analysis`, `get_baseline`, `get_rms_series`, `get_spectrum`, `get_data_quality`, `get_model`, `search_knowledge` e `get_knowledge_document`.
+- Manter cada adapter LangChain fino: nome, descrição, schema público, contexto injetado e conversão do retorno. A operação determinística em Python valida escopo e significado, chama o `IndustrialApiClient` e normaliza a observação; ela não recria transporte nem autorização da API.
+- Obter identidade, empresa, permissões, ativo central, cliente HTTP, `seed` de avaliação e modelo industrial configurado por contexto confiável. Esses dados não fazem parte dos argumentos visíveis ao modelo. `get_current_user` é uma consulta interna da fronteira de entrada, não uma tool do LLM.
+- Usar argumentos Pydantic específicos e restritos. IDs aceitam somente o prefixo e os caracteres esperados; filtros usam valores fechados. Paths, método, headers e modelo de resposta ficam fixos em código.
+- Aplicar menor acesso antes da chamada: consultas de ativo ficam limitadas ao ativo central; respostas completas também confirmam empresa e relação com o recurso pai antes de serem expostas. Conhecimento é global no escopo atual, e o modelo consultado é o configurado no runtime.
+- Retornar conteúdo JSON compacto e normalizado para o modelo e um artifact JSON serializável para código, trace, ledger e avaliações futuras. O artifact não contém headers, identidade, cliente ou resposta HTTP bruta. Qualquer redução declara `truncated=true` e a quantidade omitida; não há truncamento silencioso.
+- Não executar retry dentro das tools. Cada tentativa e cada falha permanecem explícitas para a futura política do LangGraph.
+- Preservar `mode`, `notes` e todo `ApiError`; validação inválida impede HTTP e exceção inesperada de programação não é convertida em sucesso.
+- Construir em fatias verticais `RED → GREEN`, começando por `get_asset`, e testar contrato público, escopo, chamada fixa, modos, erros, conteúdo/artifact e integração mínima com `ToolNode` sem criar ainda o agente completo.
+- Para baseline, RMS, espectro e qualidade, expor somente `asset_id` e `point_id` opcional; identidade, permissões, ativo central, cliente e seed continuam exclusivamente no `ReadToolRuntime`.
+- Normalizar séries RMS em ordem cronológica estável e projetar conteúdo/artifact com espaçamento uniforme e extremos preservados para no máximo 100/1.000 amostras. Para espectro, usar somente os campos reais (`asset_id`, `point_id`, `collected_at`, `peaks`, `bands_missing`), ordenar picos por frequência de modo estável e limitar conteúdo/artifact a 20/200. Toda redução declara a quantidade omitida.
+- Nas listagens completas de análises, validar todas as linhas antes de qualquer corte, devolver somente resumos no conteúdo do modelo (até 20) e guardar análises normalizadas completas no artifact (até 200). Em respostas degradadas, somente os campos conhecidos dos resumos ocupam esses mesmos limites. Todo corte declara contagens e truncamento.
+- Derivar `alarm_threshold` apenas da feature `rms_mm_s` do baseline (`reference + tolerance`), sem inferir validade a partir do estado. Em dados degradados, aplicar o guard compartilhado de JSON parcial e recusar IDs de ativo ou ponto que contradigam o escopo já conhecido.
+- Exigir ponto não nulo e verificável em payload completo técnico; validar `point_id` também no início de cada operação Python. Datas completas exigem hora e timezone; números de wire devem ser finitos antes de entrar em qualquer artifact JSON.
+- Aplicar a mesma garantia JSON-safe a qualquer resposta degradada: o guard compartilhado recusa recursivamente NaN e infinitos antes de compor `content` ou artifact. Campos nullable obrigatórios no wire precisam aparecer explicitamente, ainda que com `null`.
+- No cadastro completo do ativo, recusar NaN e infinitos em rotação e em todas as frequências técnicas antes da normalização. Em cadastro degradado, verificar recursivamente campos de ativo e empresa, inclusive variantes snake, kebab, camel e separadas por espaço.
+- Tratar nomes de campos degradados de forma sensível a segmentos: combinações que representam identidade, cliente, autenticação, credenciais, runtime, seed, avaliação/gabarito ou envelope HTTP são recusadas em qualquer profundidade, sem bloquear nomes industriais como `baseline_reference`, `processing_state`, `response_time`, `bearing_authenticity` e `machine_runtime_hours`.
+- Para `get_model`, usar exclusivamente `configured_model_id` imutável no `ReadToolRuntime` (padrão explícito `mdl_vib_v3`), sem expor o ID no schema público; o retorno completo confirma esse ID e a cobertura não aceita tipos de máquina duplicados.
+- Para conhecimento global, `search_knowledge` aceita somente consulta sem espaços externos, de 2 a 200 caracteres, com conteúdo Unicode visível após normalização NFKD e remoção de marcas combinantes; a consulta válida original não é alterada. O filtro é fechado em `procedure`/`glossary`/`guidance` e, em resposta degradada, uma linha sem `type` não satisfaz filtro solicitado. A busca normaliza todos os documentos antes do corte de 10 metadados/snippets de 240 caracteres; o detalhe limita o corpo a 8.000 caracteres no contexto do modelo e 32.000 no artifact, sempre declarando caracteres retornados, omitidos e truncamento.
+- Modelos e conhecimento preservam os modos e notas sem expor JSON HTTP bruto: em resposta degradada, projetam somente campos de domínio conhecidos, flags permitidas e limites aplicáveis. O validador de timestamps com data, hora e timezone passou a ser compartilhado pelas tools técnicas, de análises e de modelo.
+- Publicar as dez tools em um catálogo estático e imutável `READ_TOOLS`, sem descoberta dinâmica. Um grafo mínimo somente de teste comprova a injeção do contexto confiável pelo `ToolNode`; o grafo de produção, planner, writer, checkpointer e ledger continuam fora desta fase.
+
+- [x] Implementar tools de consulta necessárias aos cenários.
+- [x] Validar IDs, filtros e identidade antes da chamada.
+- [x] Manter resposta bruta fora do prompt quando a forma normalizada for suficiente.
+- [x] Testar escolha isolada, argumentos e tratamento de cada erro relevante.
+
+**Evidência de aceite:** em 30/08/2026, os 181 testes focados de ativo, catálogo e integração, os 398 testes do agente e os 59 testes da API passaram. O `make test` totalizou 457 testes; a única mensagem adicional foi o aviso de depreciação já existente do `python_multipart`. Os testes cobrem os dez schemas públicos, uma resposta completa e uma chamada GET por tool através de `ToolNode`, rejeição antes de HTTP, finitude numérica, escopo degradado recursivo, cinco modos de resposta, cinco categorias de erro e artifacts JSON. As saídas não serializam o objeto de identidade nem os valores ocultos de pessoa usuária, seed, cliente, gabarito ou envelope HTTP; o `company_id` validado do ativo permanece como dado legítimo do domínio.
+
+**Aceite verificado:** tools de leitura são determinísticas nas bordas e não escondem falhas da API.
 
 ## Fase 4 — tools de escrita e política
 

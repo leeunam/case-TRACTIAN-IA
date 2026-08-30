@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** simulador FastAPI, dados, contrato, cenários, contratos Pydantic e cliente HTTP assíncrono estão disponíveis, com 105 testes ao todo. As Fases 1 e 2 estão concluídas; agente LangGraph, checkpointer, observabilidade e avaliação ainda serão implementados conforme [`TASKS.md`](./TASKS.md).
+> **Estado atual:** simulador FastAPI, dados, contrato, cenários, contratos Pydantic, cliente HTTP assíncrono e dez tools LangChain de leitura estão disponíveis, com 457 testes ao todo. As Fases 1, 2 e 3 estão concluídas; o grafo de produção do agente LangGraph, checkpointer, observabilidade e avaliação ainda serão implementados conforme [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -155,7 +155,7 @@ Prompt curto recomendado:
 ├── CONTEXT.md
 ├── LICENSE
 ├── Makefile
-├── agent/                   # contratos e cliente HTTP assíncrono do agente
+├── agent/                   # contratos, cliente HTTP e tools de leitura do agente
 ├── agent-input/             # entradas permitidas ao agente
 ├── api/                     # simulador FastAPI e testes
 ├── data/                    # dados do simulador
@@ -165,7 +165,7 @@ Prompt curto recomendado:
 
 ## Limitações atuais
 
-- O cliente HTTP e os contratos existem, mas o agente LangGraph e o runner de avaliação ainda não.
+- Contratos, cliente HTTP e tools de leitura existem; há apenas um `ToolNode` mínimo nos testes, não o grafo de produção do agente nem o runner de avaliação.
 - O simulador não representa todas as garantias transacionais de produção.
 - O OpenAPI repete `/assets/{assetId}` em blocos separados; alguns parsers podem perder uma operação.
 - Contrato e resposta atual de `Asset` não têm exatamente a mesma estrutura.
