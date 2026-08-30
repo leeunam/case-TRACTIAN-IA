@@ -22,6 +22,7 @@ from tractian_agent.tools.technical import (
     get_rms_series,
     get_spectrum,
 )
+from tractian_agent.tools.observations import assert_safe_partial_json
 from tractian_agent.tools.runtime import ReadToolRuntime
 
 
@@ -626,3 +627,94 @@ def test_complete_nonfinite_numbers_are_invalid_and_artifacts_remain_strict_json
     invalid, valid = asyncio.run(invoke())
     assert invalid.error.code == "INVALID_SCHEMA_RESPONSE"
     json.dumps(valid.artifact.model_dump(mode="json"), allow_nan=False)
+
+
+@pytest.mark.parametrize("nonfinite", [math.nan, math.inf, -math.inf])
+def test_assert_safe_partial_json_rejects_nonfinite_values_without_rejecting_json_numbers(nonfinite):
+    safe = {"measurements": [0, 1.25, {"count": 2}], "complete": True}
+
+    assert_safe_partial_json(safe)
+    json.dumps(safe, allow_nan=False)
+    with pytest.raises(ValueError, match="não finito"):
+        assert_safe_partial_json({"measurements": [{"value": nonfinite}]})
+
+
+@pytest.mark.parametrize("_,__,execute", TECHNICAL_TOOLS)
+def test_degraded_technical_observation_rejects_nonfinite_json_before_artifact(_, __, execute):
+    responses = [
+        {"mode": "partial", "notes": None, "data": {"asset_id": "asset_M101", "values": [1.0, 2]}},
+        {"mode": "partial", "notes": None, "data": {"asset_id": "asset_M101", "values": [math.nan]}},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=responses.pop(0))
+
+    async def invoke():
+        runtime = _runtime(handler)
+        try:
+            safe = await execute("asset_M101", None, runtime)
+            json.dumps(safe.artifact.model_dump(mode="json"), allow_nan=False)
+            with pytest.raises(ValueError, match="não finito"):
+                await execute("asset_M101", None, runtime)
+        finally:
+            await runtime.client.aclose()
+
+    asyncio.run(invoke())
+
+
+@pytest.mark.parametrize(
+    "name,field",
+    [
+        ("baseline", "established_at"),
+        ("baseline", "invalidated_at"),
+        ("baseline", "invalidation_reason"),
+        ("rms", "baseline_reference"),
+        ("rms", "alarm_threshold"),
+    ],
+)
+def test_complete_nullable_fields_are_required_on_the_wire(name, field):
+    payload = _complete_payload(name)
+    payload.pop(field)
+    execute = next(execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+
+    async def invoke():
+        runtime = _runtime(handler)
+        try:
+            return await execute("asset_M101", None, runtime)
+        finally:
+            await runtime.client.aclose()
+
+    assert asyncio.run(invoke()).error.code == "INVALID_SCHEMA_RESPONSE"
+
+
+@pytest.mark.parametrize(
+    "name,field",
+    [
+        ("baseline", "established_at"),
+        ("baseline", "invalidated_at"),
+        ("baseline", "invalidation_reason"),
+        ("rms", "baseline_reference"),
+        ("rms", "alarm_threshold"),
+    ],
+)
+def test_complete_nullable_fields_accept_explicit_null(name, field):
+    payload = _complete_payload(name)
+    payload[field] = None
+    execute = next(execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+
+    async def invoke():
+        runtime = _runtime(handler)
+        try:
+            return await execute("asset_M101", None, runtime)
+        finally:
+            await runtime.client.aclose()
+
+    result = asyncio.run(invoke())
+    assert result.error is None
+    assert getattr(result.content, field) is None

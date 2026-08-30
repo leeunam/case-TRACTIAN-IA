@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 from typing import Literal
 
 from pydantic import Field, JsonValue
@@ -72,6 +73,8 @@ def assert_safe_partial_json(value: JsonValue) -> None:
     elif isinstance(value, list):
         for item in value:
             assert_safe_partial_json(item)
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("A resposta degradada contém número não finito.")
 
 
 class ToolSource(StrictModel):

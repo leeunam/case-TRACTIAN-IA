@@ -106,3 +106,30 @@ NaN/inf. Antes da implementação, o comando focado terminou com `27 failed,
 | `rtk uv run --project agent pytest agent/tests/test_technical_tools.py -q` | 65 passed |
 | `rtk uv run --project agent pytest agent/tests -q` | 144 passed |
 | `rtk make test` | API: 59 passed (1 aviso externo de depreciação); agent: 144 passed |
+
+## Correção 2 — JSON parcial e nulabilidade obrigatória
+
+### RED
+
+Foram adicionados testes para NaN, `+inf` e `-inf` em JSON parcial seguro e
+degradado técnico, inclusive serialização com `allow_nan=False`; também para a
+ausência e o `null` explícito dos cinco campos nullable obrigatórios. Antes da
+alteração, o foco terminou com `12 failed, 70 passed`.
+
+### GREEN
+
+- `assert_safe_partial_json` agora rejeita recursivamente apenas valores
+  `float` não finitos; inteiros e floats finitos continuam aceitos. Como todas
+  as tools chamam esse guard antes de expor dados degradados, `get_asset` e as
+  tools técnicas passam a ter o mesmo limite JSON-safe.
+- Os campos `established_at`, `invalidated_at` e `invalidation_reason` do
+  baseline, e `baseline_reference` e `alarm_threshold` da RMS, continuam
+  anuláveis, mas não têm defaults no wire: omissão retorna
+  `INVALID_SCHEMA_RESPONSE` e `null` explícito é preservado.
+- `SpectrumPeak.note` permanece realmente opcional, conforme o contrato.
+
+| Comando | Resultado da correção 2 |
+| --- | --- |
+| `rtk uv run --project agent pytest agent/tests/test_technical_tools.py -q` | 82 passed |
+| `rtk uv run --project agent pytest agent/tests -q` | 161 passed |
+| `rtk make test` | API: 59 passed (1 aviso externo de depreciação); agent: 161 passed |

@@ -125,6 +125,7 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 - Normalizar séries RMS em ordem cronológica estável e projetar conteúdo/artifact com espaçamento uniforme e extremos preservados para no máximo 100/1.000 amostras. Para espectro, usar somente os campos reais (`asset_id`, `point_id`, `collected_at`, `peaks`, `bands_missing`), ordenar picos por frequência de modo estável e limitar conteúdo/artifact a 20/200. Toda redução declara a quantidade omitida.
 - Derivar `alarm_threshold` apenas da feature `rms_mm_s` do baseline (`reference + tolerance`), sem inferir validade a partir do estado. Em dados degradados, aplicar o guard compartilhado de JSON parcial e recusar IDs de ativo ou ponto que contradigam o escopo já conhecido.
 - Exigir ponto não nulo e verificável em payload completo técnico; validar `point_id` também no início de cada operação Python. Datas completas exigem hora e timezone; números de wire devem ser finitos antes de entrar em qualquer artifact JSON.
+- Aplicar a mesma garantia JSON-safe a qualquer resposta degradada: o guard compartilhado recusa recursivamente NaN e infinitos antes de compor `content` ou artifact. Campos nullable obrigatórios no wire precisam aparecer explicitamente, ainda que com `null`.
 
 - [ ] Implementar tools de consulta necessárias aos cenários.
 - [ ] Validar IDs, filtros e identidade antes da chamada.

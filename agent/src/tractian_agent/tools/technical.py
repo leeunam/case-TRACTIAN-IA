@@ -169,9 +169,9 @@ class _BaselineWire(StrictModel):
     state: Literal["learning", "established", "invalidated"]
     detection_mode: Literal["baseline", "symptom"]
     learnable: bool
-    established_at: str | None = None
-    invalidated_at: str | None = None
-    invalidation_reason: str | None = None
+    established_at: str | None
+    invalidated_at: str | None
+    invalidation_reason: str | None
     features: list[_BaselineFeatureWire]
 
     @field_validator("established_at", "invalidated_at")
@@ -351,9 +351,9 @@ class _RmsSeriesWire(StrictModel):
     asset_id: AssetId
     point_id: PointId
     unit: Literal["mm/s"]
-    baseline_reference: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    baseline_reference: float | None = Field(ge=0, allow_inf_nan=False)
     baseline_state: Literal["learning", "established", "invalidated", "not_applicable"]
-    alarm_threshold: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    alarm_threshold: float | None = Field(ge=0, allow_inf_nan=False)
     samples: list[_RmsSampleWire]
 
 
