@@ -90,10 +90,10 @@ def test_requires_confirmation_when_approved_target_differs():
     assert result.reason is PolicyReason.APPROVAL_SCOPE_MISMATCH
 
 
-def test_denies_reprocess_with_short_justification():
+def test_denies_reprocess_with_19_characters_after_strip():
     proposal = ReprocessProposal(
         analysis_id="an_9906",
-        justification="Justificativa curta",
+        justification="  aaaaaaaaaaaaaaaaaaa  ",
     )
     approval = TrustedActionApproval(
         action="reprocess_analysis",
@@ -109,6 +109,27 @@ def test_denies_reprocess_with_short_justification():
 
     assert result.decision is PolicyDecision.DENY
     assert result.reason is PolicyReason.INVALID_JUSTIFICATION
+
+
+def test_allows_reprocess_with_exactly_20_characters_after_strip():
+    proposal = ReprocessProposal(
+        analysis_id="an_9906",
+        justification="  aaaaaaaaaaaaaaaaaaaa  ",
+    )
+    approval = TrustedActionApproval(
+        action="reprocess_analysis",
+        target_id="an_9906",
+        source=ApprovalSource.CONFIRMATION,
+    )
+
+    result = evaluate_reprocess_policy(
+        proposal,
+        permissions=frozenset({"read", "action_low"}),
+        approval=approval,
+    )
+
+    assert result.decision is PolicyDecision.ALLOW
+    assert result.reason is PolicyReason.AUTHORIZED
 
 
 def test_policy_contract_rejects_extra_fields():
