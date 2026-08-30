@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections.abc import Mapping
 from typing import Literal
 
@@ -226,6 +227,18 @@ class _SearchArguments(StrictModel):
     def _reject_outer_whitespace(cls, value: str) -> str:
         if value != value.strip() or not value.strip():
             raise ValueError("A consulta não pode começar ou terminar com espaços.")
+        normalized = unicodedata.normalize("NFKD", value)
+        searchable = "".join(
+            character
+            for character in normalized
+            if not unicodedata.category(character).startswith("M")
+        )
+        if not any(
+            not character.isspace()
+            and not unicodedata.category(character).startswith("C")
+            for character in searchable
+        ):
+            raise ValueError("A consulta deve conter texto visível e pesquisável.")
         return value
 
 
@@ -438,8 +451,9 @@ def _normalize_search(data: JsonValue, *, document_type: KnowledgeDocumentType |
             if item_id in seen_ids:
                 raise ValueError("A resposta de busca contém documento duplicado.")
             seen_ids.add(item_id)
-        if document_type is not None and item_type is not None and item_type != document_type:
-            raise ValueError("A resposta de busca não respeita o filtro de tipo.")
+        if document_type is not None:
+            if item_type is None or item_type != document_type:
+                raise ValueError("A resposta de busca não respeita o filtro de tipo.")
         normalized.append(item)  # type: ignore[arg-type]
     return normalized, flags
 

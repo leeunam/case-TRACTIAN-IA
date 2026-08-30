@@ -177,6 +177,11 @@ def test_search_and_document_use_fixed_paths_params_and_normalized_payloads():
     [
         ("search", (" x", None)),
         ("search", ("x ", None)),
+        ("search", ("\u00a0ok\u00a0", None)),
+        ("search", ("\u0301\u0301", None)),
+        ("search", ("\u200b\u200b", None)),
+        ("search", ("", None)),
+        ("search", ("  ", None)),
         ("search", ("x", None)),
         ("search", ("x" * 201, None)),
         ("search", ("ok", "other")),
@@ -199,6 +204,22 @@ def test_core_rejects_invalid_arguments_before_http(operation: str, arguments: t
         else:
             _run(_document(runtime, *arguments))
     assert calls == 0
+
+
+def test_search_preserves_valid_accented_query_in_http_parameters():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"mode": "complete", "notes": None, "data": {"results": []}},
+        )
+
+    _run(_search(_runtime(handler), "vibração"))
+
+    assert len(requests) == 1
+    assert dict(requests[0].url.params)["q"] == "vibração"
 
 
 @pytest.mark.parametrize("operation", ["model", "search", "document"])
@@ -262,6 +283,31 @@ def test_search_validates_all_rows_before_limit_filter_ids_and_snippets():
         _run(_search(_runtime(lambda request: httpx.Response(200, json={"mode": "complete", "notes": None, "data": {"results": wrong_type}})), "rolamento", "procedure"))
 
 
+def test_degraded_search_filter_requires_type_even_for_row_outside_prompt_limit():
+    documents = [
+        _document_payload(document_id=f"kb_proc_{index}") for index in range(10)
+    ]
+    documents.append({"id": "kb_proc_outside", "title": "Sem tipo", "body": "Corpo"})
+
+    with pytest.raises(ValueError, match="filtro"):
+        _run(
+            _search(
+                _runtime(
+                    lambda request: httpx.Response(
+                        200,
+                        json={
+                            "mode": "partial",
+                            "notes": "parcial",
+                            "data": {"results": documents},
+                        },
+                    )
+                ),
+                "rolamento",
+                "procedure",
+            )
+        )
+
+
 @pytest.mark.parametrize("mode", ["partial", "inconclusive", "conflict", "unavailable"])
 def test_degraded_stable_search_projects_full_rows_without_bodies(mode: str):
     data: dict[str, object] = {"results": [_document_payload()]}
@@ -275,26 +321,62 @@ def test_degraded_stable_search_projects_full_rows_without_bodies(mode: str):
     assert result.artifact.outcome.partial_data == ({"conflict": True} if mode == "conflict" else {})
 
 
-def test_document_applies_8k_and_32k_body_limits_in_complete_and_degraded_modes():
-    body = "x" * 40_001
-    payload = _document_payload(body=body)
-    result = _run(_document(_runtime(lambda request: httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload}))))
-
-    assert len(result.content.body) == 8_000
-    assert result.content.returned_body_characters == 8_000
-    assert result.content.omitted_body_characters == 32_001
-    assert result.content.truncated is True
+@pytest.mark.parametrize("mode", ["complete", "partial", "unavailable", "conflict"])
+@pytest.mark.parametrize(
+    ("length", "content_returned", "content_omitted", "content_truncated", "artifact_returned", "artifact_omitted", "artifact_truncated"),
+    [
+        (8_000, 8_000, 0, False, 8_000, 0, False),
+        (8_001, 8_000, 1, True, 8_001, 0, False),
+        (32_000, 8_000, 24_000, True, 32_000, 0, False),
+        (32_001, 8_000, 24_001, True, 32_000, 1, True),
+    ],
+)
+def test_document_body_limits_have_exact_nested_and_top_level_semantics(
+    mode: str,
+    length: int,
+    content_returned: int,
+    content_omitted: int,
+    content_truncated: bool,
+    artifact_returned: int,
+    artifact_omitted: int,
+    artifact_truncated: bool,
+):
+    data = _document_payload(body="x" * length)
+    if mode == "conflict":
+        data["conflict"] = True
+    result = _run(
+        _document(
+            _runtime(
+                lambda request: httpx.Response(
+                    200,
+                    json={"mode": mode, "notes": "modo", "data": data},
+                )
+            )
+        )
+    )
+    content_document = (
+        result.content if mode == "complete" else result.content.document
+    )
     artifact_document = result.artifact.outcome.document
-    assert len(artifact_document.body) == 32_000
-    assert artifact_document.omitted_body_characters == 8_001
+    content_data = (
+        content_document.model_dump(mode="json")
+        if mode == "complete"
+        else content_document
+    )
+    artifact_data = artifact_document.model_dump(mode="json") if mode == "complete" else artifact_document
 
-    partial = {"id": "kb_proc_001", "body": body, "conflict": True}
-    degraded = _run(_document(_runtime(lambda request: httpx.Response(200, json={"mode": "conflict", "notes": "conflito", "data": partial}))))
-    assert len(degraded.content.document["body"]) == 8_000
-    assert len(degraded.artifact.outcome.document["body"]) == 32_000
-    assert degraded.artifact.outcome.partial_data == {"conflict": True}
-    assert json.dumps(degraded.content.model_dump(mode="json"), allow_nan=False)
-    assert json.dumps(degraded.artifact.model_dump(mode="json"), allow_nan=False)
+    assert len(content_data["body"]) == content_returned
+    assert content_data["returned_body_characters"] == content_returned
+    assert content_data["omitted_body_characters"] == content_omitted
+    assert content_data["truncated"] is content_truncated
+    assert len(artifact_data["body"]) == artifact_returned
+    assert artifact_data["returned_body_characters"] == artifact_returned
+    assert artifact_data["omitted_body_characters"] == artifact_omitted
+    assert artifact_data["truncated"] is artifact_truncated
+    assert result.artifact.truncated is artifact_truncated
+    assert result.artifact.omitted_items == 0
+    assert json.dumps(result.content.model_dump(mode="json"), allow_nan=False)
+    assert json.dumps(result.artifact.model_dump(mode="json"), allow_nan=False)
 
 
 def test_degraded_model_projects_only_known_fields_and_api_errors_are_exact():
