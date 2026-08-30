@@ -8,11 +8,11 @@ import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import ValidationError
 
-from tractian_agent.checkpoint import open_checkpointer
+from tractian_agent.checkpoint import LocalCheckpointOwner, open_checkpointer
 from tractian_agent.client import IndustrialApiClient
 from tractian_agent.contracts import Identity, SupportRequest
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
-from tractian_agent.graph import build_agent_graph
+from tractian_agent.graph import CompiledAgentGraph, build_agent_graph
 from tractian_agent.state import (
     AgentDecision,
     AgentState,
@@ -275,6 +275,47 @@ def test_build_graph_rejects_checkpointer_outside_managed_lifecycle(
                 match="construa-o com open_checkpointer",
             ):
                 build_agent_graph(saver)
+
+    asyncio.run(scenario())
+
+
+def test_compiled_graph_constructor_rejects_owner_injection_before_access(
+    tmp_path: Path,
+):
+    async def scenario():
+        async with open_checkpointer(tmp_path / "checkpoints.sqlite3") as saver:
+            managed = build_agent_graph(saver)
+            compiled = managed._graph
+            accesses = []
+
+            async def forbidden_get_state(*args, **kwargs):
+                accesses.append("aget_state")
+                raise AssertionError("construtor não pode ler checkpoint")
+
+            async def forbidden_invoke(*args, **kwargs):
+                accesses.append("ainvoke")
+                raise AssertionError("construtor não pode invocar grafo")
+
+            compiled.aget_state = forbidden_get_state
+            compiled.ainvoke = forbidden_invoke
+            with pytest.raises(TypeError):
+                CompiledAgentGraph(compiled, LocalCheckpointOwner())
+            assert accesses == []
+
+            derived = CompiledAgentGraph(compiled)
+            derived_entered = asyncio.Event()
+
+            async def enter_derived_lock():
+                async with derived.thread_lock("thread_constructor_probe"):
+                    derived_entered.set()
+
+            async with managed.thread_lock("thread_constructor_probe"):
+                contender = asyncio.create_task(enter_derived_lock())
+                await asyncio.sleep(0)
+                assert not derived_entered.is_set()
+            await contender
+            assert derived_entered.is_set()
+            assert accesses == []
 
     asyncio.run(scenario())
 

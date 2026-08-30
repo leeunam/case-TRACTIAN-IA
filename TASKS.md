@@ -372,10 +372,12 @@ de pickle nem módulos JSON/MsgPack arbitrários. A fronteira Python exige
 `context_schema`, recebe o mesmo objeto em `context` e nunca persiste cliente,
 seed ou contexto. O trecho `aget_state → decisão/update → ainvoke` é serializado
 por lock local efêmero de cada `thread_id`, pertencente ao owner ativo do
-checkpointer. Todos os wrappers do mesmo saver compartilham o pool; uma segunda
-abertura do mesmo namespace no processo é recusada, e o registro é liberado no
-fechamento. Threads distintos não se bloqueiam. A garantia pressupõe um único
-event loop por owner e não promete lease multiprocesso.
+checkpointer. Todo wrapper deriva obrigatoriamente o owner do checkpointer do
+grafo compilado, sem aceitar owner injetado, e wrappers do mesmo saver
+compartilham o pool. Uma segunda abertura do mesmo namespace no processo é
+recusada, e o registro é liberado no fechamento. Threads distintos não se
+bloqueiam. A garantia pressupõe um único event loop por owner e não promete
+lease multiprocesso.
 Criação e retomada executável usam `durability="sync"`. Nova `request_id` zera o
 progresso e aplica novo `step_limit`; a mesma request parcial retoma somente os
 nós pendentes e preserva orçamento. Antes de toda retomada, o único
@@ -391,9 +393,9 @@ nem são removidos automaticamente nesta fatia; a remoção disponível é
 `adelete_thread(thread_id)`. Intenções preexistentes são apenas preservadas,
 inclusive `expires_at` e chave, sem geração ou reuso.
 
-**Evidência desta fatia:** os 29 testes de checkpoint, grafo e fronteira, os
-330 testes focados com os contratos herdados e o `make test` completo passaram;
-a execução global totalizou 59 testes da API e 735 do agente, com
+**Evidência desta fatia:** os 30 testes de checkpoint, grafo e fronteira, os
+331 testes focados com os contratos herdados e o `make test` completo passaram;
+a execução global totalizou 59 testes da API e 736 do agente, com
 somente o aviso de depreciação já conhecido do `python_multipart`.
 
 **Arquivos:** adicionar `langgraph-checkpoint-sqlite>=3.1.1,<3.2`; criar `agent/src/tractian_agent/checkpoint.py`, `agent/src/tractian_agent/graph.py`, `agent/src/tractian_agent/entrypoint.py` e testes focados; atualizar lock.

@@ -12,7 +12,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
 from langgraph.types import StateSnapshot
 
-from tractian_agent.checkpoint import LocalCheckpointOwner, get_checkpoint_owner
+from tractian_agent.checkpoint import get_checkpoint_owner
 from tractian_agent.client import IndustrialApiClient
 from tractian_agent.state import (
     AgentDecision,
@@ -30,13 +30,9 @@ MINIMAL_GRAPH_STEP_COUNT = 3
 class CompiledAgentGraph:
     """Grafo compilado que reutiliza o owner local do checkpointer."""
 
-    def __init__(
-        self,
-        graph: CompiledStateGraph,
-        owner: LocalCheckpointOwner,
-    ) -> None:
+    def __init__(self, graph: CompiledStateGraph) -> None:
         self._graph = graph
-        self._checkpoint_owner = owner
+        self._checkpoint_owner = get_checkpoint_owner(graph.checkpointer)
 
     def thread_lock(self, thread_id: str) -> AbstractAsyncContextManager[None]:
         return self._checkpoint_owner.thread_lock(thread_id)
@@ -123,7 +119,6 @@ def build_agent_graph(
     checkpointer: BaseCheckpointSaver[str],
 ) -> CompiledAgentGraph:
     """Compila o fluxo acíclico ``ingest → route → finish``."""
-    owner = get_checkpoint_owner(checkpointer)
     builder = StateGraph(AgentState, context_schema=ReadToolRuntime)
     builder.add_node("ingest", _ingest)
     builder.add_node("route", _route)
@@ -132,7 +127,4 @@ def build_agent_graph(
     builder.add_edge("ingest", "route")
     builder.add_edge("route", "finish")
     builder.add_edge("finish", END)
-    return CompiledAgentGraph(
-        builder.compile(checkpointer=checkpointer),
-        owner,
-    )
+    return CompiledAgentGraph(builder.compile(checkpointer=checkpointer))
