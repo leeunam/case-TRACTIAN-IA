@@ -1,9 +1,17 @@
+from datetime import datetime, timedelta, timezone
 import json
 
 import pytest
 from pydantic import JsonValue, ValidationError
 
-from tractian_agent.contracts import Identity, SupportRequest, ToolCall
+from tractian_agent.contracts import (
+    ActionReceipt,
+    ApiError,
+    ApiErrorCategory,
+    Identity,
+    SupportRequest,
+    ToolCall,
+)
 from tractian_agent.state import (
     AgentDecision,
     AgentState,
@@ -21,7 +29,13 @@ from tractian_agent.tools.observations import (
     ToolSource,
 )
 from tractian_agent.tools.runtime import TrustedIdentity
-from tractian_agent.write_contracts import IntentStatus, ReprocessIntentScope, WriteIntent
+from tractian_agent.write_contracts import (
+    IntentStatus,
+    PersistedActionReceipt,
+    PersistedApiError,
+    ReprocessIntentScope,
+    WriteIntent,
+)
 from tractian_agent.write_policy import (
     ApprovalSource,
     PolicyDecision,
@@ -97,6 +111,14 @@ def _intent() -> WriteIntent:
         ),
         status=IntentStatus.PREPARED,
         idempotency_key="tractian-agent:018f3a",
+        expires_at=datetime(
+            2026,
+            9,
+            6,
+            9,
+            30,
+            tzinfo=timezone(timedelta(hours=-3)),
+        ),
         prepared_execution_id="exec_01",
         attempts=0,
     )
@@ -226,6 +248,22 @@ def test_same_thread_fails_closed_for_another_case_company_or_person(
         )
 
 
+@pytest.mark.parametrize(
+    ("scope_field", "other_value"),
+    [
+        ("case_id", "case_other"),
+        ("company_id", "comp_other"),
+        ("user_id", "usr_other"),
+    ],
+)
+def test_state_rejects_intent_from_another_thread_scope(scope_field, other_value):
+    intent_data = _intent().model_dump(mode="python")
+    intent_data["scope"][scope_field] = other_value
+
+    with pytest.raises(ValidationError, match="intenção.*escopo"):
+        _state(intents=(WriteIntent.model_validate(intent_data),))
+
+
 def test_every_continuation_requires_a_new_execution_id():
     with pytest.raises(ValueError, match="execution_id"):
         _state().continue_with(
@@ -237,6 +275,135 @@ def test_every_continuation_requires_a_new_execution_id():
         )
 
 
+def test_same_request_resume_requires_identical_request_and_preserves_progress():
+    approval = TrustedActionApproval(
+        action="reprocess_analysis",
+        target_id="an_9906",
+        source=ApprovalSource.CONFIRMATION,
+    )
+    state = _state(
+        messages=(PersistedMessage(role="user", content="Solicitação original."),),
+        evidence=(
+            StateEvidence(
+                evidence_id="evidence_01",
+                call_id="call_01",
+                value={"analysis_id": "an_9906"},
+            ),
+        ),
+        decision=AgentDecision.ACT,
+        step_count=2,
+        pending_proposal=ReprocessProposal(
+            analysis_id="an_9906",
+            justification="Rolamento substituído; solicitar novo processamento.",
+        ),
+        approval=approval,
+        intents=(_intent(),),
+        final_result=FinalResult(
+            decision=AgentDecision.ACT,
+            message="Aguardando execução.",
+        ),
+        review=ReviewRecord(status=ReviewStatus.NOT_REQUIRED),
+    )
+
+    resumed = state.continue_with(
+        request=_request(),
+        identity=_identity(),
+        permissions=frozenset({"read"}),
+        request_id="req_01",
+        execution_id="exec_02",
+    )
+
+    assert resumed.step_count == 2
+    assert resumed.decision is AgentDecision.ACT
+    assert resumed.pending_proposal is not None
+    assert resumed.approval == approval
+    assert resumed.final_result is not None
+    assert resumed.review is not None
+    assert resumed.messages == state.messages
+    assert resumed.evidence == state.evidence
+    assert resumed.intents == state.intents
+
+    changed_request = _request().model_copy(update={"message": "Pedido alterado."})
+    with pytest.raises(ValueError, match="solicitação.*idêntica"):
+        state.continue_with(
+            request=changed_request,
+            identity=_identity(),
+            permissions=frozenset({"read"}),
+            request_id="req_01",
+            execution_id="exec_03",
+        )
+
+
+def test_new_request_preserves_audit_and_intents_but_resets_transient_state():
+    call = ToolCall[dict[str, JsonValue]](
+        call_id="call_01",
+        name="get_analysis",
+        arguments={"analysis_id": "an_9906"},
+    )
+    observation = ToolObservation(
+        call_id="call_01",
+        artifact=ToolArtifact(
+            tool_name="get_analysis",
+            arguments={"analysis_id": "an_9906"},
+            source=ToolSource(kind="industrial_api", resource="/analyses/an_9906"),
+            outcome=ToolOutcome(partial_data={"status": "current"}),
+        ),
+    )
+    state = _state(
+        messages=(PersistedMessage(role="user", content="Solicitação original."),),
+        tool_calls=(call,),
+        tool_observations=(observation,),
+        evidence=(
+            StateEvidence(
+                evidence_id="evidence_01",
+                call_id="call_01",
+                value={"analysis_id": "an_9906"},
+            ),
+        ),
+        decision=AgentDecision.ACT,
+        step_count=3,
+        pending_proposal=ReprocessProposal(
+            analysis_id="an_9906",
+            justification="Rolamento substituído; solicitar novo processamento.",
+        ),
+        approval=TrustedActionApproval(
+            action="reprocess_analysis",
+            target_id="an_9906",
+            source=ApprovalSource.CONFIRMATION,
+        ),
+        intents=(_intent(),),
+        final_result=FinalResult(
+            decision=AgentDecision.ACT,
+            message="Reprocesso preparado.",
+        ),
+        review=ReviewRecord(status=ReviewStatus.NOT_REQUIRED),
+    )
+    next_request = _request().model_copy(
+        update={"message": "Qual é o estado atual da análise?"}
+    )
+
+    continued = state.continue_with(
+        request=next_request,
+        identity=_identity(),
+        permissions=frozenset({"read"}),
+        request_id="req_02",
+        execution_id="exec_02",
+    )
+
+    assert continued.messages == state.messages
+    assert continued.tool_calls == state.tool_calls
+    assert continued.tool_observations == state.tool_observations
+    assert continued.evidence == state.evidence
+    assert continued.intents == state.intents
+    assert continued.decision is None
+    assert continued.step_count == 0
+    assert continued.pending_proposal is None
+    assert continued.approval is None
+    assert continued.final_result is None
+    assert continued.review is None
+    assert continued.advance_step().step_count == 1
+
+
 def test_state_rejects_extra_fields_and_mutation():
     with pytest.raises(ValidationError):
         _state(client=object())
@@ -244,6 +411,51 @@ def test_state_rejects_extra_fields_and_mutation():
     state = _state()
     with pytest.raises(ValidationError):
         state.execution_id = "exec_fabricated"
+
+
+def test_state_is_detached_from_mutable_request_calls_artifact_and_evidence():
+    request = _request()
+    call = ToolCall[dict[str, JsonValue]](
+        call_id="call_01",
+        name="get_analysis",
+        arguments={"analysis_id": "an_9906"},
+    )
+    artifact = ToolArtifact(
+        tool_name="get_analysis",
+        arguments={"analysis_id": "an_9906"},
+        source=ToolSource(kind="industrial_api", resource="/analyses/an_9906"),
+        outcome=ToolOutcome(partial_data={"status": "current"}),
+    )
+    evidence_value = {"analysis_id": "an_9906", "status": "current"}
+    state = _state(
+        request=request,
+        tool_calls=(call,),
+        tool_observations=(ToolObservation(call_id="call_01", artifact=artifact),),
+        evidence=(
+            StateEvidence(
+                evidence_id="evidence_01",
+                call_id="call_01",
+                value=evidence_value,
+            ),
+        ),
+    )
+    persisted_before = state.model_dump_json()
+
+    request.message = "conteúdo mutado"
+    call.arguments["client"] = "leaked"
+    artifact.arguments["client"] = "leaked"
+    artifact.outcome.partial_data["client"] = "leaked"
+    evidence_value["client"] = "leaked"
+
+    assert state.model_dump_json() == persisted_before
+    with pytest.raises(ValidationError):
+        state.request.message = "outra mutação"
+    with pytest.raises(TypeError):
+        state.tool_calls[0].arguments["client"] = "leaked"
+    with pytest.raises(TypeError):
+        state.tool_observations[0].artifact.outcome.partial_data["client"] = "leaked"
+    with pytest.raises(TypeError):
+        state.evidence[0].value["client"] = "leaked"
 
 
 def test_state_serializes_to_plain_json_without_runtime_or_restricted_data():
@@ -254,6 +466,20 @@ def test_state_serializes_to_plain_json_without_runtime_or_restricted_data():
                 call_id="call_01",
                 name="get_asset",
                 arguments={"asset_id": "asset_G501"},
+            ),
+        ),
+        tool_observations=(
+            ToolObservation(
+                call_id="call_01",
+                artifact=ToolArtifact(
+                    tool_name="get_analysis",
+                    arguments={"analysis_id": "an_9906"},
+                    source=ToolSource(
+                        kind="industrial_api",
+                        resource="/analyses/an_9906",
+                    ),
+                    outcome=ToolOutcome(partial_data={"status": "current"}),
+                ),
             ),
         ),
         evidence=(
@@ -286,11 +512,104 @@ def test_state_serializes_to_plain_json_without_runtime_or_restricted_data():
         )
 
 
+def test_agent_state_round_trips_real_json_with_receipt_error_and_offset():
+    prepared_data = _intent().model_dump(mode="python")
+    completed_data = {
+        **prepared_data,
+        "intent_id": "intent_completed",
+        "status": IntentStatus.COMPLETED,
+        "attempts": 1,
+        "receipt": ActionReceipt(
+            accepted=True,
+            action_id="act_1234abcd",
+            message="Reprocesso aceito.",
+        ),
+    }
+    failed_data = {
+        **prepared_data,
+        "intent_id": "intent_failed",
+        "status": IntentStatus.FAILED,
+        "attempts": 1,
+        "error": ApiError(
+            category=ApiErrorCategory.TRANSPORT,
+            code="CONNECTION_LOST",
+            message="Conexão encerrada sem resposta.",
+        ),
+    }
+    state = _state(
+        messages=(PersistedMessage(role="user", content="Investigue a análise."),),
+        tool_calls=(
+            ToolCall[dict[str, JsonValue]](
+                call_id="call_01",
+                name="get_analysis",
+                arguments={"analysis_id": "an_9906"},
+            ),
+        ),
+        tool_observations=(
+            ToolObservation(
+                call_id="call_01",
+                artifact=ToolArtifact(
+                    tool_name="get_analysis",
+                    arguments={"analysis_id": "an_9906"},
+                    source=ToolSource(
+                        kind="industrial_api",
+                        resource="/analyses/an_9906",
+                    ),
+                    outcome=ToolOutcome(partial_data={"status": "current"}),
+                ),
+            ),
+        ),
+        evidence=(
+            StateEvidence(
+                evidence_id="evidence_01",
+                call_id="call_01",
+                value={"analysis_id": "an_9906", "status": "current"},
+            ),
+        ),
+        intents=(
+            WriteIntent.model_validate(completed_data),
+            WriteIntent.model_validate(failed_data),
+        ),
+    )
+
+    restored = AgentState.model_validate_json(state.model_dump_json())
+
+    assert restored == state
+    assert isinstance(restored.intents[0].receipt, PersistedActionReceipt)
+    assert isinstance(restored.intents[1].error, PersistedApiError)
+    assert restored.intents[0].expires_at.utcoffset() == timedelta(hours=-3)
+
+
 @pytest.mark.parametrize(
     "forbidden_name",
-    ["client", "transport", "token", "golden_set", "expected_paths"],
+    [
+        "case_id",
+        "company_id",
+        "user_id",
+        "identity",
+        "permissions",
+        "approval",
+        "thread_id",
+        "request_id",
+        "execution_id",
+        "idempotency_key",
+        "central_asset_id",
+        "configured_model_id",
+        "client",
+        "transport",
+        "seed",
+        "runtime",
+        "context",
+        "url",
+        "method",
+        "headers",
+        "token",
+        "golden_set",
+        "expected_paths",
+        "test_scenarios",
+    ],
 )
-def test_state_rejects_restricted_names_inside_persisted_json(forbidden_name):
+def test_tool_call_rejects_all_trusted_public_argument_names(forbidden_name):
     with pytest.raises(ValidationError):
         _state(
             tool_calls=(
@@ -299,6 +618,149 @@ def test_state_rejects_restricted_names_inside_persisted_json(forbidden_name):
                     name="get_asset",
                     arguments={forbidden_name: "must-not-persist"},
                 ),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "forbidden_name",
+    [
+        "case_id",
+        "company_id",
+        "user_id",
+        "identity",
+        "permissions",
+        "approval",
+        "thread_id",
+        "request_id",
+        "execution_id",
+        "idempotency_key",
+        "central_asset_id",
+        "configured_model_id",
+        "client",
+        "transport",
+        "seed",
+        "runtime",
+        "context",
+        "url",
+        "method",
+        "headers",
+        "token",
+        "golden_set",
+        "expected_paths",
+        "test_scenarios",
+    ],
+)
+def test_artifact_rejects_all_trusted_public_argument_names(forbidden_name):
+    with pytest.raises(ValidationError):
+        _state(
+            tool_observations=(
+                ToolObservation(
+                    call_id="call_01",
+                    artifact=ToolArtifact(
+                        tool_name="get_asset",
+                        arguments={forbidden_name: "must-not-persist"},
+                        source=ToolSource(
+                            kind="industrial_api",
+                            resource="/assets/asset_G501",
+                        ),
+                        outcome=ToolOutcome(),
+                    ),
+                ),
+            ),
+        )
+
+
+def test_technical_evidence_and_result_allow_legitimate_domain_names():
+    domain_data = {
+        "case_id": "case_tkt_inv_04",
+        "company_id": "comp_mineracao_andes",
+        "user_id": "usr_pedro",
+        "request": "inspeção",
+        "response": "estável",
+        "method": "detecção sintomática",
+        "context": "domínio industrial",
+        "store": "almoxarifado",
+    }
+
+    state = _state(
+        tool_observations=(
+            ToolObservation(
+                call_id="call_01",
+                artifact=ToolArtifact(
+                    tool_name="get_analysis",
+                    arguments={"analysis_id": "an_9906"},
+                    source=ToolSource(
+                        kind="industrial_api",
+                        resource="/analyses/an_9906",
+                    ),
+                    outcome=ToolOutcome(partial_data=domain_data),
+                ),
+            ),
+        ),
+        evidence=(
+            StateEvidence(
+                evidence_id="evidence_01",
+                call_id="call_01",
+                value=domain_data,
+            ),
+        ),
+    )
+
+    assert state.evidence[0].value["company_id"] == "comp_mineracao_andes"
+    assert (
+        state.tool_observations[0].artifact.outcome.partial_data["method"]
+        == "detecção sintomática"
+    )
+
+
+@pytest.mark.parametrize(
+    "forbidden_name",
+    [
+        "client",
+        "transport",
+        "runtime",
+        "authorization",
+        "api_token",
+        "credential",
+        "golden_set",
+        "golden",
+        "eval",
+        "evaluation",
+        "expected_paths",
+        "test_scenarios",
+        "evaluation_seed",
+        "raw_http_response",
+        "reasoning_trace",
+    ],
+)
+def test_technical_evidence_rejects_runtime_credentials_and_evaluation(
+    forbidden_name,
+):
+    with pytest.raises(ValidationError):
+        _state(
+            evidence=(
+                StateEvidence(
+                    evidence_id="evidence_01",
+                    call_id="call_01",
+                    value={forbidden_name: "must-not-persist"},
+                ),
+            ),
+        )
+
+
+def test_technical_result_rejects_runtime_data():
+    with pytest.raises(ValidationError):
+        ToolObservation(
+            call_id="call_01",
+            artifact=ToolArtifact(
+                tool_name="get_analysis",
+                arguments={"analysis_id": "an_9906"},
+                source=ToolSource(
+                    kind="industrial_api",
+                    resource="/analyses/an_9906",
+                ),
+                outcome=ToolOutcome(partial_data={"runtime": "must-not-persist"}),
             ),
         )
 
