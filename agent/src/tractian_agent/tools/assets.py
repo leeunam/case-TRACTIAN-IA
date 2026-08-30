@@ -8,10 +8,15 @@ from langchain.tools import tool
 from langgraph.prebuilt import ToolRuntime
 from pydantic import ConfigDict, Field, JsonValue
 
-from tractian_agent.contracts import ApiError, ApiResult, ResponseMode, StrictModel
+from tractian_agent.contracts import ApiError, ResponseMode, StrictModel
 
 from .identifiers import AssetId
-from .observations import ToolArtifact, ToolOutcome, ToolSource
+from .observations import (
+    ToolArtifact,
+    ToolOutcome,
+    ToolSource,
+    assert_safe_partial_json,
+)
 from .runtime import ReadToolRuntime
 
 
@@ -192,39 +197,9 @@ def _assert_complete_point_scope(asset: _AssetWire, runtime: ReadToolRuntime) ->
             raise ValueError("A API retornou um ponto de outro ativo.")
 
 
-_FORBIDDEN_DEGRADED_KEYS = frozenset(
-    {
-        "user_id",
-        "identity",
-        "permissions",
-        "client",
-        "seed",
-        "authorization",
-        "token",
-        "access_token",
-        "headers",
-        "url",
-        "method",
-        "request",
-        "response",
-    }
-)
-
-
-def _reject_forbidden_degraded_keys(value: JsonValue) -> None:
-    if isinstance(value, Mapping):
-        for key, nested_value in value.items():
-            if key.lower() in _FORBIDDEN_DEGRADED_KEYS:
-                raise ValueError("A resposta degradada contém um campo proibido.")
-            _reject_forbidden_degraded_keys(nested_value)
-    elif isinstance(value, list):
-        for item in value:
-            _reject_forbidden_degraded_keys(item)
-
-
 def _assert_degraded_scope(data: JsonValue, runtime: ReadToolRuntime) -> None:
+    assert_safe_partial_json(data)
     if isinstance(data, Mapping):
-        _reject_forbidden_degraded_keys(data)
         if "id" in data:
             if data["id"] is None:
                 raise ValueError("A resposta degradada contém um identificador nulo.")
@@ -237,14 +212,16 @@ def _assert_degraded_scope(data: JsonValue, runtime: ReadToolRuntime) -> None:
             _assert_returned_scope(
                 asset_id=None, company_id=data["company_id"], runtime=runtime
             )
-        points = data.get("points")
-        if isinstance(points, list):
+        if "points" in data:
+            points = data["points"]
+            if not isinstance(points, list):
+                raise ValueError("A resposta degradada contém pontos inválidos.")
             for point in points:
-                if isinstance(point, Mapping) and "asset_id" in point:
+                if not isinstance(point, Mapping):
+                    raise ValueError("A resposta degradada contém um ponto inválido.")
+                if "asset_id" in point:
                     if point["asset_id"] is None or point["asset_id"] != runtime.central_asset_id:
                         raise ValueError("A resposta degradada contém um ponto de outro ativo.")
-    else:
-        _reject_forbidden_degraded_keys(data)
 
 
 async def execute_get_asset(

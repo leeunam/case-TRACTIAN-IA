@@ -434,6 +434,71 @@ def test_get_asset_rejects_forbidden_nested_partial_context_before_exposure():
         _invoke(_runtime(handler))
 
 
+@pytest.mark.parametrize(
+    "partial_data",
+    [
+        {"id": "asset_M101", "nested": {"X-User-Id": "usr_secret"}},
+        {"id": "asset_M101", "nested": {"api key": "secret"}},
+        {"id": "asset_M101", "nested": {"Refresh-Token": "secret"}},
+        {"id": "asset_M101", "nested": {"RAW response": {"body": "..."}}},
+        {"id": "asset_M101", "nested": {"Central Asset Id": "asset_M101"}},
+    ],
+)
+def test_get_asset_rejects_normalized_sensitive_partial_keys(
+    partial_data: dict[str, object],
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"mode": "partial", "notes": "Resposta degradada.", "data": partial_data},
+        )
+
+    with pytest.raises(ValueError, match="proibido"):
+        _invoke(_runtime(handler))
+
+
+def test_get_asset_preserves_legitimate_partial_domain_and_status_fields():
+    partial_data = {
+        "id": "asset_M101",
+        "company_id": "comp_forja_br",
+        "status_code": 206,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"mode": "partial", "notes": "Resposta degradada.", "data": partial_data},
+        )
+
+    result = _invoke(_runtime(handler))
+
+    assert result.artifact.outcome.partial_data == partial_data
+
+
+@pytest.mark.parametrize(
+    "points",
+    [
+        {"asset_id": "asset_other"},
+        ["pt_M101_de"],
+        [{"asset_id": None}],
+        [{"asset_id": "asset_other"}],
+    ],
+)
+def test_get_asset_rejects_invalid_degraded_points_structure(points: object):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "partial",
+                "notes": "Resposta degradada.",
+                "data": {"id": "asset_M101", "points": points},
+            },
+        )
+
+    with pytest.raises(ValueError, match="pontos|ponto"):
+        _invoke(_runtime(handler))
+
+
 def test_get_asset_preserves_api_error_exactly():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
