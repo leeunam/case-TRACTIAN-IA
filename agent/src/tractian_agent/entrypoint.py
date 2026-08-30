@@ -50,8 +50,15 @@ class AgentGraph(Protocol):
         config: dict[str, object],
         values: dict[str, object],
         *,
-        as_node: str | None = None,
+        as_node: str,
     ) -> dict[str, object]: ...
+
+
+_PENDING_PREDECESSORS = {
+    "ingest": START,
+    "route": "ingest",
+    "finish": "route",
+}
 
 
 def _require_opaque_id(value: str, *, name: str) -> str:
@@ -60,6 +67,27 @@ def _require_opaque_id(value: str, *, name: str) -> str:
     ):
         raise ValueError(f"{name} é obrigatório e não aceita espaços")
     return value
+
+
+def _pending_predecessor(next_nodes: tuple[str, ...]) -> str:
+    if not next_nodes:
+        raise AgentInvocationProtocolError(
+            "NON_TERMINAL_WITHOUT_PENDING_WORK",
+            "checkpoint não terminal não possui trabalho pendente",
+        )
+    if len(next_nodes) != 1:
+        raise AgentInvocationProtocolError(
+            "MULTIPLE_PENDING_NODES",
+            "checkpoint possui múltiplos nós pendentes",
+        )
+    pending_node = next_nodes[0]
+    try:
+        return _PENDING_PREDECESSORS[pending_node]
+    except KeyError as error:
+        raise AgentInvocationProtocolError(
+            "UNKNOWN_PENDING_NODE",
+            f"checkpoint possui nó pendente desconhecido: {pending_node}",
+        ) from error
 
 
 async def invoke_agent(
@@ -109,11 +137,7 @@ async def invoke_agent(
                 )
                 invocation_input = None
             else:
-                if not snapshot.next:
-                    raise AgentInvocationProtocolError(
-                        "NON_TERMINAL_WITHOUT_PENDING_WORK",
-                        "checkpoint não terminal não possui trabalho pendente",
-                    )
+                predecessor = _pending_predecessor(snapshot.next)
                 if state.step_limit < MINIMAL_GRAPH_STEP_COUNT:
                     raise AgentInvocationProtocolError(
                         "STEP_LIMIT_EXHAUSTED",
@@ -122,6 +146,7 @@ async def invoke_agent(
                 config = await graph.aupdate_state(
                     snapshot.config,
                     state.model_dump(mode="json"),
+                    as_node=predecessor,
                 )
                 invocation_input = None
         else:

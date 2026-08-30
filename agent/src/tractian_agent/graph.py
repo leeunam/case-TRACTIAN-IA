@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import AsyncIterator
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass
+from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 from langchain_core.runnables.config import RunnableConfig
@@ -15,6 +12,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
 from langgraph.types import StateSnapshot
 
+from tractian_agent.checkpoint import LocalCheckpointOwner, get_checkpoint_owner
 from tractian_agent.client import IndustrialApiClient
 from tractian_agent.state import (
     AgentDecision,
@@ -29,46 +27,19 @@ from tractian_agent.tools.runtime import ReadToolRuntime
 MINIMAL_GRAPH_STEP_COUNT = 3
 
 
-@dataclass
-class _LockEntry:
-    lock: asyncio.Lock
-    users: int = 0
-
-
-class _ThreadLockPool:
-    """Locks locais efêmeros; não oferecem lease entre processos."""
-
-    def __init__(self) -> None:
-        self._entries: dict[str, _LockEntry] = {}
-        self._registry_lock = asyncio.Lock()
-
-    @asynccontextmanager
-    async def hold(self, thread_id: str) -> AsyncIterator[None]:
-        async with self._registry_lock:
-            entry = self._entries.get(thread_id)
-            if entry is None:
-                entry = _LockEntry(lock=asyncio.Lock())
-                self._entries[thread_id] = entry
-            entry.users += 1
-        try:
-            async with entry.lock:
-                yield
-        finally:
-            async with self._registry_lock:
-                entry.users -= 1
-                if entry.users == 0:
-                    del self._entries[thread_id]
-
-
 class CompiledAgentGraph:
-    """Grafo compilado e locks com o mesmo ciclo de vida local."""
+    """Grafo compilado que reutiliza o owner local do checkpointer."""
 
-    def __init__(self, graph: CompiledStateGraph) -> None:
+    def __init__(
+        self,
+        graph: CompiledStateGraph,
+        owner: LocalCheckpointOwner,
+    ) -> None:
         self._graph = graph
-        self._thread_locks = _ThreadLockPool()
+        self._checkpoint_owner = owner
 
     def thread_lock(self, thread_id: str) -> AbstractAsyncContextManager[None]:
-        return self._thread_locks.hold(thread_id)
+        return self._checkpoint_owner.thread_lock(thread_id)
 
     async def aget_state(self, config: RunnableConfig) -> StateSnapshot:
         return await self._graph.aget_state(config)
@@ -152,6 +123,7 @@ def build_agent_graph(
     checkpointer: BaseCheckpointSaver[str],
 ) -> CompiledAgentGraph:
     """Compila o fluxo acíclico ``ingest → route → finish``."""
+    owner = get_checkpoint_owner(checkpointer)
     builder = StateGraph(AgentState, context_schema=ReadToolRuntime)
     builder.add_node("ingest", _ingest)
     builder.add_node("route", _route)
@@ -160,4 +132,7 @@ def build_agent_graph(
     builder.add_edge("ingest", "route")
     builder.add_edge("route", "finish")
     builder.add_edge("finish", END)
-    return CompiledAgentGraph(builder.compile(checkpointer=checkpointer))
+    return CompiledAgentGraph(
+        builder.compile(checkpointer=checkpointer),
+        owner,
+    )

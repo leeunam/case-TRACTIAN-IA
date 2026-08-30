@@ -68,3 +68,23 @@ def test_default_checkpointer_path_creates_parent_and_closes_connection(
         assert (foreign_cwd / explicit_path).is_file()
 
     asyncio.run(scenario())
+
+
+def test_checkpoint_namespace_has_only_one_active_local_owner(tmp_path: Path):
+    checkpoint_path = tmp_path / "checkpoints.sqlite3"
+
+    async def scenario():
+        async with open_checkpointer(checkpoint_path):
+            with pytest.raises(
+                RuntimeError,
+                match="namespace do checkpoint já possui owner local ativo",
+            ):
+                async with open_checkpointer(checkpoint_path):
+                    pass
+
+        async with open_checkpointer(checkpoint_path) as reopened_saver:
+            await reopened_saver.aget(
+                {"configurable": {"thread_id": "owner_reopened"}}
+            )
+
+    asyncio.run(scenario())

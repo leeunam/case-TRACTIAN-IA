@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import ValidationError
 
 from tractian_agent.checkpoint import open_checkpointer
@@ -93,12 +94,14 @@ def _initial_state(
 
 
 class _RecordingGraph:
-    def __init__(self, values=None):
+    def __init__(self, values=None, *, next_nodes=()):
         self.values = values or {}
+        self.next_nodes = next_nodes
         self.state_config = None
         self.invoke_config = None
         self.durability = None
         self.context = None
+        self.as_node = None
 
     @asynccontextmanager
     async def thread_lock(self, thread_id):
@@ -106,7 +109,11 @@ class _RecordingGraph:
 
     async def aget_state(self, config):
         self.state_config = config
-        return SimpleNamespace(values=self.values, config=config, next=())
+        return SimpleNamespace(
+            values=self.values,
+            config=config,
+            next=self.next_nodes,
+        )
 
     async def ainvoke(self, input, config, *, context=None, durability):
         self.invoke_config = config
@@ -116,6 +123,7 @@ class _RecordingGraph:
 
     async def aupdate_state(self, config, values, *, as_node=None):
         self.values = values
+        self.as_node = as_node
         return config
 
 
@@ -215,6 +223,60 @@ def test_entrypoint_rejects_untrusted_context_before_checkpoint_access():
     graph = asyncio.run(scenario())
     assert graph.state_config is None
     assert graph.invoke_config is None
+
+
+@pytest.mark.parametrize(
+    ("next_nodes", "expected_code"),
+    [
+        ((), "NON_TERMINAL_WITHOUT_PENDING_WORK"),
+        (("route", "finish"), "MULTIPLE_PENDING_NODES"),
+        (("unknown_node",), "UNKNOWN_PENDING_NODE"),
+    ],
+)
+def test_nonterminal_resume_rejects_invalid_pending_work_shape(
+    next_nodes: tuple[str, ...],
+    expected_code: str,
+):
+    state = _initial_state()
+    graph = _RecordingGraph(
+        state.model_dump(mode="json"),
+        next_nodes=next_nodes,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=_runtime(client),
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_resume",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == expected_code
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+def test_build_graph_rejects_checkpointer_outside_managed_lifecycle(
+    tmp_path: Path,
+):
+    async def scenario():
+        async with AsyncSqliteSaver.from_conn_string(
+            str(tmp_path / "unmanaged.sqlite3")
+        ) as saver:
+            with pytest.raises(
+                TypeError,
+                match="construa-o com open_checkpointer",
+            ):
+                build_agent_graph(saver)
+
+    asyncio.run(scenario())
 
 
 def test_ingest_node_requires_and_reads_trusted_runtime_context(tmp_path: Path):
@@ -526,6 +588,78 @@ def test_new_request_recovers_partial_thread_with_a_new_step_limit(tmp_path: Pat
     ]
 
 
+def test_new_request_resumes_from_ingest_after_crash_between_update_and_invoke(
+    tmp_path: Path,
+):
+    checkpoint_path = tmp_path / "checkpoints.sqlite3"
+    config = {"configurable": {"thread_id": "thread_crash_after_start"}}
+    request_a = _request(message="Ciclo anterior concluído.")
+    request_b = _request(message="Novo ciclo recuperável.")
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = _runtime(client)
+            async with open_checkpointer(checkpoint_path) as saver:
+                graph = build_agent_graph(saver)
+                await invoke_agent(
+                    graph,
+                    request=request_a,
+                    runtime=runtime,
+                    thread_id="thread_crash_after_start",
+                    request_id="req_before_crash",
+                    execution_id="exec_before_crash",
+                )
+                original_get_state = graph.aget_state
+
+                async def crash_before_graph_runs(*args, **kwargs):
+                    raise RuntimeError("falha forçada após update START")
+
+                graph.ainvoke = crash_before_graph_runs
+                with pytest.raises(
+                    RuntimeError,
+                    match="falha forçada após update START",
+                ):
+                    await invoke_agent(
+                        graph,
+                        request=request_b,
+                        runtime=runtime,
+                        thread_id="thread_crash_after_start",
+                        request_id="req_after_crash",
+                        execution_id="exec_crashed",
+                    )
+                crashed = await original_get_state(config)
+
+            async with open_checkpointer(checkpoint_path) as reopened_saver:
+                reopened_graph = build_agent_graph(reopened_saver)
+                before_resume = await reopened_graph.aget_state(config)
+                recovered = await invoke_agent(
+                    reopened_graph,
+                    request=request_b,
+                    runtime=runtime,
+                    thread_id="thread_crash_after_start",
+                    request_id="req_after_crash",
+                    execution_id="exec_recovered",
+                )
+                terminal = await reopened_graph.aget_state(config)
+        return crashed, before_resume, recovered, terminal
+
+    crashed, before_resume, recovered, terminal = asyncio.run(scenario())
+
+    assert crashed.next == ("ingest",)
+    assert before_resume.next == ("ingest",)
+    assert before_resume.values["request_id"] == "req_after_crash"
+    assert before_resume.values["step_count"] == 0
+    assert recovered.execution_id == "exec_recovered"
+    assert recovered.step_count == 3
+    assert recovered.final_result is not None
+    assert [message.content for message in recovered.messages] == [
+        "Ciclo anterior concluído.",
+        "Novo ciclo recuperável.",
+    ]
+    assert terminal.next == ()
+    assert terminal.values == recovered.model_dump(mode="json")
+
+
 def test_same_terminal_request_replays_immutable_state_without_ainvoke(
     tmp_path: Path,
 ):
@@ -614,6 +748,48 @@ def test_same_partial_request_resumes_only_pending_nodes_and_preserves_budget(
     assert resumed.step_limit == 3
     assert [message.content for message in resumed.messages] == [
         "Pedido parcialmente processado."
+    ]
+
+
+def test_same_partial_request_after_route_resumes_only_finish(tmp_path: Path):
+    checkpoint_path = tmp_path / "checkpoints.sqlite3"
+    request = _request(message="Pedido roteado antes da retomada.")
+    config = {"configurable": {"thread_id": "thread_resume_after_route"}}
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = _runtime(client)
+            async with open_checkpointer(checkpoint_path) as saver:
+                graph = build_agent_graph(saver)
+                await graph.ainvoke(
+                    _initial_state(
+                        thread_id="thread_resume_after_route",
+                        request=request,
+                    ).model_dump(mode="json"),
+                    config,
+                    context=runtime,
+                    durability="sync",
+                    interrupt_after=["route"],
+                )
+                partial = await graph.aget_state(config)
+                resumed = await invoke_agent(
+                    graph,
+                    request=request,
+                    runtime=runtime,
+                    thread_id="thread_resume_after_route",
+                    request_id="req_01",
+                    execution_id="exec_after_route",
+                )
+        return partial, resumed
+
+    partial, resumed = asyncio.run(scenario())
+
+    assert partial.next == ("finish",)
+    assert partial.values["step_count"] == 2
+    assert resumed.step_count == 3
+    assert resumed.final_result is not None
+    assert [message.content for message in resumed.messages] == [
+        "Pedido roteado antes da retomada."
     ]
 
 
@@ -805,6 +981,79 @@ def test_concurrent_requests_on_the_same_thread_are_serialized_without_loss(
     assert [message["content"] for message in values["messages"]] == [
         "Leitura concorrente A.",
         "Leitura concorrente B.",
+    ]
+
+
+def test_two_graph_wrappers_on_the_same_checkpoint_owner_serialize_the_thread(
+    tmp_path: Path,
+):
+    checkpoint_path = tmp_path / "checkpoints.sqlite3"
+    config = {"configurable": {"thread_id": "thread_shared_owner"}}
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            async with open_checkpointer(checkpoint_path) as saver:
+                first_graph = build_agent_graph(saver)
+                second_graph = build_agent_graph(saver)
+                first_get_state = first_graph.aget_state
+                second_get_state = second_graph.aget_state
+                first_snapshot_read = asyncio.Event()
+                second_snapshot_read = asyncio.Event()
+                release_first = asyncio.Event()
+
+                async def delayed_first_get_state(read_config):
+                    snapshot = await first_get_state(read_config)
+                    first_snapshot_read.set()
+                    await release_first.wait()
+                    return snapshot
+
+                async def observed_second_get_state(read_config):
+                    snapshot = await second_get_state(read_config)
+                    second_snapshot_read.set()
+                    return snapshot
+
+                first_graph.aget_state = delayed_first_get_state
+                second_graph.aget_state = observed_second_get_state
+                first_task = asyncio.create_task(
+                    invoke_agent(
+                        first_graph,
+                        request=_request(message="Owner compartilhado A."),
+                        runtime=_runtime(client),
+                        thread_id="thread_shared_owner",
+                        request_id="req_shared_owner_a",
+                        execution_id="exec_shared_owner_a",
+                    )
+                )
+                await first_snapshot_read.wait()
+                second_task = asyncio.create_task(
+                    invoke_agent(
+                        second_graph,
+                        request=_request(message="Owner compartilhado B."),
+                        runtime=_runtime(client),
+                        thread_id="thread_shared_owner",
+                        request_id="req_shared_owner_b",
+                        execution_id="exec_shared_owner_b",
+                    )
+                )
+                try:
+                    await asyncio.wait_for(second_snapshot_read.wait(), timeout=0.1)
+                except TimeoutError:
+                    pass
+                finally:
+                    release_first.set()
+                results = await asyncio.gather(first_task, second_task)
+                final_snapshot = await first_get_state(config)
+        return results, final_snapshot.values
+
+    results, values = asyncio.run(scenario())
+
+    assert {result.request_id for result in results} == {
+        "req_shared_owner_a",
+        "req_shared_owner_b",
+    }
+    assert [message["content"] for message in values["messages"]] == [
+        "Owner compartilhado A.",
+        "Owner compartilhado B.",
     ]
 
 
