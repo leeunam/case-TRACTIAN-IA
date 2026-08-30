@@ -42,13 +42,13 @@ class _AssetWire(StrictModel):
     line: str = Field(min_length=1, pattern=r"\S")
     parent_asset_id: AssetId | None
     machine_type: str = Field(min_length=1, pattern=r"\S")
-    rotation_rpm: float = Field(ge=0)
+    rotation_rpm: float = Field(ge=0, allow_inf_nan=False)
     bearing_pn: str | None
-    bpfo_hz: float | None
-    bpfi_hz: float | None
-    bsf_hz: float | None
-    ftf_hz: float | None
-    line_frequency_hz: float | None
+    bpfo_hz: float | None = Field(allow_inf_nan=False)
+    bpfi_hz: float | None = Field(allow_inf_nan=False)
+    bsf_hz: float | None = Field(allow_inf_nan=False)
+    ftf_hz: float | None = Field(allow_inf_nan=False)
+    line_frequency_hz: float | None = Field(allow_inf_nan=False)
     sensor_status: str = Field(min_length=1, pattern=r"\S")
     points: list[_AssetPointWire]
 
@@ -222,6 +222,38 @@ def _assert_degraded_scope(data: JsonValue, runtime: ReadToolRuntime) -> None:
                 if "asset_id" in point:
                     if point["asset_id"] is None or point["asset_id"] != runtime.central_asset_id:
                         raise ValueError("A resposta degradada contém um ponto de outro ativo.")
+
+    pending: list[JsonValue] = [data]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, Mapping):
+            for key, nested_value in current.items():
+                normalized_key = "".join(
+                    character for character in key.casefold() if character.isalnum()
+                )
+                if normalized_key == "assetid":
+                    if nested_value is None:
+                        raise ValueError(
+                            "A resposta degradada contém um ativo não verificável."
+                        )
+                    _assert_returned_scope(
+                        asset_id=nested_value,
+                        company_id=None,
+                        runtime=runtime,
+                    )
+                elif normalized_key == "companyid":
+                    if nested_value is None:
+                        raise ValueError(
+                            "A resposta degradada contém uma empresa não verificável."
+                        )
+                    _assert_returned_scope(
+                        asset_id=None,
+                        company_id=nested_value,
+                        runtime=runtime,
+                    )
+                pending.append(nested_value)
+        elif isinstance(current, list):
+            pending.extend(current)
 
 
 async def execute_get_asset(

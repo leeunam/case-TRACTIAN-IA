@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from typing import Any
 
 import httpx
@@ -356,6 +357,39 @@ def test_get_asset_rejects_complete_response_with_a_point_from_another_asset():
         _invoke(_runtime(handler))
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "rotation_rpm",
+        "bpfo_hz",
+        "bpfi_hz",
+        "bsf_hz",
+        "ftf_hz",
+        "line_frequency_hz",
+    ],
+)
+@pytest.mark.parametrize("invalid_number", [math.nan, math.inf, -math.inf])
+def test_get_asset_rejects_every_non_finite_complete_numeric_field(
+    field_name: str,
+    invalid_number: float,
+):
+    payload = _asset_payload()
+    payload[field_name] = invalid_number
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"mode": "complete", "notes": None, "data": payload},
+        )
+
+    result = _invoke(_runtime(handler))
+
+    assert result.content is None
+    assert result.error is not None
+    assert result.error.category is ApiErrorCategory.INVALID_RESPONSE
+    json.dumps(result.artifact.model_dump(mode="json"), allow_nan=False)
+
+
 def test_get_asset_preserves_degraded_mode_notes_and_partial_json():
     partial_data = {"id": "asset_M101", "sensor_status": "offline"}
 
@@ -386,6 +420,33 @@ def test_get_asset_rejects_a_contradictory_id_in_degraded_data():
         )
 
     with pytest.raises(ValueError, match="identificador"):
+        _invoke(_runtime(handler))
+
+
+@pytest.mark.parametrize(
+    ("partial_data", "match"),
+    [
+        ({"details": {"asset_id": "asset_other"}}, "ativo|identificador"),
+        ({"details": {"asset-id": "asset_other"}}, "ativo|identificador"),
+        ({"details": {"assetId": "asset_other"}}, "ativo|identificador"),
+        ({"details": {"asset id": "asset_other"}}, "ativo|identificador"),
+        ({"details": {"company_id": "comp_other"}}, "empresa"),
+        ({"details": {"company-id": "comp_other"}}, "empresa"),
+        ({"details": {"companyId": "comp_other"}}, "empresa"),
+        ({"details": {"company id": "comp_other"}}, "empresa"),
+    ],
+)
+def test_get_asset_rejects_nested_or_normalized_degraded_scope_fields(
+    partial_data: dict[str, object],
+    match: str,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"mode": "partial", "notes": "Escopo parcial.", "data": partial_data},
+        )
+
+    with pytest.raises(ValueError, match=match):
         _invoke(_runtime(handler))
 
 
@@ -496,9 +557,115 @@ def test_get_asset_rejects_sensitive_key_combinations(
         _invoke(_runtime(handler))
 
 
+@pytest.mark.parametrize(
+    "sensitive_key",
+    [
+        "trusted_identity",
+        "trustedIdentity",
+        "trusted-identity",
+        "trusted identity",
+        "api_client",
+        "apiClient",
+        "api-client",
+        "api client",
+        "evaluation_seed",
+        "evaluationSeed",
+        "evaluation-seed",
+        "evaluation seed",
+        "runtime_context",
+        "runtimeContext",
+        "runtime-context",
+        "runtime context",
+        "golden_set",
+        "goldenSet",
+        "golden-set",
+        "golden set",
+        "expected_paths",
+        "expectedPaths",
+        "expected-paths",
+        "expected paths",
+        "evaluation_score",
+        "evaluationScore",
+        "eval_rubric",
+        "test_scenarios",
+        "testScenarios",
+        "test-scenarios",
+        "test scenarios",
+        "http_response",
+        "httpResponse",
+        "http-response",
+        "http response",
+        "response_body",
+        "responseBody",
+        "response-body",
+        "response body",
+        "raw_http_body",
+        "rawHttpBody",
+        "raw-http-body",
+        "raw http body",
+        "request_url",
+        "requestUrl",
+        "request-url",
+        "request url",
+    ],
+)
+def test_get_asset_rejects_nested_compound_runtime_eval_and_http_keys(
+    sensitive_key: str,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "partial",
+                "notes": "Resposta degradada.",
+                "data": {
+                    "id": "asset_M101",
+                    "domain": {"nested": {sensitive_key: "secret"}},
+                },
+            },
+        )
+
+    with pytest.raises(ValueError, match="proibido"):
+        _invoke(_runtime(handler))
+
+
 @pytest.mark.parametrize("legitimate_key", ["technical_configuration", "response_time"])
 def test_get_asset_preserves_legitimate_compound_partial_keys(legitimate_key: str):
     partial_data = {"id": "asset_M101", legitimate_key: "observado"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"mode": "partial", "notes": "Resposta degradada.", "data": partial_data},
+        )
+
+    result = _invoke(_runtime(handler))
+
+    assert result.artifact.outcome.partial_data == partial_data
+
+
+@pytest.mark.parametrize(
+    ("legitimate_key", "value"),
+    [
+        ("asset_id", "asset_M101"),
+        ("company_id", "comp_forja_br"),
+        ("point_id", "pt_M101_de"),
+        ("baseline_reference", "bs_M101_de"),
+        ("processing_state", "delayed"),
+        ("expected_lifetime", 1200),
+        ("test_frequency_hz", 60.0),
+        ("http_status_code", 206),
+        ("machine_runtime_hours", 4300),
+    ],
+)
+def test_get_asset_preserves_legitimate_nested_domain_keys(
+    legitimate_key: str,
+    value: object,
+):
+    partial_data = {
+        "id": "asset_M101",
+        "domain": {"nested": {legitimate_key: value}},
+    }
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
