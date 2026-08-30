@@ -23,8 +23,6 @@ _SENSITIVE_PARTIAL_KEY_FRAGMENTS = frozenset(
         "cookie",
         "centralassetid",
         "toolcallid",
-        "headers",
-        "responseheaders",
         "rawresponse",
         "token",
     }
@@ -44,6 +42,8 @@ _GENERIC_FORBIDDEN_PARTIAL_KEYS = frozenset(
         "method",
         "request",
         "response",
+        "header",
+        "headers",
     }
 )
 
@@ -56,6 +56,10 @@ _ALWAYS_SENSITIVE_KEY_SEGMENTS = frozenset(
         "evaluation",
         "eval",
         "golden",
+        "auth",
+        "authentication",
+        "credential",
+        "credentials",
     }
 )
 
@@ -72,6 +76,14 @@ _KNOWN_SENSITIVE_COMPOUNDS = frozenset(
         "responsebody",
         "rawhttpbody",
         "requesturl",
+        "apiauth",
+        "apicredential",
+        "responseheader",
+        "requestheader",
+        "httpheader",
+        "rawheader",
+        "apiheader",
+        "authorizationheader",
     }
 )
 
@@ -134,6 +146,16 @@ def _is_forbidden_partial_key(key: str) -> bool:
     if "response" in segments and segments & {"body", "headers"}:
         return True
     if "request" in segments and segments & {"body", "headers", "method", "url"}:
+        return True
+    if segments & {"header", "headers"} and segments & {
+        "api",
+        "auth",
+        "authorization",
+        "http",
+        "raw",
+        "request",
+        "response",
+    }:
         return True
     if "raw" in segments and segments & {"body", "http", "request", "response"}:
         return True

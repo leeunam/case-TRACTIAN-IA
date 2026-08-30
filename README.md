@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** simulador FastAPI, dados, contrato, cenários, contratos Pydantic, cliente HTTP assíncrono e dez tools LangChain de leitura estão disponíveis, com 417 testes ao todo. As Fases 1, 2 e 3 estão concluídas; o grafo de produção do agente LangGraph, checkpointer, observabilidade e avaliação ainda serão implementados conforme [`TASKS.md`](./TASKS.md).
+> **Estado atual:** simulador FastAPI, dados, contrato, cenários, contratos Pydantic, cliente HTTP assíncrono e dez tools LangChain de leitura estão disponíveis, com 457 testes ao todo. As Fases 1, 2 e 3 estão concluídas; o grafo de produção do agente LangGraph, checkpointer, observabilidade e avaliação ainda serão implementados conforme [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
