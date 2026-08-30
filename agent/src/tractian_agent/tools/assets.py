@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Annotated, Literal
+from typing import Literal
 
-from langchain.tools import InjectedToolArg, tool
+from langchain.tools import tool
+from langgraph.prebuilt import ToolRuntime
 from pydantic import ConfigDict, Field, JsonValue
 
 from tractian_agent.contracts import ApiError, ApiResult, ResponseMode, StrictModel
@@ -119,7 +120,7 @@ class _GetAssetToolArguments(StrictModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     asset_id: AssetId
-    runtime: Annotated[ReadToolRuntime, InjectedToolArg]
+    runtime: ToolRuntime[ReadToolRuntime]
 
 
 def _normalize_asset(asset: _AssetWire) -> AssetArtifact:
@@ -185,13 +186,65 @@ def _assert_returned_scope(
         raise ValueError("A API retornou um ativo de outra empresa.")
 
 
+def _assert_complete_point_scope(asset: _AssetWire, runtime: ReadToolRuntime) -> None:
+    for point in asset.points:
+        if point.asset_id != asset.id or point.asset_id != runtime.central_asset_id:
+            raise ValueError("A API retornou um ponto de outro ativo.")
+
+
+_FORBIDDEN_DEGRADED_KEYS = frozenset(
+    {
+        "user_id",
+        "identity",
+        "permissions",
+        "client",
+        "seed",
+        "authorization",
+        "token",
+        "access_token",
+        "headers",
+        "url",
+        "method",
+        "request",
+        "response",
+    }
+)
+
+
+def _reject_forbidden_degraded_keys(value: JsonValue) -> None:
+    if isinstance(value, Mapping):
+        for key, nested_value in value.items():
+            if key.lower() in _FORBIDDEN_DEGRADED_KEYS:
+                raise ValueError("A resposta degradada contém um campo proibido.")
+            _reject_forbidden_degraded_keys(nested_value)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_forbidden_degraded_keys(item)
+
+
 def _assert_degraded_scope(data: JsonValue, runtime: ReadToolRuntime) -> None:
     if isinstance(data, Mapping):
-        _assert_returned_scope(
-            asset_id=data.get("id"),
-            company_id=data.get("company_id"),
-            runtime=runtime,
-        )
+        _reject_forbidden_degraded_keys(data)
+        if "id" in data:
+            if data["id"] is None:
+                raise ValueError("A resposta degradada contém um identificador nulo.")
+            _assert_returned_scope(
+                asset_id=data["id"], company_id=None, runtime=runtime
+            )
+        if "company_id" in data:
+            if data["company_id"] is None:
+                raise ValueError("A resposta degradada contém uma empresa nula.")
+            _assert_returned_scope(
+                asset_id=None, company_id=data["company_id"], runtime=runtime
+            )
+        points = data.get("points")
+        if isinstance(points, list):
+            for point in points:
+                if isinstance(point, Mapping) and "asset_id" in point:
+                    if point["asset_id"] is None or point["asset_id"] != runtime.central_asset_id:
+                        raise ValueError("A resposta degradada contém um ponto de outro ativo.")
+    else:
+        _reject_forbidden_degraded_keys(data)
 
 
 async def execute_get_asset(
@@ -232,6 +285,7 @@ async def execute_get_asset(
             company_id=asset.company_id,
             runtime=runtime,
         )
+        _assert_complete_point_scope(asset, runtime)
         normalized = _normalize_asset(asset)
         return GetAssetResult(
             content=_model_content(normalized),
@@ -268,10 +322,10 @@ async def execute_get_asset(
     ),
 )
 async def get_asset(
-    asset_id: AssetId, runtime: ReadToolRuntime
+    asset_id: AssetId, runtime: ToolRuntime[ReadToolRuntime]
 ) -> tuple[dict[str, JsonValue], dict[str, JsonValue]]:
     """Consulta o ativo central, com contexto confiável injetado pelo runtime."""
-    result = await execute_get_asset(asset_id, runtime)
+    result = await execute_get_asset(asset_id, runtime.context)
     if result.error is not None:
         content: dict[str, JsonValue] = {"error": result.error.model_dump(mode="json")}
     elif result.content is not None:

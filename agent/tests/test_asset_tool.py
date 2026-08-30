@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 import httpx
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.graph import START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode, ToolRuntime
 from pydantic import ValidationError
 
 from tractian_agent.client import IndustrialApiClient
@@ -73,7 +77,43 @@ def _invoke(runtime: ReadToolRuntime, asset_id: str = "asset_M101"):
 
 async def _invoke_adapter_async(runtime: ReadToolRuntime, arguments: dict[str, object]):
     try:
-        return await get_asset.ainvoke({**arguments, "runtime": runtime})
+        tool_runtime = ToolRuntime(
+            state={},
+            context=runtime,
+            config={},
+            stream_writer=lambda _: None,
+            tool_call_id=None,
+            store=None,
+        )
+        return await get_asset.ainvoke({**arguments, "runtime": tool_runtime})
+    finally:
+        await runtime.client.aclose()
+
+
+async def _invoke_through_tool_node(runtime: ReadToolRuntime) -> dict[str, Any]:
+    graph = StateGraph(MessagesState, context_schema=ReadToolRuntime)
+    graph.add_node("tools", ToolNode([get_asset]))
+    graph.add_edge(START, "tools")
+    app = graph.compile()
+    try:
+        return await app.ainvoke(
+            {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "get_asset",
+                                "args": {"asset_id": "asset_M101"},
+                                "id": "call_get_asset_1",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                ]
+            },
+            context=runtime,
+        )
     finally:
         await runtime.client.aclose()
 
@@ -215,6 +255,41 @@ def test_get_asset_adapter_returns_only_model_content_and_rejects_unknown_argume
     assert calls == 1
 
 
+def test_get_asset_runs_through_tool_node_with_injected_langgraph_runtime():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"mode": "complete", "notes": None, "data": _asset_payload()},
+        )
+
+    result = asyncio.run(_invoke_through_tool_node(_runtime(handler)))
+
+    assert len(requests) == 1
+    message = result["messages"][-1]
+    assert isinstance(message, ToolMessage)
+    assert message.name == "get_asset"
+    assert message.tool_call_id == "call_get_asset_1"
+    assert json.loads(message.content)["id"] == "asset_M101"
+    assert message.artifact["tool_name"] == "get_asset"
+    assert message.artifact["outcome"]["asset"]["technical_configuration"][
+        "machine_type"
+    ] == "motor_induction"
+
+
+def test_read_tool_runtime_does_not_allow_trusted_identity_mutation():
+    runtime = _runtime(lambda request: httpx.Response(200, json={}))
+    try:
+        with pytest.raises(ValidationError):
+            runtime.identity.user_id = "usr_other"
+        with pytest.raises(ValidationError):
+            runtime.identity.company_id = "comp_other"
+    finally:
+        asyncio.run(runtime.client.aclose())
+
+
 def test_get_asset_rejects_missing_read_permission_before_http():
     calls = 0
 
@@ -267,6 +342,20 @@ def test_get_asset_rejects_complete_response_with_mismatched_scope(
         _invoke(_runtime(handler))
 
 
+def test_get_asset_rejects_complete_response_with_a_point_from_another_asset():
+    payload = _asset_payload()
+    payload["points"][0]["asset_id"] = "asset_other"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"mode": "complete", "notes": None, "data": payload},
+        )
+
+    with pytest.raises(ValueError, match="ponto"):
+        _invoke(_runtime(handler))
+
+
 def test_get_asset_preserves_degraded_mode_notes_and_partial_json():
     partial_data = {"id": "asset_M101", "sensor_status": "offline"}
 
@@ -297,6 +386,51 @@ def test_get_asset_rejects_a_contradictory_id_in_degraded_data():
         )
 
     with pytest.raises(ValueError, match="identificador"):
+        _invoke(_runtime(handler))
+
+
+@pytest.mark.parametrize(
+    ("partial_data", "match"),
+    [
+        ({"id": None}, "identificador"),
+        ({"company_id": None}, "empresa"),
+        (
+            {
+                "id": "asset_M101",
+                "company_id": "comp_forja_br",
+                "parent_asset_id": "asset_parent",
+                "points": [{"id": "pt_any", "asset_id": "asset_other"}],
+            },
+            "ponto",
+        ),
+    ],
+)
+def test_get_asset_rejects_inconsistent_or_null_scope_fields_in_degraded_data(
+    partial_data: dict[str, object], match: str
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"mode": "partial", "notes": "Resposta inconsistente.", "data": partial_data},
+        )
+
+    with pytest.raises(ValueError, match=match):
+        _invoke(_runtime(handler))
+
+
+def test_get_asset_rejects_forbidden_nested_partial_context_before_exposure():
+    partial_data = {
+        "id": "asset_M101",
+        "details": {"headers": {"Authorization": "Bearer secret"}},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"mode": "partial", "notes": "Resposta degradada.", "data": partial_data},
+        )
+
+    with pytest.raises(ValueError, match="proibido"):
         _invoke(_runtime(handler))
 
 
