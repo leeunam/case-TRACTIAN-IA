@@ -149,6 +149,16 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decidir:** matriz de permissões, formato da justificativa, quando pedir confirmação e quando expandir idempotência.
 
+**Decisões implementadas na primeira fatia:**
+
+- A política inicial é uma função pura e cobre somente a proposta de reprocessar uma análise; ela não recebe cliente HTTP nem executa escrita.
+- Reprocesso exige `action_low`, justificativa com pelo menos 20 caracteres após remover espaços externos e aprovação confiável para a mesma ação e o mesmo `analysis_id`.
+- Aprovação ausente ou com alvo diferente produz `require_confirmation`; falta de permissão ou justificativa inválida produz `deny`; somente o escopo exato produz `allow`.
+- Decisões carregam códigos estáveis e a aprovação registra se veio do pedido original ou de confirmação posterior. Esse objeto pertence à fronteira confiável e nunca será argumento público do modelo.
+- Execução HTTP, persistência da chave idempotente e tratamento de retry permanecem para fatias posteriores.
+
+**Evidência da primeira fatia:** os 6 testes focados da política, os 404 testes do agente e os 59 testes da API passaram; `make test` totalizou 463 testes, com apenas o aviso de depreciação já conhecido do `python_multipart`.
+
 - [ ] Separar proposta de ação e execução efetiva.
 - [ ] Exigir pedido explícito, permissão, escopo claro e justificativa.
 - [ ] Pedir confirmação para ação inferida, ampliada ou ambígua.
@@ -297,3 +307,142 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 - [ ] Revisar segurança, reprodutibilidade e isolamento do golden set.
 
 **Aceite:** outra pessoa consegue reproduzir o experimento seguindo apenas o repositório.
+
+## Plano SDD — concluir as Fases 5 e 4
+
+**Especificação vinculante:** `AGENTS.md`, as Fases 4 e 5 deste arquivo, as etapas 6, 8 e 10 do `LEARNING-GUIDE.md` e a decisão aprovada de persistir intenções somente no estado/checkpointer do LangGraph.
+
+**Ordem deliberada:** `5A → 4A/reprocesso → aceite da Fase 5 → restante da Fase 4`. A escrita real depende de um checkpoint durável anterior ao HTTP, enquanto o aceite de retomada da Fase 5 precisa de uma escrita real para provar que não há duplicação.
+
+### Restrições globais
+
+- Não criar SQLite, tabela ou repositório paralelo para intenções do agente. A intenção vive no estado persistido pelo checkpointer; a API mantém seu SQLite idempotente independente.
+- Usar SQLite como checkpointer de desenvolvimento e manter PostgreSQL como evolução futura.
+- Usar `durability="sync"` na entrada e na retomada de qualquer fluxo que possa escrever. `prepare_intent` e `execute_action` ocupam nós e supersteps distintos.
+- Somente `POST /analyses/{id}/reprocess` admite retry automático, sempre com a mesma chave e o mesmo corpo. As outras quatro ações fazem no máximo uma tentativa automática e ficam `uncertain` se o resultado puder ter sido aplicado.
+- Identidade, empresa, permissões, aprovação, `thread_id`, `request_id`, `execution_id`, cliente e chave idempotente pertencem ao contexto/estado confiável; nunca são argumentos públicos do modelo.
+- Aprovação vincula ação, alvo e parâmetros materiais. Justificativa estruturalmente válida não deve ser tratada como evidência suficiente.
+- Validar escopo antes do HTTP: ativo central, análise pertencente ao ativo, modelo configurado e caso atual. A API simulada não substitui essa proteção.
+- Propostas LangChain não produzem efeito. Somente o nó determinístico de execução, depois de `allow` e do checkpoint, recebe acesso à operação HTTP.
+- Não executar retry dentro de cliente, proposal tool ou operação. Preservar todo `ApiError`; `IN_PROGRESS`, `OUTCOME_UNKNOWN` e conflito de payload bloqueiam nova execução.
+- O checkpoint guarda somente valores observáveis e serializáveis. Não recebe cliente, transporte, resposta HTTP bruta, credencial, token, seed, golden set, trace de raciocínio ou arquivos restritos de avaliação.
+- O grafo desta entrega é determinístico e sem LLM. Planner, writer, ledger completo, Logfire e runner de avaliação continuam fora do escopo.
+- O MVP declara processo local único por `thread_id`; não promete lease distribuído com SQLite.
+- Cada tarefa segue TDD em fatias verticais, executa testes focados e `make test`, recebe commit próprio e passa por revisão independente de especificação e qualidade.
+
+### Task 1 — consolidar a política inicial existente
+
+**Objetivo:** incorporar e verificar a primeira fatia já presente no worktree, criando uma base revisada para as tarefas seguintes.
+
+**Arquivos:** `agent/src/tractian_agent/write_policy.py`, `agent/tests/test_write_policy.py` e esta seção de `TASKS.md`.
+
+**Contrato e testes:**
+
+- Manter a política pura de reprocesso com `allow`, `require_confirmation` e `deny` e códigos estáveis.
+- Confirmar `action_low`, justificativa de 20 caracteres após `strip`, aprovação ausente, alvo divergente e rejeição de campos extras.
+- Não adicionar HTTP, idempotência, grafo ou generalização nesta tarefa.
+- Executar o teste focado e `make test`; fazer self-review e commit.
+
+### Task 2 — contratos tipados do estado e das intenções
+
+**Objetivo:** definir valores observáveis e serializáveis que o LangGraph poderá persistir, sem ainda construir o grafo.
+
+**Arquivos:** criar `agent/src/tractian_agent/state.py`, `agent/src/tractian_agent/write_contracts.py` e testes focados correspondentes; alterar contratos compartilhados somente quando necessário.
+
+**Contrato e testes:**
+
+- Estado tipado contém solicitação, identidade confiável, `request_id`, `thread_id`, `execution_id`, mensagens, chamadas/observações, evidências inicialmente vazias e tipadas, decisão, contador/limite de passos, proposta pendente, aprovação, intenções, resultado final e revisão.
+- `thread_id` identifica a linha persistente de um caso; um thread pode receber vários `request_id`; cada invocação/retomada usa novo `execution_id`. Reuso do thread para outro caso, empresa ou pessoa falha fechado.
+- Intenção registra ID, escopo imutável, hash canônico, decisão, status, chave/expiração opcional, execução que a preparou, tentativas explícitas e recibo/erro tipado.
+- Status permitidos: `proposed`, `awaiting_confirmation`, `prepared`, `completed`, `denied`, `failed` e `uncertain`.
+- Modelos rejeitam campos extras e mutação; serialização não contém objetos ou nomes restritos.
+- O limite de passos é positivo e impede progresso além do orçamento.
+
+### Task 3 — checkpointer SQLite, grafo mínimo e fronteira Python
+
+**Objetivo:** concluir a infraestrutura 5A sem LLM e provar persistência/reabertura do estado.
+
+**Arquivos:** adicionar `langgraph-checkpoint-sqlite>=3.1.1,<3.2`; criar `agent/src/tractian_agent/checkpoint.py`, `agent/src/tractian_agent/graph.py`, `agent/src/tractian_agent/entrypoint.py` e testes focados; atualizar lock.
+
+**Contrato e testes:**
+
+- Usar `AsyncSqliteSaver` com contexto assíncrono, conexão sempre fechada e serializer restrito a tipos seguros.
+- O caminho padrão de desenvolvimento é `.run/agent-checkpoints.sqlite3`; testes usam arquivo temporário.
+- A primeira fronteira é função Python assíncrona; ela exige `thread_id`, contexto autenticado e sempre invoca/retoma com `durability="sync"`.
+- Grafo mínimo determinístico prova `ingest → route → finish`, encerra um caso simples de leitura e respeita limite de passos; não finge possuir planner ou writer.
+- Estado sobrevive ao fechamento e reabertura do saver; threads distintos não compartilham estado; contexto não é serializado.
+- Retenção do MVP: sem remoção automática, com exclusão explícita do thread; uma chave de reprocesso expira em sete dias e não é reutilizada silenciosamente depois disso.
+
+### Task 4 — matriz completa e cinco proposal tools
+
+**Objetivo:** generalizar a política fechada e expor ao modelo apenas propostas sem efeito.
+
+**Arquivos:** evoluir `write_policy.py` e `write_contracts.py`; criar `agent/src/tractian_agent/tools/writes.py`; atualizar catálogos/exportações e testes.
+
+**Contrato e testes:**
+
+- Propostas: reprocessar análise, solicitar especialista, atualizar somente criticidade, solicitar retreinamento do modelo configurado e escalar o caso atual.
+- Permissões: `action_low`, `action_low`, `action_high`, `action_high` e `escalate`, respectivamente.
+- Aprovação compara ação, alvo e parâmetros materiais; divergência pede confirmação, ausência de permissão ou justificativa inválida nega.
+- Schemas públicos não aceitam identidade, permissão, aprovação, chave, URL, método, headers, IDs ocultos ou campos arbitrários.
+- As cinco tools apenas devolvem proposta/conteúdo e artifact tipados; nenhuma recebe cliente nem chama HTTP.
+- Publicar catálogo estático e imutável `WRITE_PROPOSAL_TOOLS`.
+
+### Task 5 — runtime confiável e cinco operações HTTP fixas
+
+**Objetivo:** implementar efeitos isolados, ainda sem conectá-los automaticamente ao grafo.
+
+**Arquivos:** evoluir `tools/runtime.py`; criar `agent/src/tractian_agent/write_operations.py` e testes focados.
+
+**Contrato e testes:**
+
+- Runtime confiável fornece identidade, permissões, ativo central, caso atual, modelo configurado e cliente; nenhum desses valores aparece em schema público.
+- Cada operação fixa método, path e body em código e devolve `ActionReceipt` ou `ApiError` sem esconder falha.
+- Reprocesso e especialista verificam por leitura completa que a análise pertence ao ativo central antes do POST; resposta degradada não autoriza escrita.
+- Criticidade só aceita `low`, `medium`, `high` ou `critical` e somente o ativo central; retreinamento usa apenas o modelo configurado; escalonamento usa apenas o caso atual.
+- Apenas reprocesso aceita chave persistida e é retryable. As demais operações não enviam chave e nunca fazem retry.
+- Testar sucesso, cinco categorias de `ApiError`, resposta inválida e rejeição de escopo antes do HTTP de escrita.
+
+### Task 6 — reprocesso vertical com intenção persistida
+
+**Objetivo:** fechar a dependência circular com o primeiro fluxo de escrita seguro e retomável.
+
+**Arquivos:** evoluir grafo, entrypoint e contratos; criar testes de integração de reprocesso com SQLite real temporário e transporte HTTP simulado.
+
+**Contrato e testes:**
+
+- Fluxo: `proposal → policy → confirmation/deny → prepare_intent → checkpoint sync → execute_action → checkpoint do resultado`.
+- A chave `tractian-agent:<uuid>` é criada por código exatamente uma vez, somente após `allow`, e fica checkpointada antes do primeiro HTTP.
+- Ausência de aprovação usa `interrupt()` sem efeito anterior; retomada recebe aprovação estruturada pela fronteira confiável e reutiliza o mesmo `thread_id`.
+- Fechar o saver depois de `prepare_intent`, recriar saver/grafo e retomar reutiliza a mesma chave.
+- Perda da resposta depois do commit remoto produz replay do mesmo recibo e somente uma ação real.
+- Estado `completed` não chama HTTP novamente; chave vencida, conflito, `IN_PROGRESS` e `OUTCOME_UNKNOWN` não geram chave nem retry novo.
+- Falha antes de confirmar o checkpoint impede o HTTP.
+
+### Task 7 — integrar as quatro ações não idempotentes
+
+**Objetivo:** concluir o caminho agir/escalar sem prometer garantias que a API não oferece.
+
+**Arquivos:** evoluir o grafo/entrypoint e testes de integração parametrizados.
+
+**Contrato e testes:**
+
+- Especialista, criticidade, retreinamento e escalonamento passam pela mesma política, confirmação e checkpoint de preparação.
+- A intenção registra o `execution_id` que a preparou. A primeira execução pode despachar; retomada com outro `execution_id` não repete e marca `uncertain`/revisão.
+- Timeout, transporte, `5xx` ou queda no ponto de despacho ficam `uncertain`; `4xx` fica `failed`; nenhum caso dispara retry automático.
+- Uma nova ação exige nova intenção e nova aprovação; não reutilizar silenciosamente intenção concluída ou incerta.
+- Testar permitido, proibido, ambíguo, conflito de escopo e retomada conservadora para as quatro ações.
+
+### Task 8 — aceite, documentação e estado real
+
+**Objetivo:** provar os critérios de aceite das duas fases e alinhar a documentação sem descrever componentes futuros como funcionais.
+
+**Arquivos:** completar cobertura faltante da API somente se necessária; atualizar `TASKS.md` e `README.md`; atualizar `Makefile` apenas se existir runner real utilizável.
+
+**Contrato e testes:**
+
+- Executar todas as suites focadas e `make test` com saída registrada.
+- Registrar decisões sobre IDs, retenção, fronteira Python, durabilidade, retry e resultado incerto.
+- Marcar Fases 4 e 5 somente se todos os itens e aceites estiverem demonstrados.
+- README deve distinguir grafo determinístico/checkpointer e proposal tools reais de planner, writer, ledger, Logfire e avaliação ainda planejados.
+- Não ampliar o contrato da API com idempotência para os outros quatro endpoints nesta entrega.
