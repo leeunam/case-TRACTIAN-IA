@@ -32,6 +32,8 @@ class PolicyReason(str, Enum):
 
 
 class ReprocessProposal(StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     analysis_id: AnalysisId
     justification: str
 

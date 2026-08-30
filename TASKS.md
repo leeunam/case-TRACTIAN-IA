@@ -347,6 +347,8 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Objetivo:** definir valores observáveis e serializáveis que o LangGraph poderá persistir, sem ainda construir o grafo.
 
+**Decisões implementadas nesta fatia:** o estado vincula cada `thread_id` a caso, empresa e pessoa usuária e exige novo `execution_id` em cada continuação; um mesmo thread aceita novos `request_id`. Mensagens, chamadas, observações, evidências, intenções, resultado e revisão usam contratos JSON-safe e imutáveis, sem objetos do runtime. O orçamento é positivo e validado antes de cada avanço. A intenção inicial cobre somente reprocesso; a união das cinco propostas permanece na Task 4.
+
 **Arquivos:** criar `agent/src/tractian_agent/state.py`, `agent/src/tractian_agent/write_contracts.py` e testes focados correspondentes; alterar contratos compartilhados somente quando necessário.
 
 **Contrato e testes:**
