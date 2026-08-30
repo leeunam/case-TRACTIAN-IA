@@ -16,6 +16,9 @@ from tractian_agent.state import (
     AgentDecision,
     AgentState,
     FinalResult,
+    JsonSnapshot,
+    PersistedToolArtifact,
+    PersistedToolCall,
     PersistedMessage,
     ReviewRecord,
     ReviewStatus,
@@ -669,6 +672,204 @@ def test_artifact_rejects_all_trusted_public_argument_names(forbidden_name):
                 ),
             ),
         )
+
+
+@pytest.mark.parametrize("boundary", ["call", "artifact"])
+@pytest.mark.parametrize(
+    "invalid_arguments",
+    [
+        ["asset_G501"],
+        "asset_G501",
+        7,
+        None,
+        {1: "asset_G501"},
+    ],
+)
+def test_persisted_arguments_require_json_object_with_string_keys(
+    boundary,
+    invalid_arguments,
+):
+    with pytest.raises(ValidationError, match="arguments|argumentos"):
+        if boundary == "call":
+            PersistedToolCall(
+                call_id="call_01",
+                name="get_asset",
+                arguments=invalid_arguments,
+            )
+        else:
+            PersistedToolArtifact(
+                tool_name="get_asset",
+                arguments=invalid_arguments,
+                source={"kind": "industrial_api", "resource": "/assets/asset_G501"},
+                outcome={},
+            )
+
+
+def test_persisted_argument_objects_keep_nested_mapping_and_round_trip():
+    arguments = {
+        "asset_id": "asset_G501",
+        "filters": {"status": ["current", "stale"]},
+    }
+    call = PersistedToolCall(
+        call_id="call_01",
+        name="get_asset",
+        arguments=arguments,
+    )
+    artifact = PersistedToolArtifact(
+        tool_name="get_asset",
+        arguments=arguments,
+        source={"kind": "industrial_api", "resource": "/assets/asset_G501"},
+        outcome={},
+    )
+
+    restored_call = PersistedToolCall.model_validate_json(call.model_dump_json())
+    restored_artifact = PersistedToolArtifact.model_validate_json(
+        artifact.model_dump_json()
+    )
+
+    assert restored_call.arguments.to_python() == arguments
+    assert restored_artifact.arguments.to_python() == arguments
+
+
+def test_json_snapshot_round_trips_its_explicit_wire_representation():
+    domain_value = {
+        "analysis_id": "an_9906",
+        "measurements": [1, {"status": "current"}],
+    }
+    snapshot = JsonSnapshot.capture(domain_value, forbidden_names=frozenset())
+
+    wire = snapshot.model_dump_json()
+    restored = JsonSnapshot.model_validate_json(wire)
+
+    assert json.loads(wire) == {"encoded": snapshot.encoded}
+    assert restored == snapshot
+    assert restored.to_python() == domain_value
+
+
+def test_json_snapshot_validation_and_serialization_schemas_match_the_wire():
+    validation_schema = JsonSnapshot.model_json_schema(mode="validation")
+    serialization_schema = JsonSnapshot.model_json_schema(mode="serialization")
+
+    assert validation_schema == serialization_schema
+    assert validation_schema["type"] == "object"
+    assert validation_schema["required"] == ["encoded"]
+    assert validation_schema["properties"]["encoded"]["type"] == "string"
+    assert validation_schema["additionalProperties"] is False
+
+
+def test_nested_snapshot_uses_the_same_explicit_wire_and_schema():
+    call = PersistedToolCall(
+        call_id="call_01",
+        name="get_asset",
+        arguments={"filters": {"status": ["current"]}},
+    )
+
+    wire = call.model_dump_json()
+    restored = PersistedToolCall.model_validate_json(wire)
+    validation_schema = PersistedToolCall.model_json_schema(mode="validation")
+    serialization_schema = PersistedToolCall.model_json_schema(mode="serialization")
+
+    assert json.loads(wire)["arguments"] == {"encoded": call.arguments.encoded}
+    assert restored == call
+    assert validation_schema == serialization_schema
+
+
+@pytest.mark.parametrize("boundary", ["call", "artifact"])
+@pytest.mark.parametrize(
+    "forbidden_name",
+    [
+        "access_token",
+        "accessToken",
+        "client-secret",
+        "clientSecret",
+        "trusted_identity",
+        "trustedIdentity",
+        "action-approval",
+        "actionApproval",
+        "agent_thread_id",
+        "agentThreadId",
+        "http_response",
+        "httpResponse",
+        "response-body",
+        "responseBody",
+        "reasoning_trace_detail",
+        "reasoningTraceDetail",
+    ],
+)
+def test_public_arguments_reject_nested_segmented_sensitive_aliases(
+    boundary,
+    forbidden_name,
+):
+    arguments = {"outer": {forbidden_name: "must-not-persist"}}
+
+    with pytest.raises(ValidationError):
+        if boundary == "call":
+            PersistedToolCall(
+                call_id="call_01",
+                name="get_asset",
+                arguments=arguments,
+            )
+        else:
+            PersistedToolArtifact(
+                tool_name="get_asset",
+                arguments=arguments,
+                source={"kind": "industrial_api", "resource": "/assets/asset_G501"},
+                outcome={},
+            )
+
+
+@pytest.mark.parametrize(
+    "forbidden_name",
+    [
+        "access_token",
+        "clientSecret",
+        "http_response",
+        "responseBody",
+        "reasoning_trace_detail",
+    ],
+)
+def test_technical_data_rejects_nested_segmented_sensitive_aliases(
+    forbidden_name,
+):
+    with pytest.raises(ValidationError):
+        StateEvidence(
+            evidence_id="evidence_01",
+            call_id="call_01",
+            value={"outer": {forbidden_name: "must-not-persist"}},
+        )
+
+
+def test_technical_data_preserves_nested_domain_identifiers_and_names():
+    domain_data = {
+        "outer": {
+            "case_id": "case_tkt_inv_04",
+            "companyId": "comp_mineracao_andes",
+            "user-id": "usr_pedro",
+            "asset_id": "asset_G501",
+            "analysisId": "an_9906",
+            "machine_runtime_hours": 72,
+            "bearingAuthenticity": "verified",
+            "response-time": 12,
+        }
+    }
+
+    evidence = StateEvidence(
+        evidence_id="evidence_01",
+        call_id="call_01",
+        value=domain_data,
+    )
+    outcome = ToolObservation(
+        call_id="call_01",
+        artifact=ToolArtifact(
+            tool_name="get_analysis",
+            arguments={"analysis_id": "an_9906"},
+            source=ToolSource(kind="industrial_api", resource="/analyses/an_9906"),
+            outcome=ToolOutcome(partial_data=domain_data),
+        ),
+    ).artifact.outcome
+
+    assert evidence.value.to_python() == domain_data
+    assert outcome.partial_data.to_python() == domain_data
 
 
 def test_technical_evidence_and_result_allow_legitimate_domain_names():

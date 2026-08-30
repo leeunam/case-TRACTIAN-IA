@@ -35,13 +35,14 @@ def _scope(**changes: object) -> ReprocessIntentScope:
 
 def _policy_result(
     decision: PolicyDecision = PolicyDecision.ALLOW,
+    reason: PolicyReason | None = None,
 ) -> WritePolicyResult:
-    reason = {
+    resolved_reason = reason or {
         PolicyDecision.ALLOW: PolicyReason.AUTHORIZED,
         PolicyDecision.REQUIRE_CONFIRMATION: PolicyReason.EXPLICIT_APPROVAL_REQUIRED,
         PolicyDecision.DENY: PolicyReason.MISSING_PERMISSION,
     }[decision]
-    return WritePolicyResult(decision=decision, reason=reason)
+    return WritePolicyResult(decision=decision, reason=resolved_reason)
 
 
 def _intent(**changes: object) -> WriteIntent:
@@ -189,6 +190,48 @@ def test_write_intent_accepts_each_consistent_status_variant(
         assert isinstance(restored.receipt, PersistedActionReceipt)
     elif result_kind == "error":
         assert isinstance(restored.error, PersistedApiError)
+
+
+_VALID_REASONS = {
+    PolicyDecision.ALLOW: {PolicyReason.AUTHORIZED},
+    PolicyDecision.REQUIRE_CONFIRMATION: {
+        PolicyReason.EXPLICIT_APPROVAL_REQUIRED,
+        PolicyReason.APPROVAL_SCOPE_MISMATCH,
+    },
+    PolicyDecision.DENY: {
+        PolicyReason.MISSING_PERMISSION,
+        PolicyReason.INVALID_JUSTIFICATION,
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("decision", "reason"),
+    [
+        (decision, reason)
+        for decision in PolicyDecision
+        for reason in PolicyReason
+    ],
+)
+def test_write_intent_enforces_reason_for_each_policy_decision(decision, reason):
+    status = {
+        PolicyDecision.ALLOW: IntentStatus.PROPOSED,
+        PolicyDecision.REQUIRE_CONFIRMATION: IntentStatus.AWAITING_CONFIRMATION,
+        PolicyDecision.DENY: IntentStatus.DENIED,
+    }[decision]
+    changes = {
+        "status": status,
+        "decision": _policy_result(decision, reason),
+        "idempotency_key": None,
+        "expires_at": None,
+        "prepared_execution_id": None,
+    }
+
+    if reason in _VALID_REASONS[decision]:
+        assert _intent(**changes).decision.reason is reason
+    else:
+        with pytest.raises(ValidationError, match="razão.*decisão"):
+            _intent(**changes)
 
 
 @pytest.mark.parametrize(

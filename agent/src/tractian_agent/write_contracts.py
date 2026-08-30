@@ -16,7 +16,7 @@ from tractian_agent.contracts import (
     StrictModel,
 )
 from tractian_agent.tools.identifiers import AnalysisId
-from tractian_agent.write_policy import PolicyDecision, WritePolicyResult
+from tractian_agent.write_policy import PolicyDecision, PolicyReason, WritePolicyResult
 
 
 CanonicalHash = Annotated[
@@ -114,6 +114,20 @@ class WriteIntent(StrictModel):
 
     @model_validator(mode="after")
     def _validate_status_fields(self) -> WriteIntent:
+        valid_reasons = {
+            PolicyDecision.ALLOW: {PolicyReason.AUTHORIZED},
+            PolicyDecision.REQUIRE_CONFIRMATION: {
+                PolicyReason.EXPLICIT_APPROVAL_REQUIRED,
+                PolicyReason.APPROVAL_SCOPE_MISMATCH,
+            },
+            PolicyDecision.DENY: {
+                PolicyReason.MISSING_PERMISSION,
+                PolicyReason.INVALID_JUSTIFICATION,
+            },
+        }
+        if self.decision.reason not in valid_reasons[self.decision.decision]:
+            raise ValueError("razão incompatível com a decisão da intenção")
+
         expected_decision = {
             IntentStatus.PROPOSED: PolicyDecision.ALLOW,
             IntentStatus.AWAITING_CONFIRMATION: PolicyDecision.REQUIRE_CONFIRMATION,

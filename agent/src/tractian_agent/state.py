@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from enum import Enum
 import json
 import math
+import re
 from typing import Literal
 
 from pydantic import (
@@ -13,8 +14,8 @@ from pydantic import (
     Field,
     JsonValue,
     TypeAdapter,
+    ValidationInfo,
     field_validator,
-    model_serializer,
     model_validator,
 )
 
@@ -27,6 +28,20 @@ from tractian_agent.write_policy import ReprocessProposal, TrustedActionApproval
 
 def _normalized_key(value: str) -> str:
     return "".join(character for character in value.casefold() if character.isalnum())
+
+
+def _key_segments(value: str) -> frozenset[str]:
+    """Segmenta aliases snake/kebab/camel sem recorrer a substring livre."""
+    separated_acronyms = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", value)
+    separated_camel = re.sub(
+        r"([a-z0-9])([A-Z])",
+        r"\1 \2",
+        separated_acronyms,
+    )
+    return frozenset(
+        segment.casefold()
+        for segment in re.findall(r"[A-Za-z0-9]+", separated_camel)
+    )
 
 
 _TECHNICAL_FORBIDDEN_NAMES = frozenset(
@@ -56,6 +71,16 @@ _TECHNICAL_FORBIDDEN_NAMES = frozenset(
     }
 )
 
+_TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS = (
+    frozenset({"access", "token"}),
+    frozenset({"api", "token"}),
+    frozenset({"api", "key"}),
+    frozenset({"client", "secret"}),
+    frozenset({"http", "response"}),
+    frozenset({"response", "body"}),
+    frozenset({"reasoning", "trace"}),
+)
+
 _PUBLIC_ARGUMENT_FORBIDDEN_NAMES = _TECHNICAL_FORBIDDEN_NAMES | {
     "caseid",
     "companyid",
@@ -76,21 +101,49 @@ _PUBLIC_ARGUMENT_FORBIDDEN_NAMES = _TECHNICAL_FORBIDDEN_NAMES | {
     "headers",
 }
 
+_PUBLIC_ARGUMENT_FORBIDDEN_SEGMENT_PATTERNS = (
+    *_TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS,
+    frozenset({"trusted", "identity"}),
+    frozenset({"action", "approval"}),
+    frozenset({"agent", "thread", "id"}),
+    frozenset({"thread", "id"}),
+    frozenset({"request", "id"}),
+    frozenset({"execution", "id"}),
+    frozenset({"idempotency", "key"}),
+    frozenset({"central", "asset", "id"}),
+    frozenset({"configured", "model", "id"}),
+    frozenset({"case", "id"}),
+    frozenset({"company", "id"}),
+    frozenset({"user", "id"}),
+)
+
 
 def _validate_json_boundary(
     value: JsonValue,
     *,
     forbidden_names: frozenset[str] | set[str],
+    forbidden_segment_patterns: tuple[frozenset[str], ...] = (),
 ) -> None:
     """Percorre um payload uma vez e aplica a política da sua fronteira."""
     if isinstance(value, Mapping):
         for key, nested_value in value.items():
-            if _normalized_key(key) in forbidden_names:
+            segments = _key_segments(key)
+            if _normalized_key(key) in forbidden_names or any(
+                pattern <= segments for pattern in forbidden_segment_patterns
+            ):
                 raise ValueError("o estado contém um campo proibido")
-            _validate_json_boundary(nested_value, forbidden_names=forbidden_names)
+            _validate_json_boundary(
+                nested_value,
+                forbidden_names=forbidden_names,
+                forbidden_segment_patterns=forbidden_segment_patterns,
+            )
     elif isinstance(value, list):
         for item in value:
-            _validate_json_boundary(item, forbidden_names=forbidden_names)
+            _validate_json_boundary(
+                item,
+                forbidden_names=forbidden_names,
+                forbidden_segment_patterns=forbidden_segment_patterns,
+            )
     elif isinstance(value, float) and not math.isfinite(value):
         raise ValueError("o estado contém número não finito")
 
@@ -107,17 +160,37 @@ class JsonSnapshot(FrozenStateModel):
 
     encoded: str
 
+    @field_validator("encoded")
+    @classmethod
+    def _require_canonical_json(cls, value: str) -> str:
+        try:
+            validated = _JSON_VALUE_ADAPTER.validate_python(json.loads(value))
+            return json.dumps(
+                validated,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("encoded deve conter JSON canônico válido") from error
+
     @classmethod
     def capture(
         cls,
         value: object,
         *,
         forbidden_names: frozenset[str] | set[str],
+        forbidden_segment_patterns: tuple[frozenset[str], ...] = (),
     ) -> JsonSnapshot:
         if isinstance(value, cls):
             value = value.to_python()
         validated = _JSON_VALUE_ADAPTER.validate_python(value)
-        _validate_json_boundary(validated, forbidden_names=forbidden_names)
+        _validate_json_boundary(
+            validated,
+            forbidden_names=forbidden_names,
+            forbidden_segment_patterns=forbidden_segment_patterns,
+        )
         return cls(
             encoded=json.dumps(
                 validated,
@@ -134,9 +207,29 @@ class JsonSnapshot(FrozenStateModel):
     def __getitem__(self, key: str | int) -> JsonValue:
         return self.to_python()[key]
 
-    @model_serializer(mode="plain")
-    def _serialize_as_json_value(self) -> JsonValue:
-        return self.to_python()
+
+def _snapshot_domain_value(value: object, validation_mode: str) -> object:
+    if isinstance(value, JsonSnapshot):
+        return value.to_python()
+    if validation_mode == "json":
+        return JsonSnapshot.model_validate(value).to_python()
+    return value
+
+
+def _capture_public_argument_object(
+    value: object,
+    validation_mode: str,
+) -> JsonSnapshot:
+    domain_value = _snapshot_domain_value(value, validation_mode)
+    if not isinstance(domain_value, Mapping) or any(
+        not isinstance(key, str) for key in domain_value
+    ):
+        raise ValueError("arguments deve ser um objeto JSON com chaves string")
+    return JsonSnapshot.capture(
+        domain_value,
+        forbidden_names=_PUBLIC_ARGUMENT_FORBIDDEN_NAMES,
+        forbidden_segment_patterns=_PUBLIC_ARGUMENT_FORBIDDEN_SEGMENT_PATTERNS,
+    )
 
 
 class PersistedRequestIdentity(FrozenStateModel):
@@ -173,11 +266,12 @@ class PersistedToolCall(FrozenStateModel):
 
     @field_validator("arguments", mode="before")
     @classmethod
-    def _snapshot_public_arguments(cls, value: object) -> JsonSnapshot:
-        return JsonSnapshot.capture(
-            value,
-            forbidden_names=_PUBLIC_ARGUMENT_FORBIDDEN_NAMES,
-        )
+    def _snapshot_public_arguments(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> JsonSnapshot:
+        return _capture_public_argument_object(value, info.mode)
 
 
 class PersistedToolSource(FrozenStateModel):
@@ -193,12 +287,17 @@ class PersistedToolOutcome(FrozenStateModel):
 
     @field_validator("partial_data", mode="before")
     @classmethod
-    def _snapshot_technical_result(cls, value: object) -> JsonSnapshot | None:
+    def _snapshot_technical_result(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> JsonSnapshot | None:
         if value is None:
             return None
         return JsonSnapshot.capture(
-            value,
+            _snapshot_domain_value(value, info.mode),
             forbidden_names=_TECHNICAL_FORBIDDEN_NAMES,
+            forbidden_segment_patterns=_TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS,
         )
 
 
@@ -219,11 +318,12 @@ class PersistedToolArtifact(FrozenStateModel):
 
     @field_validator("arguments", mode="before")
     @classmethod
-    def _snapshot_public_arguments(cls, value: object) -> JsonSnapshot:
-        return JsonSnapshot.capture(
-            value,
-            forbidden_names=_PUBLIC_ARGUMENT_FORBIDDEN_NAMES,
-        )
+    def _snapshot_public_arguments(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> JsonSnapshot:
+        return _capture_public_argument_object(value, info.mode)
 
 
 class MessageRole(str, Enum):
@@ -273,10 +373,15 @@ class StateEvidence(FrozenStateModel):
 
     @field_validator("value", mode="before")
     @classmethod
-    def _snapshot_value(cls, value: object) -> JsonSnapshot:
+    def _snapshot_value(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> JsonSnapshot:
         return JsonSnapshot.capture(
-            value,
+            _snapshot_domain_value(value, info.mode),
             forbidden_names=_TECHNICAL_FORBIDDEN_NAMES,
+            forbidden_segment_patterns=_TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS,
         )
 
 
@@ -367,7 +472,10 @@ class AgentState(FrozenStateModel):
         same_request = request_id == self.request_id
         if same_request and persisted_request != self.request:
             raise ValueError("retomada da mesma request_id exige solicitação idêntica")
-        data = self.model_dump(mode="python")
+        data = {
+            field_name: getattr(self, field_name)
+            for field_name in type(self).model_fields
+        }
         data.update(
             request=persisted_request,
             identity=identity,
@@ -390,6 +498,9 @@ class AgentState(FrozenStateModel):
         """Avança uma unidade sem permitir ultrapassar o orçamento."""
         if self.step_count >= self.step_limit:
             raise ValueError("orçamento de passos esgotado")
-        data = self.model_dump(mode="python")
+        data = {
+            field_name: getattr(self, field_name)
+            for field_name in type(self).model_fields
+        }
         data["step_count"] = self.step_count + 1
         return type(self).model_validate(data)
