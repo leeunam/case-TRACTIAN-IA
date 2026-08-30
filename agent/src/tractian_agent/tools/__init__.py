@@ -8,6 +8,7 @@ from .technical import (
     get_rms_series,
     get_spectrum,
 )
+from .knowledge import get_knowledge_document, get_model, search_knowledge
 
 __all__ = [
     "get_asset",
@@ -17,4 +18,7 @@ __all__ = [
     "get_rms_series",
     "get_spectrum",
     "get_data_quality",
+    "get_model",
+    "search_knowledge",
+    "get_knowledge_document",
 ]

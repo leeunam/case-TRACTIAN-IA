@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
 import math
 from typing import Literal, TypeVar
 
@@ -27,6 +26,7 @@ from .observations import (
     assert_safe_partial_json,
 )
 from .runtime import ReadToolRuntime
+from .timestamps import parse_aware_iso_timestamp as _parse_timestamp
 
 
 ItemT = TypeVar("ItemT")
@@ -37,18 +37,6 @@ def _validate_optional_point_id(value: object) -> PointId | None:
     if value is None:
         return None
     return _POINT_ID_ADAPTER.validate_python(value, strict=True)
-
-
-def _parse_timestamp(value: str) -> datetime:
-    if "T" not in value:
-        raise ValueError("O timestamp deve conter data, hora e timezone ISO 8601.")
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError("O timestamp deve usar ISO 8601.") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("O timestamp deve informar timezone.")
-    return parsed
 
 
 def _assert_read_scope(asset_id: str, runtime: ReadToolRuntime) -> None:
