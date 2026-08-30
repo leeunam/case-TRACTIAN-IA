@@ -872,6 +872,113 @@ def test_technical_data_preserves_nested_domain_identifiers_and_names():
     assert outcome.partial_data.to_python() == domain_data
 
 
+def _alias_forms(*segments: str) -> tuple[str, str, str]:
+    snake = "_".join(segments)
+    kebab = "-".join(segments)
+    camel = segments[0] + "".join(segment.title() for segment in segments[1:])
+    return snake, kebab, camel
+
+
+_TECHNICAL_SUFFIX_ALIASES = [
+    alias
+    for segments in (
+        ("token", "value"),
+        ("password", "hash"),
+        ("credential", "cache"),
+        ("credentials", "cache"),
+        ("authorization", "context"),
+        ("secret", "value"),
+        ("cookie", "value"),
+        ("evaluation", "result"),
+        ("eval", "result"),
+        ("golden", "set", "version"),
+        ("evaluation", "seed", "value"),
+        ("expected", "paths", "digest"),
+        ("test", "scenarios", "version"),
+    )
+    for alias in _alias_forms(*segments)
+]
+
+_PUBLIC_ONLY_SUFFIX_ALIASES = [
+    alias
+    for segments in (
+        ("permissions", "snapshot"),
+        ("approval", "record"),
+        ("identity", "context"),
+    )
+    for alias in _alias_forms(*segments)
+]
+
+_SAFE_AMBIGUOUS_AND_DOMAIN_NAMES = [
+    "client_secretary",
+    "access_tokenization",
+    "http_responsiveness",
+    "baseline_reference",
+    "processing_state",
+    "response_time",
+    "bearing_authenticity",
+    "machine_runtime_hours",
+    "runtime_client_state",
+    "asset_id",
+    "analysis_id",
+]
+
+
+@pytest.mark.parametrize("forbidden_name", _TECHNICAL_SUFFIX_ALIASES)
+def test_technical_suffix_policy_rejects_sensitive_segment_aliases(forbidden_name):
+    with pytest.raises(ValidationError):
+        StateEvidence(
+            evidence_id="evidence_01",
+            call_id="call_01",
+            value={"outer": {forbidden_name: "must-not-persist"}},
+        )
+
+
+@pytest.mark.parametrize(
+    "forbidden_name",
+    _TECHNICAL_SUFFIX_ALIASES + _PUBLIC_ONLY_SUFFIX_ALIASES,
+)
+def test_public_suffix_policy_rejects_sensitive_segment_aliases(forbidden_name):
+    with pytest.raises(ValidationError):
+        PersistedToolCall(
+            call_id="call_01",
+            name="get_asset",
+            arguments={"outer": {forbidden_name: "must-not-persist"}},
+        )
+
+
+@pytest.mark.parametrize("allowed_name", _PUBLIC_ONLY_SUFFIX_ALIASES)
+def test_technical_suffix_policy_allows_public_only_context_names(allowed_name):
+    evidence = StateEvidence(
+        evidence_id="evidence_01",
+        call_id="call_01",
+        value={"outer": {allowed_name: "domain-observation"}},
+    )
+
+    assert evidence.value.to_python()["outer"][allowed_name] == "domain-observation"
+
+
+@pytest.mark.parametrize("allowed_name", _SAFE_AMBIGUOUS_AND_DOMAIN_NAMES)
+@pytest.mark.parametrize("boundary", ["public", "technical"])
+def test_suffix_policies_preserve_ambiguous_and_domain_names(boundary, allowed_name):
+    nested_value = {"outer": {allowed_name: "domain-observation"}}
+
+    if boundary == "public":
+        snapshot = PersistedToolCall(
+            call_id="call_01",
+            name="get_asset",
+            arguments=nested_value,
+        ).arguments
+    else:
+        snapshot = StateEvidence(
+            evidence_id="evidence_01",
+            call_id="call_01",
+            value=nested_value,
+        ).value
+
+    assert snapshot.to_python()["outer"][allowed_name] == "domain-observation"
+
+
 def test_technical_evidence_and_result_allow_legitimate_domain_names():
     domain_data = {
         "case_id": "case_tkt_inv_04",

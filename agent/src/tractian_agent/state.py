@@ -71,6 +71,20 @@ _TECHNICAL_FORBIDDEN_NAMES = frozenset(
     }
 )
 
+_TECHNICAL_FORBIDDEN_SEGMENTS = frozenset(
+    {
+        "token",
+        "password",
+        "credential",
+        "credentials",
+        "authorization",
+        "secret",
+        "cookie",
+        "evaluation",
+        "eval",
+    }
+)
+
 _TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS = (
     frozenset({"access", "token"}),
     frozenset({"api", "token"}),
@@ -79,6 +93,12 @@ _TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS = (
     frozenset({"http", "response"}),
     frozenset({"response", "body"}),
     frozenset({"reasoning", "trace"}),
+    frozenset({"golden", "set"}),
+    frozenset({"expected", "path"}),
+    frozenset({"expected", "paths"}),
+    frozenset({"test", "scenario"}),
+    frozenset({"test", "scenarios"}),
+    frozenset({"evaluation", "seed"}),
 )
 
 _PUBLIC_ARGUMENT_FORBIDDEN_NAMES = _TECHNICAL_FORBIDDEN_NAMES | {
@@ -99,6 +119,12 @@ _PUBLIC_ARGUMENT_FORBIDDEN_NAMES = _TECHNICAL_FORBIDDEN_NAMES | {
     "method",
     "header",
     "headers",
+}
+
+_PUBLIC_ARGUMENT_FORBIDDEN_SEGMENTS = _TECHNICAL_FORBIDDEN_SEGMENTS | {
+    "identity",
+    "permissions",
+    "approval",
 }
 
 _PUBLIC_ARGUMENT_FORBIDDEN_SEGMENT_PATTERNS = (
@@ -122,19 +148,25 @@ def _validate_json_boundary(
     value: JsonValue,
     *,
     forbidden_names: frozenset[str] | set[str],
+    forbidden_segments: frozenset[str] | set[str] = frozenset(),
     forbidden_segment_patterns: tuple[frozenset[str], ...] = (),
 ) -> None:
     """Percorre um payload uma vez e aplica a política da sua fronteira."""
     if isinstance(value, Mapping):
         for key, nested_value in value.items():
             segments = _key_segments(key)
-            if _normalized_key(key) in forbidden_names or any(
-                pattern <= segments for pattern in forbidden_segment_patterns
+            if (
+                _normalized_key(key) in forbidden_names
+                or not segments.isdisjoint(forbidden_segments)
+                or any(
+                    pattern <= segments for pattern in forbidden_segment_patterns
+                )
             ):
                 raise ValueError("o estado contém um campo proibido")
             _validate_json_boundary(
                 nested_value,
                 forbidden_names=forbidden_names,
+                forbidden_segments=forbidden_segments,
                 forbidden_segment_patterns=forbidden_segment_patterns,
             )
     elif isinstance(value, list):
@@ -142,6 +174,7 @@ def _validate_json_boundary(
             _validate_json_boundary(
                 item,
                 forbidden_names=forbidden_names,
+                forbidden_segments=forbidden_segments,
                 forbidden_segment_patterns=forbidden_segment_patterns,
             )
     elif isinstance(value, float) and not math.isfinite(value):
@@ -181,6 +214,7 @@ class JsonSnapshot(FrozenStateModel):
         value: object,
         *,
         forbidden_names: frozenset[str] | set[str],
+        forbidden_segments: frozenset[str] | set[str] = frozenset(),
         forbidden_segment_patterns: tuple[frozenset[str], ...] = (),
     ) -> JsonSnapshot:
         if isinstance(value, cls):
@@ -189,6 +223,7 @@ class JsonSnapshot(FrozenStateModel):
         _validate_json_boundary(
             validated,
             forbidden_names=forbidden_names,
+            forbidden_segments=forbidden_segments,
             forbidden_segment_patterns=forbidden_segment_patterns,
         )
         return cls(
@@ -228,6 +263,7 @@ def _capture_public_argument_object(
     return JsonSnapshot.capture(
         domain_value,
         forbidden_names=_PUBLIC_ARGUMENT_FORBIDDEN_NAMES,
+        forbidden_segments=_PUBLIC_ARGUMENT_FORBIDDEN_SEGMENTS,
         forbidden_segment_patterns=_PUBLIC_ARGUMENT_FORBIDDEN_SEGMENT_PATTERNS,
     )
 
@@ -297,6 +333,7 @@ class PersistedToolOutcome(FrozenStateModel):
         return JsonSnapshot.capture(
             _snapshot_domain_value(value, info.mode),
             forbidden_names=_TECHNICAL_FORBIDDEN_NAMES,
+            forbidden_segments=_TECHNICAL_FORBIDDEN_SEGMENTS,
             forbidden_segment_patterns=_TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS,
         )
 
@@ -381,6 +418,7 @@ class StateEvidence(FrozenStateModel):
         return JsonSnapshot.capture(
             _snapshot_domain_value(value, info.mode),
             forbidden_names=_TECHNICAL_FORBIDDEN_NAMES,
+            forbidden_segments=_TECHNICAL_FORBIDDEN_SEGMENTS,
             forbidden_segment_patterns=_TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS,
         )
 
