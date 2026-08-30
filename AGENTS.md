@@ -25,7 +25,7 @@ Só marque uma tarefa após executar seu critério de aceite. Registre decisões
 
 ## Estado atual
 
-Existem o simulador FastAPI, os dados, o contrato, os cenários e 59 testes. A persistência idempotente da Fase 1 está concluída; o agente LangGraph, seu checkpointer, o Logfire e o runner Pydantic Evals ainda não foram implementados. Nunca descreva componente planejado como funcional.
+Existem o simulador FastAPI, os dados, o contrato, os cenários, os contratos e o cliente HTTP do agente, com 105 testes ao todo. As Fases 1 e 2 estão concluídas; o agente LangGraph, seu checkpointer, o Logfire e o runner Pydantic Evals ainda não foram implementados. Nunca descreva componente planejado como funcional.
 
 ## Invariantes
 

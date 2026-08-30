@@ -126,8 +126,9 @@ Implemente um cliente HTTP sem LLM. Ele deve:
 - usar uma URL-base configurável;
 - aplicar timeout;
 - enviar `x-user-id` quando necessário;
-- gerar uma nova `Idempotency-Key` para cada intenção de escrita e reutilizá-la somente em
-  retries do mesmo pedido;
+- receber da camada de execução uma `Idempotency-Key` já associada à intenção de escrita,
+  validá-la e reutilizá-la somente em retries do mesmo pedido; a geração e a persistência ficam
+  no estado da intenção, não no transporte HTTP;
 - converter respostas em modelos Pydantic;
 - distinguir erro de transporte de rejeição da API;
 - nunca registrar credenciais.

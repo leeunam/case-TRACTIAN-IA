@@ -57,7 +57,7 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 - Criar `api/app/idempotency.py` com `sqlite3`, separado do armazenamento Parquet e sem ORM.
 - Usar `IDEMPOTENCY_DB_PATH`; na ausência da variável, gravar em `.run/idempotency.sqlite3`. Testes usam um arquivo temporário isolado. SQLite continua sendo a opção de desenvolvimento; PostgreSQL permanece a evolução futura.
 - Manter registros por 7 dias desde a primeira solicitação e remover vencidos sob demanda, dentro de uma nova operação.
-- Aceitar chaves de 1 a 255 caracteres sem espaços e diferenciar maiúsculas de minúsculas. O futuro cliente backend, não a pessoa usuária nem o LLM, gera e persiste antes da chamada uma chave no formato `tractian-agent:<uuid>`.
+- Aceitar chaves de 1 a 255 caracteres sem espaços e diferenciar maiúsculas de minúsculas. A futura camada de execução de escritas, não a pessoa usuária nem o LLM, gera e persiste antes da chamada uma chave no formato `tractian-agent:<uuid>`; o cliente HTTP apenas a valida e propaga.
 - Tratar a chave como protocolo, não como credencial. Autenticação e permissão protegem a ação; no simulador, `x-user-id` continua sendo apenas uma aproximação da identidade de produção.
 - Identificar unicamente o pedido por pessoa autenticada, método, endpoint completo e chave idempotente, com restrição `UNIQUE` no SQLite sobre essa combinação.
 - Calcular `payload_hash` como `sha256:v1:<digest>` sobre JSON canônico com chaves ordenadas, sem alterar valores nem persistir o payload original.
@@ -85,10 +85,22 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decidir:** timeouts, categorias de erro, envelope normalizado e propagação da identidade.
 
-- [ ] Criar contratos tipados para solicitação, identidade, chamada de tool, resultado e erro.
-- [ ] Criar cliente `httpx` sem lógica de decisão do agente.
-- [ ] Normalizar respostas `2xx`, `4xx`, `5xx`, timeout e payload inválido.
-- [ ] Testar o cliente sem depender de servidor externo.
+**Decisões implementadas:**
+
+- Manter o consumidor em um projeto Python próprio, `agent/`, separado do simulador em `api/`.
+- Usar contratos Pydantic estritos (`extra="forbid"`) para solicitação, identidade, chamada de tool, resultado e erro; argumentos de tool são modelos Pydantic específicos e não recebem identidade. `asset_id` é obrigatório, mas anulável em chamados sem ativo central, conforme o esquema dos casos.
+- Exigir identidade confiável em cada chamada e propagar somente `user_id` no header `x-user-id`; `company_id` permanece no contexto para validações determinísticas posteriores e não vira header inventado.
+- Separar consultas envelopadas de respostas JSON diretas. Em `mode=complete`, validar `data` pelo modelo solicitado; em `partial`, `inconclusive`, `conflict` ou `unavailable`, preservar `mode`, `notes` e o JSON degradado sem fingir que o recurso completo existe.
+- Classificar erros como `api`, `server`, `timeout`, `transport` ou `invalid_response`, preservando status e códigos fornecidos pela API quando o payload é válido.
+- Usar timeouts configuráveis de 2 s para conexão, 10 s para leitura, 5 s para escrita e 2 s para obtenção de conexão do pool.
+- Não fazer retry nem decidir se um erro é repetível dentro do cliente. A criação e a persistência da chave pertencem à intenção de escrita e ao estado das fases posteriores; o cliente valida o protocolo e apenas propaga a chave recebida.
+- Recusar URLs externas antes de enviar identidade e não seguir redirects automaticamente.
+- Testar o transporte somente com `httpx.MockTransport`, sem servidor, porta, espera real ou chamada de modelo.
+
+- [x] Criar contratos tipados para solicitação, identidade, chamada de tool, resultado e erro.
+- [x] Criar cliente `httpx` sem lógica de decisão do agente.
+- [x] Normalizar respostas `2xx`, `4xx`, `5xx`, timeout e payload inválido.
+- [x] Testar o cliente sem depender de servidor externo.
 
 **Aceite:** toda resposta da API vira um resultado tipado ou erro explícito.
 

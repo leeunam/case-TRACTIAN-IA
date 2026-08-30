@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** simulador FastAPI, dados, contrato, cenários e 59 testes estão disponíveis. A persistência idempotente da Fase 1 está concluída; agente LangGraph, checkpointer, observabilidade e avaliação ainda serão implementados conforme [`TASKS.md`](./TASKS.md).
+> **Estado atual:** simulador FastAPI, dados, contrato, cenários, contratos Pydantic e cliente HTTP assíncrono estão disponíveis, com 105 testes ao todo. As Fases 1 e 2 estão concluídas; agente LangGraph, checkpointer, observabilidade e avaliação ainda serão implementados conforme [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -50,7 +50,7 @@ O **ledger de evidências** vive no estado da execução e associa afirmações 
 - O arquivo usa `IDEMPOTENCY_DB_PATH`; sem a variável, fica em `.run/idempotency.sqlite3`. `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS` altera o limite de processamento, cujo padrão é 300 segundos.
 - O primeiro alvo de idempotência é `POST /analyses/{analysisId}/reprocess`.
 - A API exige uma `Idempotency-Key` de 1 a 255 caracteres sem espaços, reserva a intenção antes da ação, persiste respostas concluídas em SQLite e faz replay mesmo após recriar o armazenamento; mesma chave com payload diferente retorna `409 Conflict`.
-- O futuro cliente do agente gerará uma chave nova para cada intenção, a guardará antes da primeira chamada e reutilizará essa chave somente em retries do mesmo pedido.
+- A futura camada de execução de escritas gerará e persistirá uma chave nova antes da primeira chamada e a reutilizará somente em retries da mesma intenção; o cliente HTTP apenas valida e propaga a chave recebida.
 - A reserva é atômica: enquanto a primeira chamada está em execução, uma chamada concorrente com a mesma intenção recebe `409 IDEMPOTENCY_IN_PROGRESS` e não cria outra ação. Uma falha inesperada durante a ação marca o resultado como `uncertain`; retries recebem `409 IDEMPOTENCY_OUTCOME_UNKNOWN` em vez de repetir a ação.
 - Um registro `processing` com mais de 300 segundos, ou o limite definido em `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS`, muda para `uncertain` sem repetir a ação.
 - Registros vencidos são removidos sob demanda depois de 7 dias; a mesma chave, após esse prazo, inicia uma nova execução. O horário de criação identifica cada geração e impede que um trabalho antigo altere a reserva nova.
@@ -110,9 +110,9 @@ O golden set nunca entra no runtime e não é consultado por RAG. Ele é visíve
 Requisitos: Python 3.10 ou superior e [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
-make setup   # instala a API e gera os dados
+make setup   # instala API/agente e gera os dados
 make up      # inicia a API em http://localhost:8000
-make test    # executa a suíte atual
+make test    # executa as suítes da API e do agente
 make logs    # acompanha o log da API
 make stop    # encerra a API iniciada pelo Makefile
 ```
@@ -155,6 +155,7 @@ Prompt curto recomendado:
 ├── CONTEXT.md
 ├── LICENSE
 ├── Makefile
+├── agent/                   # contratos e cliente HTTP assíncrono do agente
 ├── agent-input/             # entradas permitidas ao agente
 ├── api/                     # simulador FastAPI e testes
 ├── data/                    # dados do simulador
@@ -164,7 +165,7 @@ Prompt curto recomendado:
 
 ## Limitações atuais
 
-- O agente e o runner de avaliação ainda não existem.
+- O cliente HTTP e os contratos existem, mas o agente LangGraph e o runner de avaliação ainda não.
 - O simulador não representa todas as garantias transacionais de produção.
 - O OpenAPI repete `/assets/{assetId}` em blocos separados; alguns parsers podem perder uma operação.
 - Contrato e resposta atual de `Asset` não têm exatamente a mesma estrutura.
