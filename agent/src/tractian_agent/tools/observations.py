@@ -9,14 +9,10 @@ from pydantic import Field, JsonValue
 from tractian_agent.contracts import ApiError, ResponseMode, StrictModel
 
 
-_FORBIDDEN_PARTIAL_KEYS = frozenset(
+_SENSITIVE_PARTIAL_KEY_FRAGMENTS = frozenset(
     {
         "userid",
         "xuserid",
-        "identity",
-        "permissions",
-        "client",
-        "seed",
         "authorization",
         "apikey",
         "password",
@@ -24,14 +20,24 @@ _FORBIDDEN_PARTIAL_KEYS = frozenset(
         "secret",
         "cookie",
         "centralassetid",
-        "context",
-        "runtime",
-        "config",
-        "store",
         "toolcallid",
         "headers",
         "responseheaders",
         "rawresponse",
+        "token",
+    }
+)
+
+_GENERIC_FORBIDDEN_PARTIAL_KEYS = frozenset(
+    {
+        "identity",
+        "permissions",
+        "client",
+        "seed",
+        "context",
+        "runtime",
+        "config",
+        "store",
         "url",
         "method",
         "request",
@@ -55,8 +61,11 @@ def assert_safe_partial_json(value: JsonValue) -> None:
         for key, nested_value in value.items():
             normalized_key = _normalize_partial_key(key)
             if (
-                normalized_key in _FORBIDDEN_PARTIAL_KEYS
-                or "token" in normalized_key
+                normalized_key in _GENERIC_FORBIDDEN_PARTIAL_KEYS
+                or any(
+                    fragment in normalized_key
+                    for fragment in _SENSITIVE_PARTIAL_KEY_FRAGMENTS
+                )
             ):
                 raise ValueError("A resposta degradada contém um campo proibido.")
             assert_safe_partial_json(nested_value)

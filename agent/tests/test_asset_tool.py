@@ -476,6 +476,42 @@ def test_get_asset_preserves_legitimate_partial_domain_and_status_fields():
 
 
 @pytest.mark.parametrize(
+    "sensitive_key",
+    ["client_secret", "db_password", "request_headers", "set_cookie"],
+)
+def test_get_asset_rejects_sensitive_key_combinations(
+    sensitive_key: str,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "partial",
+                "notes": "Resposta degradada.",
+                "data": {"id": "asset_M101", "nested": {sensitive_key: "secret"}},
+            },
+        )
+
+    with pytest.raises(ValueError, match="proibido"):
+        _invoke(_runtime(handler))
+
+
+@pytest.mark.parametrize("legitimate_key", ["technical_configuration", "response_time"])
+def test_get_asset_preserves_legitimate_compound_partial_keys(legitimate_key: str):
+    partial_data = {"id": "asset_M101", legitimate_key: "observado"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"mode": "partial", "notes": "Resposta degradada.", "data": partial_data},
+        )
+
+    result = _invoke(_runtime(handler))
+
+    assert result.artifact.outcome.partial_data == partial_data
+
+
+@pytest.mark.parametrize(
     "points",
     [
         {"asset_id": "asset_other"},
