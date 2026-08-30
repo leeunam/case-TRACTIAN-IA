@@ -450,10 +450,29 @@ def test_degraded_list_validates_all_rows_before_21_and_201_cuts_and_declares_co
     assert result.content.returned_analyses == 20
     assert result.content.omitted_analyses == 181
     assert result.content.truncated is True
+    assert result.content.analyses[0]["id"] == "an_200"
+    assert result.content.analyses[-1]["id"] == "an_181"
     assert result.artifact.outcome.returned_analyses == 200
     assert result.artifact.outcome.omitted_analyses == 1
     assert result.artifact.truncated is True
     assert result.artifact.omitted_items == 1
+    assert result.artifact.outcome.analyses[0]["id"] == "an_200"
+    assert result.artifact.outcome.analyses[-1]["id"] == "an_1"
+
+
+def test_degraded_list_rejects_unknown_top_level_data_instead_of_bypassing_limits():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "partial",
+                "notes": "Dados parciais.",
+                "data": {"analyses": [], "raw_rows": ["unexpected"]},
+            },
+        )
+
+    with pytest.raises(ValueError, match="topo inesperado"):
+        _run(_list(_runtime(handler)))
 
 
 @pytest.mark.parametrize(
@@ -561,13 +580,13 @@ def test_degraded_data_and_api_errors_are_preserved_without_retry():
     assert partial.artifact.outcome.partial_data == {"observed": True}
 
     def error_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={"code": "NOT_FOUND", "message": "Análise ausente."})
+        return httpx.Response(404, json={"code": "NOT_FOUND", "message": "Análise não encontrada."})
 
     error = _run(_detail(_runtime(error_handler)))
     assert error.error == ApiError(
         category=ApiErrorCategory.API,
         code="NOT_FOUND",
-        message="Análise ausente.",
+        message="Análise não encontrada.",
         status_code=404,
     )
 

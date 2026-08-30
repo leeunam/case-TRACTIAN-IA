@@ -22,6 +22,7 @@ from tractian_agent.contracts import ApiError, ResponseMode, StrictModel
 from .identifiers import AnalysisId, AssetId, PointId
 from .observations import ToolArtifact, ToolOutcome, ToolSource, assert_safe_partial_json
 from .runtime import ReadToolRuntime
+
 AnalysisStatus = Literal["current", "stale", "pending", "inconclusive"]
 AnalysisType = Literal[
     "none",
@@ -42,6 +43,7 @@ _POINT_ID = TypeAdapter(PointId)
 _STATUS = TypeAdapter(AnalysisStatus)
 _TYPE = TypeAdapter(AnalysisType)
 _SEVERITY = TypeAdapter(AnalysisSeverity)
+_DEGRADED_LIST_FLAGS = frozenset({"conflict", "inconclusive"})
 
 
 def _validate_asset_id(value: object) -> AssetId:
@@ -411,6 +413,9 @@ def _normalize_degraded_list(
     analyses = data["analyses"]
     if not isinstance(analyses, list):
         raise ValueError("A resposta degradada contém uma lista de análises inválida.")
+    unexpected_keys = set(data) - {"analyses", *_DEGRADED_LIST_FLAGS}
+    if unexpected_keys:
+        raise ValueError("A resposta degradada contém um campo de topo inesperado.")
     seen_ids: set[str] = set()
     summaries: list[dict[str, JsonValue]] = []
     for item in analyses:
@@ -430,7 +435,14 @@ def _normalize_degraded_list(
             if summary["status"] != status:
                 raise ValueError("A resposta degradada contém uma análise que não respeita o filtro de status.")
         summaries.append(summary)
-    flags = {key: value for key, value in data.items() if key != "analyses"}
+    flags: dict[str, JsonValue] = {}
+    for key in _DEGRADED_LIST_FLAGS:
+        if key not in data:
+            continue
+        value = data[key]
+        if not isinstance(value, bool):
+            raise ValueError("A resposta degradada contém uma flag inválida.")
+        flags[key] = value
     return _ordered_degraded_summaries(summaries), flags
 
 
