@@ -3,11 +3,19 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
+import math
 from typing import Literal, TypeVar
 
 from langchain.tools import tool
 from langgraph.prebuilt import ToolRuntime
-from pydantic import ConfigDict, Field, JsonValue, field_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    JsonValue,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+)
 
 from tractian_agent.contracts import ApiError, ResponseMode, StrictModel
 
@@ -22,6 +30,25 @@ from .runtime import ReadToolRuntime
 
 
 ItemT = TypeVar("ItemT")
+_POINT_ID_ADAPTER = TypeAdapter(PointId)
+
+
+def _validate_optional_point_id(value: object) -> PointId | None:
+    if value is None:
+        return None
+    return _POINT_ID_ADAPTER.validate_python(value, strict=True)
+
+
+def _parse_timestamp(value: str) -> datetime:
+    if "T" not in value:
+        raise ValueError("O timestamp deve conter data, hora e timezone ISO 8601.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("O timestamp deve usar ISO 8601.") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("O timestamp deve informar timezone.")
+    return parsed
 
 
 def _assert_read_scope(asset_id: str, runtime: ReadToolRuntime) -> None:
@@ -40,6 +67,8 @@ def _assert_complete_scope(
 ) -> None:
     if asset_id != runtime.central_asset_id:
         raise ValueError("A API retornou um identificador de ativo fora do escopo.")
+    if point_id is None:
+        raise ValueError("A API retornou um ponto não verificável.")
     if requested_point_id is not None and point_id != requested_point_id:
         raise ValueError("A API retornou um ponto diferente do solicitado.")
 
@@ -51,16 +80,26 @@ def _assert_degraded_scope(
     runtime: ReadToolRuntime,
 ) -> None:
     assert_safe_partial_json(data)
-    if not isinstance(data, Mapping):
-        return
-    if "asset_id" in data:
-        asset_id = data["asset_id"]
-        if asset_id is None or asset_id != runtime.central_asset_id:
-            raise ValueError("A resposta degradada contém um ativo fora do escopo.")
-    if "point_id" in data:
-        point_id = data["point_id"]
-        if requested_point_id is not None and point_id != requested_point_id:
-            raise ValueError("A resposta degradada contém um ponto diferente do solicitado.")
+    pending: list[JsonValue] = [data]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, Mapping):
+            if "asset_id" in current:
+                asset_id = current["asset_id"]
+                if asset_id is None or asset_id != runtime.central_asset_id:
+                    raise ValueError("A resposta degradada contém um ativo fora do escopo.")
+            if "point_id" in current:
+                try:
+                    point_id = _validate_optional_point_id(current["point_id"])
+                except ValidationError as exc:
+                    raise ValueError("A resposta degradada contém um ponto inválido.") from exc
+                if point_id is None:
+                    raise ValueError("A resposta degradada contém um ponto inválido.")
+                if requested_point_id is not None and point_id != requested_point_id:
+                    raise ValueError("A resposta degradada contém um ponto diferente do solicitado.")
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
 
 
 def _query_params(
@@ -104,7 +143,7 @@ def _content_and_artifact(
 class _TechnicalToolArguments(StrictModel):
     """Inclui o runtime somente para a injeção do LangGraph."""
 
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid", strict=True, arbitrary_types_allowed=True)
 
     asset_id: AssetId
     point_id: PointId | None = None
@@ -115,8 +154,8 @@ class _BaselineFeatureWire(StrictModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     feature: str = Field(min_length=1, pattern=r"\S")
-    reference: float
-    tolerance: float
+    reference: float = Field(ge=0, allow_inf_nan=False)
+    tolerance: float = Field(ge=0, allow_inf_nan=False)
 
 
 class _BaselineWire(StrictModel):
@@ -134,6 +173,13 @@ class _BaselineWire(StrictModel):
     invalidated_at: str | None = None
     invalidation_reason: str | None = None
     features: list[_BaselineFeatureWire]
+
+    @field_validator("established_at", "invalidated_at")
+    @classmethod
+    def _requires_timestamp_with_timezone(cls, value: str | None) -> str | None:
+        if value is not None:
+            _parse_timestamp(value)
+        return value
 
 
 class BaselineFeature(StrictModel):
@@ -173,7 +219,10 @@ class GetBaselineResult(StrictModel):
 def _derive_rms_alarm_threshold(features: list[BaselineFeature]) -> float | None:
     for feature in features:
         if feature.feature == "rms_mm_s":
-            return feature.reference + feature.tolerance
+            threshold = feature.reference + feature.tolerance
+            if not math.isfinite(threshold):
+                raise ValueError("O limiar RMS derivado não é finito.")
+            return round(threshold, 3)
     return None
 
 
@@ -206,6 +255,7 @@ async def execute_get_baseline(
     point_id: PointId | None,
     runtime: ReadToolRuntime,
 ) -> GetBaselineResult:
+    point_id = _validate_optional_point_id(point_id)
     _assert_read_scope(asset_id, runtime)
     path = f"/assets/{asset_id}/baseline"
     result = await runtime.client.query(
@@ -283,13 +333,13 @@ class _RmsSampleWire(StrictModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     ts: str = Field(min_length=1)
-    value: float
+    value: float = Field(ge=0, allow_inf_nan=False)
 
     @field_validator("ts")
     @classmethod
     def _requires_iso_timestamp(cls, value: str) -> str:
         try:
-            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            _parse_timestamp(value)
         except ValueError as exc:
             raise ValueError("O timestamp RMS deve usar ISO 8601.") from exc
         return value
@@ -299,11 +349,11 @@ class _RmsSeriesWire(StrictModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     asset_id: AssetId
-    point_id: PointId | None
+    point_id: PointId
     unit: Literal["mm/s"]
-    baseline_reference: float | None
+    baseline_reference: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     baseline_state: Literal["learning", "established", "invalidated", "not_applicable"]
-    alarm_threshold: float | None
+    alarm_threshold: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     samples: list[_RmsSampleWire]
 
 
@@ -347,7 +397,7 @@ def _chronological_samples(samples: list[_RmsSampleWire]) -> list[RmsSample]:
         for _, sample in sorted(
             enumerate(samples),
             key=lambda item: (
-                datetime.fromisoformat(item[1].ts.replace("Z", "+00:00")),
+                _parse_timestamp(item[1].ts),
                 item[0],
             ),
         )
@@ -364,7 +414,7 @@ def _normalize_rms(
     rms: _RmsSeriesWire,
 ) -> tuple[RmsModelContent, RmsArtifact, int]:
     samples = _chronological_samples(rms.samples)
-    artifact_samples = samples[:1000]
+    artifact_samples = _edge_preserving_projection(samples, 1000)
     artifact_omitted = len(samples) - len(artifact_samples)
     prompt_samples = _edge_preserving_projection(samples, 100)
     return (
@@ -398,6 +448,7 @@ async def execute_get_rms_series(
     point_id: PointId | None,
     runtime: ReadToolRuntime,
 ) -> GetRmsSeriesResult:
+    point_id = _validate_optional_point_id(point_id)
     _assert_read_scope(asset_id, runtime)
     path = f"/assets/{asset_id}/rms"
     result = await runtime.client.query(
@@ -474,8 +525,8 @@ async def get_rms_series(
 class _SpectrumPeakWire(StrictModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    freq_hz: float
-    amplitude_mm_s: float
+    freq_hz: float = Field(ge=0, allow_inf_nan=False)
+    amplitude_mm_s: float = Field(ge=0, allow_inf_nan=False)
     note: str | None = None
 
 
@@ -483,17 +534,16 @@ class _SpectrumWire(StrictModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     asset_id: AssetId
-    point_id: PointId | None
-    frequency_resolution_hz: float
+    point_id: PointId
     peaks: list[_SpectrumPeakWire]
-    bands_missing: list[str] = Field(default_factory=list)
+    bands_missing: list[str]
     collected_at: str = Field(min_length=1)
 
     @field_validator("collected_at")
     @classmethod
     def _requires_iso_timestamp(cls, value: str) -> str:
         try:
-            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            _parse_timestamp(value)
         except ValueError as exc:
             raise ValueError("A coleta do espectro deve usar ISO 8601.") from exc
         return value
@@ -508,7 +558,6 @@ class SpectrumPeak(StrictModel):
 class SpectrumArtifact(StrictModel):
     asset_id: AssetId
     point_id: PointId | None
-    frequency_resolution_hz: float
     peaks: list[SpectrumPeak]
     bands_missing: list[str]
     collected_at: str
@@ -554,7 +603,6 @@ def _normalize_spectrum(
     base = {
         "asset_id": spectrum.asset_id,
         "point_id": spectrum.point_id,
-        "frequency_resolution_hz": spectrum.frequency_resolution_hz,
         "bands_missing": spectrum.bands_missing,
         "collected_at": spectrum.collected_at,
         "total_peaks": len(peaks),
@@ -575,6 +623,7 @@ async def execute_get_spectrum(
     point_id: PointId | None,
     runtime: ReadToolRuntime,
 ) -> GetSpectrumResult:
+    point_id = _validate_optional_point_id(point_id)
     _assert_read_scope(asset_id, runtime)
     path = f"/assets/{asset_id}/spectrum"
     result = await runtime.client.query(
@@ -654,10 +703,10 @@ class _DataQualityWire(StrictModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     asset_id: AssetId
-    point_id: PointId | None
-    completeness: float = Field(ge=0, le=1)
+    point_id: PointId
+    completeness: float = Field(ge=0, le=1, allow_inf_nan=False)
     freshness_minutes: int = Field(ge=0)
-    snr_db: float
+    snr_db: float = Field(allow_inf_nan=False)
     staleness_flag: bool
 
 
@@ -700,6 +749,7 @@ async def execute_get_data_quality(
     point_id: PointId | None,
     runtime: ReadToolRuntime,
 ) -> GetDataQualityResult:
+    point_id = _validate_optional_point_id(point_id)
     _assert_read_scope(asset_id, runtime)
     path = f"/assets/{asset_id}/data-quality"
     result = await runtime.client.query(

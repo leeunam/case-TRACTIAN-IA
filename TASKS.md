@@ -122,8 +122,9 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 - Preservar `mode`, `notes` e todo `ApiError`; validação inválida impede HTTP e exceção inesperada de programação não é convertida em sucesso.
 - Construir em fatias verticais `RED → GREEN`, começando por `get_asset`, e testar contrato público, escopo, chamada fixa, modos, erros, conteúdo/artifact e integração mínima com `ToolNode` sem criar ainda o agente completo.
 - Para baseline, RMS, espectro e qualidade, expor somente `asset_id` e `point_id` opcional; identidade, permissões, ativo central, cliente e seed continuam exclusivamente no `ReadToolRuntime`.
-- Normalizar séries RMS em ordem cronológica estável e projetar o conteúdo para no máximo 100 amostras, preservando extremos; o artifact pode reter no máximo 1.000. Para espectro, ordenar picos por frequência de modo estável e limitar conteúdo/artifact a 20/200. Toda redução declara a quantidade omitida.
+- Normalizar séries RMS em ordem cronológica estável e projetar conteúdo/artifact com espaçamento uniforme e extremos preservados para no máximo 100/1.000 amostras. Para espectro, usar somente os campos reais (`asset_id`, `point_id`, `collected_at`, `peaks`, `bands_missing`), ordenar picos por frequência de modo estável e limitar conteúdo/artifact a 20/200. Toda redução declara a quantidade omitida.
 - Derivar `alarm_threshold` apenas da feature `rms_mm_s` do baseline (`reference + tolerance`), sem inferir validade a partir do estado. Em dados degradados, aplicar o guard compartilhado de JSON parcial e recusar IDs de ativo ou ponto que contradigam o escopo já conhecido.
+- Exigir ponto não nulo e verificável em payload completo técnico; validar `point_id` também no início de cada operação Python. Datas completas exigem hora e timezone; números de wire devem ser finitos antes de entrar em qualquer artifact JSON.
 
 - [ ] Implementar tools de consulta necessárias aos cenários.
 - [ ] Validar IDs, filtros e identidade antes da chamada.

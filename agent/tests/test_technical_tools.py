@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import json
+import math
 
 import httpx
 import pytest
@@ -133,6 +135,7 @@ def test_get_rms_series_normalizes_chronology_and_declares_two_projections():
     assert result.content.samples[0].value == 0.0
     assert result.content.samples[-1].value == 1000.0
     assert len(result.artifact.outcome.rms.samples) == 1000
+    assert result.artifact.outcome.rms.samples[-1].value == 1000.0
     assert result.artifact.truncated is True
     assert result.artifact.omitted_items == 2
 
@@ -154,7 +157,6 @@ def test_get_spectrum_stably_orders_projects_peaks_and_preserves_missing_bands()
                 "data": {
                     "asset_id": "asset_M101",
                     "point_id": "pt_M101_de",
-                    "frequency_resolution_hz": 0.25,
                     "peaks": peaks,
                     "bands_missing": ["2x_line", "bpfo"],
                     "collected_at": "2026-01-03T00:00:00+00:00",
@@ -175,6 +177,7 @@ def test_get_spectrum_stably_orders_projects_peaks_and_preserves_missing_bands()
     assert requests[0].url.path == "/assets/asset_M101/spectrum"
     assert dict(requests[0].url.params) == {"seed": "fixed-technical"}
     assert result.content.bands_missing == ["2x_line", "bpfo"]
+    assert "frequency_resolution_hz" not in result.content.model_dump()
     assert result.content.total_peaks == 201
     assert result.content.omitted_peaks == 181
     assert len(result.content.peaks) == 20
@@ -257,7 +260,6 @@ def _complete_payload(name: str, *, asset_id: str = "asset_M101", point_id: str 
         return {
             "asset_id": asset_id,
             "point_id": point_id,
-            "frequency_resolution_hz": 0.25,
             "peaks": [{"freq_hz": 30.0, "amplitude_mm_s": 0.4}],
             "bands_missing": ["2x_line"],
             "collected_at": "2026-01-01T00:00:00+00:00",
@@ -475,3 +477,152 @@ def test_baseline_keeps_threshold_none_without_the_exact_rms_feature():
     result = asyncio.run(invoke())
     assert result.content.state == "established"
     assert result.content.alarm_threshold is None
+
+
+@pytest.mark.parametrize("_,__,execute", TECHNICAL_TOOLS)
+@pytest.mark.parametrize("invalid_point", ["wrong", b"pt_M101_de", "../pt_M101_de"])
+def test_execute_rejects_invalid_point_before_http(_, __, execute, invalid_point):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    async def invoke():
+        runtime = _runtime(handler)
+        try:
+            with pytest.raises(ValidationError):
+                await execute("asset_M101", invalid_point, runtime)
+        finally:
+            await runtime.client.aclose()
+
+    asyncio.run(invoke())
+    assert calls == 0
+
+
+@pytest.mark.parametrize("_,__,execute", TECHNICAL_TOOLS)
+def test_degraded_scope_checks_nested_exact_asset_and_point_keys(_, __, execute):
+    responses = [
+        {"mode": "partial", "notes": None, "data": {"parent_asset_id": "asset_OTHER", "nested": {"asset_id": "asset_OTHER"}}},
+        {"mode": "partial", "notes": None, "data": {"items": [{"point_id": None}]}},
+        {"mode": "partial", "notes": None, "data": {"items": [{"point_id": "pt_OTHER"}]}},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=responses.pop(0))
+
+    async def invoke():
+        runtime = _runtime(handler)
+        try:
+            with pytest.raises(ValueError, match="ativo fora do escopo"):
+                await execute("asset_M101", "pt_M101_de", runtime)
+            with pytest.raises(ValueError, match="ponto inválido"):
+                await execute("asset_M101", "pt_M101_de", runtime)
+            with pytest.raises(ValueError, match="ponto diferente"):
+                await execute("asset_M101", "pt_M101_de", runtime)
+        finally:
+            await runtime.client.aclose()
+
+    asyncio.run(invoke())
+
+
+@pytest.mark.parametrize("name,_,execute", TECHNICAL_TOOLS)
+def test_complete_payloads_require_a_verifiable_point(name, _, execute):
+    payload = _complete_payload(name, point_id=None)  # type: ignore[arg-type]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+
+    async def invoke():
+        runtime = _runtime(handler)
+        try:
+            return await execute("asset_M101", None, runtime)
+        finally:
+            await runtime.client.aclose()
+
+    result = asyncio.run(invoke())
+    assert result.error.code == "INVALID_SCHEMA_RESPONSE"
+
+
+@pytest.mark.parametrize(
+    "name,mutate",
+    [
+        ("baseline", lambda payload: payload.__setitem__("established_at", "2026-01-01")),
+        ("rms", lambda payload: payload["samples"][0].__setitem__("ts", "2026-01-01T00:00:00")),
+        ("spectrum", lambda payload: payload.__setitem__("collected_at", "2026-01-01")),
+    ],
+)
+def test_complete_timestamps_require_time_and_timezone(name, mutate):
+    payload = _complete_payload(name)
+    mutate(payload)
+    execute = next(execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+
+    async def invoke():
+        runtime = _runtime(handler)
+        try:
+            return await execute("asset_M101", None, runtime)
+        finally:
+            await runtime.client.aclose()
+
+    assert asyncio.run(invoke()).error.code == "INVALID_SCHEMA_RESPONSE"
+
+
+def test_spectrum_requires_bands_missing_and_rejects_the_removed_resolution_field():
+    missing_bands = _complete_payload("spectrum")
+    missing_bands.pop("bands_missing")
+    removed_field = _complete_payload("spectrum")
+    removed_field["frequency_resolution_hz"] = 0.25
+    responses = [missing_bands, removed_field]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": responses.pop(0)})
+
+    async def invoke():
+        runtime = _runtime(handler)
+        try:
+            first = await execute_get_spectrum("asset_M101", None, runtime)
+            second = await execute_get_spectrum("asset_M101", None, runtime)
+            return first, second
+        finally:
+            await runtime.client.aclose()
+
+    first, second = asyncio.run(invoke())
+    assert first.error.code == "INVALID_SCHEMA_RESPONSE"
+    assert second.error.code == "INVALID_SCHEMA_RESPONSE"
+
+
+@pytest.mark.parametrize(
+    "name,mutate",
+    [
+        ("baseline", lambda payload: payload["features"][0].__setitem__("reference", math.nan)),
+        ("rms", lambda payload: payload["samples"][0].__setitem__("value", math.inf)),
+        ("spectrum", lambda payload: payload["peaks"][0].__setitem__("freq_hz", -math.inf)),
+        ("data_quality", lambda payload: payload.__setitem__("snr_db", math.nan)),
+    ],
+)
+def test_complete_nonfinite_numbers_are_invalid_and_artifacts_remain_strict_json(name, mutate):
+    invalid_payload = _complete_payload(name)
+    mutate(invalid_payload)
+    valid_payload = _complete_payload(name)
+    execute = next(execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name)
+    responses = [invalid_payload, valid_payload]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": responses.pop(0)})
+
+    async def invoke():
+        runtime = _runtime(handler)
+        try:
+            invalid = await execute("asset_M101", None, runtime)
+            valid = await execute("asset_M101", None, runtime)
+            return invalid, valid
+        finally:
+            await runtime.client.aclose()
+
+    invalid, valid = asyncio.run(invoke())
+    assert invalid.error.code == "INVALID_SCHEMA_RESPONSE"
+    json.dumps(valid.artifact.model_dump(mode="json"), allow_nan=False)

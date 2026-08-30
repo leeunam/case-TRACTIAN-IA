@@ -64,6 +64,45 @@ terminou com `37 passed`.
 As decisões de limite, projeção e derivação foram registradas em `TASKS.md`.
 `get_asset` não foi alterada: a nova implementação compartilha helpers apenas
 entre as quatro tools técnicas, preservando os contratos aprovados da Task 1.
-O wire model de espectro aceita `note` e `bands_missing` ausentes como valores
-vazios/nulos compatíveis com o contrato documentado; qualquer campo extra em
-resposta completa continua inválido. Não há preocupação bloqueante conhecida.
+O wire model de espectro aceita `note` nulo quando presente, mas exige
+`bands_missing` no payload completo real; qualquer campo extra em resposta
+completa continua inválido. Não há preocupação bloqueante conhecida.
+
+## Correção após revisão independente
+
+Uma revisão independente reprovou a versão inicial por divergência do payload
+real de espectro e por fronteiras insuficientemente defensivas. A correção foi
+feita em uma nova rodada RED → GREEN.
+
+### RED
+
+Primeiro, a remoção de `frequency_resolution_hz` dos fixtures de teste fez o
+teste focado falhar em três casos, pois o wire model ainda exigia o campo. Em
+seguida, foram adicionadas regressões para a borda RMS de 1.000 itens, entradas
+diretas inválidas de `point_id`, referências aninhadas em respostas degradadas,
+ponto nulo completo, timestamps incompletos, ausência de `bands_missing` e
+NaN/inf. Antes da implementação, o comando focado terminou com `27 failed,
+38 passed`.
+
+### GREEN
+
+- O espectro agora usa somente `asset_id`, `point_id`, `collected_at`, `peaks`
+  e `bands_missing`; o último é obrigatório no modo completo e o antigo campo
+  de resolução é rejeitado como extra.
+- A inspeção de escopo degradado percorre recursivamente objetos e listas,
+  analisando apenas chaves exatas `asset_id` e `point_id`, sem tratar
+  `parent_asset_id` como o ativo consultado. Nulos, IDs inválidos e relações
+  conhecidamente contraditórias falham.
+- Cada `execute_*` valida o ponto com `TypeAdapter(..., strict=True)` antes de
+  qualquer HTTP; o schema interno da tool também é estrito.
+- RMS usa a mesma projeção edge-preserving/evenly-spaced para 100 e 1.000
+  amostras, mantendo as duas extremidades e duplicatas como itens.
+- O validador comum de timestamps requer data, hora e timezone ISO/RFC3339.
+  Todos os floats de wire rejeitam NaN e infinitos, e o limiar RMS é arredondado
+  a três casas e recusado se a soma não for finita.
+
+| Comando | Resultado da correção |
+| --- | --- |
+| `rtk uv run --project agent pytest agent/tests/test_technical_tools.py -q` | 65 passed |
+| `rtk uv run --project agent pytest agent/tests -q` | 144 passed |
+| `rtk make test` | API: 59 passed (1 aviso externo de depreciação); agent: 144 passed |
