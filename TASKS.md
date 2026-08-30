@@ -364,6 +364,23 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Objetivo:** concluir a infraestrutura 5A sem LLM e provar persistência/reabertura do estado.
 
+**Decisões implementadas nesta fatia:** o desenvolvimento usa
+`AsyncSqliteSaver.from_conn_string` em contexto assíncrono, no caminho padrão
+`.run/agent-checkpoints.sqlite3`, com serializer sem fallback de pickle nem
+módulos JSON/MsgPack arbitrários. A fronteira Python exige `ReadToolRuntime` e
+`thread_id`, cria ou continua o `AgentState` e chama o grafo sempre com
+`durability="sync"`; cliente e demais objetos do runtime não entram no
+checkpoint. O grafo acíclico `ingest → route → finish` consome três passos e
+somente produz um resultado determinístico explícito, sem LLM, tool produtiva
+ou efeito. Threads não expiram nem são removidos automaticamente nesta fatia;
+a remoção disponível é `adelete_thread(thread_id)`. Intenções preexistentes são
+apenas preservadas, inclusive `expires_at` e chave, sem geração ou reuso.
+
+**Evidência desta fatia:** os 13 testes novos de checkpoint, grafo e fronteira,
+os 314 testes focados com os contratos herdados e o `make test` completo
+passaram; a execução global totalizou 59 testes da API e 719 do agente, com
+somente o aviso de depreciação já conhecido do `python_multipart`.
+
 **Arquivos:** adicionar `langgraph-checkpoint-sqlite>=3.1.1,<3.2`; criar `agent/src/tractian_agent/checkpoint.py`, `agent/src/tractian_agent/graph.py`, `agent/src/tractian_agent/entrypoint.py` e testes focados; atualizar lock.
 
 **Contrato e testes:**
