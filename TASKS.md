@@ -449,6 +449,23 @@ passaram. O `make test` completo passou com 59 testes da API e 782 do agente
 
 **Objetivo:** implementar efeitos isolados, ainda sem conectá-los automaticamente ao grafo.
 
+**Decisões implementadas nesta fatia:** `WriteToolRuntime` estende o runtime de
+leitura e exige `current_case_id`, sem tornar o caso obrigatório para as dez
+tools existentes. O módulo de operações publica somente cinco funções Python;
+método, caminho e bodies Pydantic fechados permanecem privados e fixos. O
+preflight de reprocesso e especialista reutiliza `execute_get_analysis`: somente
+resposta `complete`, validada e vinculada ao ativo central libera o write. Erros
+da API são preservados; resposta degradada, divergência de escopo ou falta de
+prova produz `ANALYSIS_SCOPE_UNCONFIRMED`, e chave persistida inválida produz
+`INVALID_IDEMPOTENCY_KEY` antes de qualquer HTTP. Não há loop, backoff ou retry;
+somente reprocesso recebe e propaga `Idempotency-Key`.
+
+**Evidência desta fatia:** os 20 testes novos de runtime e operações passaram;
+os 158 testes focados relacionados também passaram. O `make test` completo
+passou com 59 testes da API e 810 do agente (869 no total), além somente do
+aviso de depreciação já conhecido do `python_multipart`. `uv lock --check`
+também passou para o projeto do agente.
+
 **Arquivos:** evoluir `tools/runtime.py`; criar `agent/src/tractian_agent/write_operations.py` e testes focados.
 
 **Contrato e testes:**
