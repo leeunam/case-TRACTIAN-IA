@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** simulador FastAPI, dados, contrato, cenários, contratos Pydantic, cliente HTTP assíncrono e dez tools LangChain de leitura estão disponíveis, com 457 testes ao todo. As Fases 1, 2 e 3 estão concluídas; o grafo de produção do agente LangGraph, checkpointer, observabilidade e avaliação ainda serão implementados conforme [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph determinístico e checkpointer SQLite de desenvolvimento. A execução de aceite de 30/08/2026 passou com 59 testes da API e 1.053 do agente (1.112 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 5 estão concluídas. O grafo atual não é um agente de produção: planner LLM, writer, resposta gerada ao cliente, ledger completo, gate de liberação, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -42,25 +42,29 @@ Essa separação reduz contexto, facilita testes e impede que a redação altere
 
 No MVP, planner e writer podem usar o mesmo modelo com prompts e contratos diferentes. A separação é de responsabilidade, não uma obrigação de contratar dois modelos.
 
-O **ledger de evidências** vive no estado da execução e associa afirmações às fontes consultadas. O Logfire recebe traces e métricas para consulta humana e operação; ele não é o banco principal do ledger nem uma fonte que o agente consulta durante o atendimento.
+No desenho final, o **ledger de evidências** associará afirmações às fontes consultadas no estado da execução. O Logfire receberá traces e métricas para consulta humana e operação; ele não será o banco principal do ledger nem uma fonte que o agente consulta durante o atendimento. Nenhum dos dois componentes está implementado nesta entrega.
 
 ### Persistência e idempotência
 
-- SQLite armazena a idempotência no desenvolvimento e também será usado pelo futuro checkpointer; PostgreSQL é a evolução esperada.
-- O arquivo usa `IDEMPOTENCY_DB_PATH`; sem a variável, fica em `.run/idempotency.sqlite3`. `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS` altera o limite de processamento, cujo padrão é 300 segundos.
+Há dois armazenamentos SQLite independentes no desenvolvimento. A API usa `IDEMPOTENCY_DB_PATH` (padrão `.run/idempotency.sqlite3`) para a idempotência de reprocesso; `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS` altera seu limite de processamento, cujo padrão é 300 segundos. O grafo usa `.run/agent-checkpoints.sqlite3` por `AsyncSqliteSaver`, com serializer restrito e sem remoção automática de threads; a exclusão é explícita. PostgreSQL continua sendo a evolução futura, não uma implementação atual.
+
+- `thread_id` identifica a linha persistida; um thread pode receber novos `request_id`, e cada execução ou retomada recebe novo `execution_id`. Mudança de caso, empresa, pessoa usuária ou alvo confiável falha fechada.
+- A intenção persistida registra ID, request, escopo imutável, hash, decisão/status, tentativas, execução preparadora e recibo ou erro; runtime, cliente, credenciais, seed, golden set, resposta HTTP bruta e raciocínio não entram no checkpoint.
+- Criação e retomada que podem escrever usam `durability="sync"`; `prepare_intent` fica em superstep distinto e é persistido antes de `execute_action`. Confirmações usam `interrupt()` estruturado e `Command` pelo ID na fronteira confiável.
 - O primeiro alvo de idempotência é `POST /analyses/{analysisId}/reprocess`.
 - A API exige uma `Idempotency-Key` de 1 a 255 caracteres sem espaços, reserva a intenção antes da ação, persiste respostas concluídas em SQLite e faz replay mesmo após recriar o armazenamento; mesma chave com payload diferente retorna `409 Conflict`.
-- A futura camada de execução de escritas gerará e persistirá uma chave nova antes da primeira chamada e a reutilizará somente em retries da mesma intenção; o cliente HTTP apenas valida e propaga a chave recebida.
+- O fluxo determinístico de reprocesso cria `tractian-agent:<uuid>` uma única vez após `allow`, persiste-a antes do HTTP e a reutiliza somente em, no máximo, um retry com o mesmo corpo. Cliente, proposal tools e operações não criam retries.
 - A reserva é atômica: enquanto a primeira chamada está em execução, uma chamada concorrente com a mesma intenção recebe `409 IDEMPOTENCY_IN_PROGRESS` e não cria outra ação. Uma falha inesperada durante a ação marca o resultado como `uncertain`; retries recebem `409 IDEMPOTENCY_OUTCOME_UNKNOWN` em vez de repetir a ação.
 - Um registro `processing` com mais de 300 segundos, ou o limite definido em `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS`, muda para `uncertain` sem repetir a ação.
 - Registros vencidos são removidos sob demanda depois de 7 dias; a mesma chave, após esse prazo, inicia uma nova execução. O horário de criação identifica cada geração e impede que um trabalho antigo altere a reserva nova.
 - Se a resposta se perde depois do commit, o retry recupera a resposta persistida sem repetir a ação.
+- Especialista, criticidade, retreinamento e escalonamento não usam chave nem retry automático: têm no máximo um despacho. Em retomada de uma intenção `prepared` por outro `execution_id`, terminam conservadoramente em `uncertain/0` sem tocar a rede. Isso pode produzir falso incerto e `attempts` pode subcontar um crash pós-efeito; o lock por `thread_id` é local ao processo/event loop e o preflight do especialista é opaco.
 
 ### Modelos
 
 O acesso aos modelos terá uma interface própria. Groq é o provedor inicial; NVIDIA NIM ficará como alternativa a comparar. Planner e writer poderão usar modelos distintos futuramente sem alterar a regra de negócio.
 
-## Avaliação offline
+## Avaliação offline planejada
 
 Avaliação não participa do atendimento ao cliente nem provoca retries automáticos no runtime.
 
@@ -155,7 +159,7 @@ Prompt curto recomendado:
 ├── CONTEXT.md
 ├── LICENSE
 ├── Makefile
-├── agent/                   # contratos, cliente HTTP e tools de leitura do agente
+├── agent/                   # contratos, cliente, tools, política, operações, estado, grafo e checkpointer
 ├── agent-input/             # entradas permitidas ao agente
 ├── api/                     # simulador FastAPI e testes
 ├── data/                    # dados do simulador
@@ -165,7 +169,8 @@ Prompt curto recomendado:
 
 ## Limitações atuais
 
-- Contratos, cliente HTTP e tools de leitura existem; há apenas um `ToolNode` mínimo nos testes, não o grafo de produção do agente nem o runner de avaliação.
+- Existe um grafo LangGraph determinístico com fluxos de escrita e checkpointer, mas sem LLM. Ele não possui planner, writer, resposta gerada ao cliente, ledger completo, gate de segurança de liberação, Logfire nem runner Pydantic Evals; portanto não é um agente de produção.
+- As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
 - O simulador não representa todas as garantias transacionais de produção.
 - O OpenAPI repete `/assets/{assetId}` em blocos separados; alguns parsers podem perder uma operação.
 - Contrato e resposta atual de `Asset` não têm exatamente a mesma estrutura.

@@ -8,7 +8,7 @@ from pydantic import ConfigDict, Field, field_validator
 from tractian_agent.client import IndustrialApiClient
 from tractian_agent.contracts import Identity, StrictModel
 
-from .identifiers import AssetId, ModelId
+from .identifiers import AssetId, CaseId, ModelId
 
 Permission = Literal["read", "action_low", "action_high", "escalate"]
 
@@ -54,6 +54,35 @@ class ReadToolRuntime(StrictModel):
             identity=TrustedIdentity(user_id=user_id, company_id=company_id),
             permissions=permissions,
             central_asset_id=central_asset_id,
+            client=client,
+            seed=seed,
+            configured_model_id=configured_model_id,
+        )
+
+
+class WriteToolRuntime(ReadToolRuntime):
+    """Contexto confiável adicional exigido pelas operações de escrita."""
+
+    current_case_id: CaseId
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        user_id: str,
+        company_id: str,
+        permissions: frozenset[Permission],
+        central_asset_id: str,
+        current_case_id: str,
+        client: IndustrialApiClient,
+        seed: str | None = None,
+        configured_model_id: str = "mdl_vib_v3",
+    ) -> WriteToolRuntime:
+        return cls(
+            identity=TrustedIdentity(user_id=user_id, company_id=company_id),
+            permissions=permissions,
+            central_asset_id=central_asset_id,
+            current_case_id=current_case_id,
             client=client,
             seed=seed,
             configured_model_id=configured_model_id,
