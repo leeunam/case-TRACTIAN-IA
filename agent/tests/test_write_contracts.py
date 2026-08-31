@@ -396,10 +396,11 @@ def test_write_intent_serializes_as_plain_json_without_runtime_objects():
         _intent(receipt=object())
 
 
-def test_task_one_public_proposal_does_not_expose_trusted_runtime_fields():
+def test_reprocess_proposal_adds_only_the_internal_discriminator():
     proposal_fields = ReprocessProposal.model_json_schema()["properties"]
 
-    assert set(proposal_fields) == {"analysis_id", "justification"}
+    assert set(proposal_fields) == {"action", "analysis_id", "justification"}
+    assert proposal_fields["action"]["const"] == "reprocess_analysis"
     assert not {
         "execution_id",
         "identity",

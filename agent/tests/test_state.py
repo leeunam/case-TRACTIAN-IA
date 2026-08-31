@@ -41,10 +41,14 @@ from tractian_agent.write_contracts import (
 )
 from tractian_agent.write_policy import (
     ApprovalSource,
+    EscalateCaseProposal,
     PolicyDecision,
     PolicyReason,
     ReprocessProposal,
+    RequestModelRetrainingProposal,
+    RequestSpecialistAnalysisProposal,
     TrustedActionApproval,
+    UpdateAssetCriticalityProposal,
     WritePolicyResult,
 )
 
@@ -206,6 +210,38 @@ def test_new_state_starts_with_empty_typed_evidence_and_observable_collections()
     assert state.approval is None
     assert state.final_result is None
     assert state.review is None
+
+
+@pytest.mark.parametrize(
+    "proposal",
+    [
+        ReprocessProposal(
+            analysis_id="an_9906",
+            justification="Há dados novos para reprocessar esta análise.",
+        ),
+        RequestSpecialistAnalysisProposal(
+            analysis_id="an_9906",
+            justification="A limitação registrada exige análise especializada.",
+        ),
+        UpdateAssetCriticalityProposal(
+            criticality="critical",
+            justification="O impacto operacional exige criticidade mais alta.",
+        ),
+        RequestModelRetrainingProposal(
+            justification="Erros sistemáticos sustentam solicitar novo treinamento.",
+        ),
+        EscalateCaseProposal(
+            justification="O caso ultrapassa o atendimento remoto disponível.",
+        ),
+    ],
+)
+def test_pending_proposal_restores_each_discriminated_variant(proposal):
+    original = _state(pending_proposal=proposal)
+
+    restored = AgentState.model_validate_json(original.model_dump_json())
+
+    assert restored.pending_proposal == proposal
+    assert type(restored.pending_proposal) is type(proposal)
 
 
 def test_same_thread_accepts_new_request_and_execution_for_the_same_scope():

@@ -413,6 +413,27 @@ somente o aviso de depreciação já conhecido do `python_multipart`.
 
 **Objetivo:** generalizar a política fechada e expor ao modelo apenas propostas sem efeito.
 
+**Decisões implementadas nesta fatia:** as cinco propostas formam uma união
+imutável discriminada por `action`, sem quebrar a construção existente de
+`ReprocessProposal`. A política resolve o escopo canônico pela ação, alvo e
+parâmetros materiais; somente a criticidade é material nesta entrega. Ativo
+central, caso atual e modelo configurado ficam em `TrustedWriteContext`, fora
+dos schemas públicos. A ordem fechada é permissão, justificativa, presença de
+aprovação e igualdade integral do escopo. `AgentState.pending_proposal`
+persiste e restaura as cinco variantes, enquanto `WriteIntent` e
+`ReprocessIntentScope` continuam exclusivos do reprocesso.
+
+As cinco tools LangChain retornam conteúdo de proposta e artifact próprio com
+`effect_executed=false`, sem runtime, cliente ou HTTP. O catálogo
+`WRITE_PROPOSAL_TOOLS` é uma tupla ordenada e única; seus schemas públicos
+rejeitam campos extras e expõem somente os argumentos definidos nesta task.
+
+**Evidência desta fatia:** 46 casos de teste foram acrescentados. Os 384 testes
+focados de política, contratos, estado, checkpoint, grafo e proposal tools
+passaram. O `make test` completo passou com 59 testes da API e 782 do agente
+(841 no total), além somente do aviso de depreciação já conhecido do
+`python_multipart`. `uv lock --check` também passou para o projeto do agente.
+
 **Arquivos:** evoluir `write_policy.py` e `write_contracts.py`; criar `agent/src/tractian_agent/tools/writes.py`; atualizar catálogos/exportações e testes.
 
 **Contrato e testes:**

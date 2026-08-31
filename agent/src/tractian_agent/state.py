@@ -23,7 +23,7 @@ from tractian_agent.contracts import ResponseMode, StrictModel, SupportRequest, 
 from tractian_agent.tools.observations import ToolArtifact
 from tractian_agent.tools.runtime import Permission, TrustedIdentity
 from tractian_agent.write_contracts import PersistedApiError, WriteIntent
-from tractian_agent.write_policy import ReprocessProposal, TrustedActionApproval
+from tractian_agent.write_policy import TrustedActionApproval, WriteProposal
 
 
 def _normalized_key(value: str) -> str:
@@ -448,7 +448,7 @@ class AgentState(FrozenStateModel):
     decision: AgentDecision | None = None
     step_count: int = Field(default=0, ge=0)
     step_limit: int = Field(gt=0)
-    pending_proposal: ReprocessProposal | None = None
+    pending_proposal: WriteProposal | None = None
     approval: TrustedActionApproval | None = None
     intents: tuple[WriteIntent, ...] = ()
     final_result: FinalResult | None = None
