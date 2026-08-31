@@ -13,7 +13,12 @@ import pytest
 import tractian_agent.graph as graph_module
 from tractian_agent.checkpoint import open_checkpointer
 from tractian_agent.client import IndustrialApiClient
-from tractian_agent.contracts import ActionReceipt, Identity, SupportRequest
+from tractian_agent.contracts import (
+    ActionReceipt,
+    ApiErrorCategory,
+    Identity,
+    SupportRequest,
+)
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
 from tractian_agent.graph import build_agent_graph
 from tractian_agent.state import AgentDecision, AgentState
@@ -706,6 +711,86 @@ def test_non_idempotent_result_matrix_never_retries(
     assert (intent.error is not None) is (result_kind != "rejected")
     assert (state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW) is requires_review
     assert state.review is None
+
+
+@pytest.mark.parametrize("case", ACTION_CASES, ids=lambda case: case.slug)
+@pytest.mark.parametrize(
+    ("status_code", "expected_status"),
+    [
+        pytest.param(400, IntentStatus.FAILED, id="400"),
+        pytest.param(403, IntentStatus.FAILED, id="403"),
+        pytest.param(409, IntentStatus.FAILED, id="409"),
+        pytest.param(200, IntentStatus.UNCERTAIN, id="2xx"),
+    ],
+)
+def test_non_idempotent_malformed_http_response_never_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: ActionCase,
+    status_code: int,
+    expected_status: IntentStatus,
+):
+    requests: list[httpx.Request] = []
+    operation_calls: list[object] = []
+    operation_name = _OPERATION_NAMES[case.slug]
+    original_operation = getattr(graph_module, operation_name)
+
+    async def counted_operation(proposal, runtime):
+        operation_calls.append(proposal)
+        return await original_operation(proposal, runtime)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"mode": "complete", "notes": None, "data": _analysis_payload()},
+            )
+        return httpx.Response(
+            status_code,
+            content=b"{malformed-json",
+            headers={"content-type": "application/json"},
+        )
+
+    monkeypatch.setattr(graph_module, operation_name, counted_operation)
+
+    async def scenario():
+        runtime = _runtime(handler, case)
+        try:
+            async with open_checkpointer(
+                tmp_path / f"checkpoints-malformed-{case.slug}-{status_code}.sqlite3"
+            ) as saver:
+                return await invoke_agent(
+                    build_agent_graph(saver),
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=f"thread_malformed_{case.slug}_{status_code}",
+                    request_id=f"req_malformed_{case.slug}_{status_code}",
+                    execution_id=f"exec_malformed_{case.slug}_{status_code}",
+                    proposal=case.proposal,
+                    original_approval=case.approval,
+                )
+        finally:
+            await runtime.client.aclose()
+
+    state = asyncio.run(scenario())
+    intent = state.intents[0]
+    write_requests = _write_requests(requests, case)
+    expected_gets = 1 if case.slug == "specialist" else 0
+
+    assert intent.status is expected_status
+    assert intent.attempts == 1
+    assert intent.error is not None
+    assert intent.error.category is ApiErrorCategory.INVALID_RESPONSE
+    assert intent.error.status_code == status_code
+    assert len(operation_calls) == 1
+    assert len(write_requests) == 1
+    assert len(requests) == expected_gets + 1
+    assert sum(request.method == "GET" for request in requests) == expected_gets
+    assert "idempotency-key" not in write_requests[0].headers
+    assert (
+        state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+    ) is (expected_status is IntentStatus.UNCERTAIN)
 
 
 @pytest.mark.parametrize("case", ACTION_CASES, ids=lambda case: case.slug)

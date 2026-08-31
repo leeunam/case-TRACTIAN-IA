@@ -1517,6 +1517,97 @@ def test_reprocess_result_matrix_uses_at_most_one_same_key_retry(
         assert state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
 
 
+@pytest.mark.parametrize(
+    ("status_code", "expected_status", "expected_attempts"),
+    [
+        pytest.param(400, IntentStatus.FAILED, 1, id="400"),
+        pytest.param(403, IntentStatus.FAILED, 1, id="403"),
+        pytest.param(409, IntentStatus.FAILED, 1, id="409"),
+        pytest.param(200, IntentStatus.UNCERTAIN, 2, id="2xx"),
+    ],
+)
+def test_reprocess_malformed_http_response_uses_status_before_category(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    expected_status: IntentStatus,
+    expected_attempts: int,
+):
+    requests: list[httpx.Request] = []
+    operation_keys: list[str] = []
+    original_operation = graph_module.execute_reprocess_analysis
+
+    async def counted_operation(
+        proposal,
+        runtime,
+        *,
+        idempotency_key,
+    ):
+        operation_keys.append(idempotency_key)
+        return await original_operation(
+            proposal,
+            runtime,
+            idempotency_key=idempotency_key,
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"mode": "complete", "notes": None, "data": _analysis_payload()},
+            )
+        return httpx.Response(
+            status_code,
+            content=b"{malformed-json",
+            headers={"content-type": "application/json"},
+        )
+
+    monkeypatch.setattr(
+        graph_module,
+        "execute_reprocess_analysis",
+        counted_operation,
+    )
+
+    async def scenario():
+        runtime = _runtime(handler)
+        try:
+            async with open_checkpointer(
+                tmp_path / f"checkpoints-malformed-{status_code}.sqlite3"
+            ) as saver:
+                return await invoke_agent(
+                    build_agent_graph(saver),
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=f"thread_malformed_{status_code}",
+                    request_id=f"req_malformed_{status_code}",
+                    execution_id=f"exec_malformed_{status_code}",
+                    proposal=_proposal(),
+                    original_approval=_approval(),
+                )
+        finally:
+            await runtime.client.aclose()
+
+    state = asyncio.run(scenario())
+    intent = state.intents[0]
+    get_requests = [request for request in requests if request.method == "GET"]
+    post_requests = [request for request in requests if request.method == "POST"]
+
+    assert intent.status is expected_status
+    assert intent.attempts == expected_attempts
+    assert intent.error is not None
+    assert intent.error.category is ApiErrorCategory.INVALID_RESPONSE
+    assert intent.error.status_code == status_code
+    assert len(operation_keys) == expected_attempts
+    assert operation_keys == [intent.idempotency_key] * expected_attempts
+    assert len(get_requests) == expected_attempts
+    assert len(post_requests) == expected_attempts
+    assert len(requests) == expected_attempts * 2
+    assert {
+        request.headers["idempotency-key"] for request in post_requests
+    } == {intent.idempotency_key}
+
+
 def test_prepared_checkpoint_is_observable_before_operation_http(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

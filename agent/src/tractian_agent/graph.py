@@ -579,6 +579,12 @@ def _status_for_first_error(error: ApiError) -> IntentStatus:
     return IntentStatus.FAILED
 
 
+def _is_ambiguous_operation_error(error: ApiError) -> bool:
+    if error.status_code is not None and 400 <= error.status_code < 500:
+        return False
+    return error.category in _AMBIGUOUS_ERROR_CATEGORIES
+
+
 def _terminal_from_operation(
     state: AgentState,
     intent: WriteIntent,
@@ -652,7 +658,7 @@ def _terminal_from_non_idempotent_operation(
     else:
         status = (
             IntentStatus.UNCERTAIN
-            if result.category in _AMBIGUOUS_ERROR_CATEGORIES
+            if _is_ambiguous_operation_error(result)
             else IntentStatus.FAILED
         )
         terminal_intent = _updated_intent(
@@ -813,7 +819,7 @@ async def _execute_action(
     )
     first_was_ambiguous = (
         isinstance(first, ApiError)
-        and first.category in _AMBIGUOUS_ERROR_CATEGORIES
+        and _is_ambiguous_operation_error(first)
     )
     if not first_was_ambiguous:
         terminal = _terminal_from_operation(
