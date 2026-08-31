@@ -454,6 +454,21 @@ class AgentState(FrozenStateModel):
     final_result: FinalResult | None = None
     review: ReviewRecord | None = None
 
+    @field_validator("pending_proposal", mode="before")
+    @classmethod
+    def _restore_legacy_reprocess_proposal(cls, value: object) -> object:
+        """Adiciona o discriminador somente ao shape inequívoco anterior."""
+        if isinstance(value, Mapping) and set(value) == {
+            "analysis_id",
+            "justification",
+        }:
+            return {
+                "action": "reprocess_analysis",
+                "analysis_id": value["analysis_id"],
+                "justification": value["justification"],
+            }
+        return value
+
     @model_validator(mode="after")
     def _validate_scope_and_budget(self) -> AgentState:
         expected_scope = (

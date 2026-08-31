@@ -2,10 +2,15 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from langgraph.checkpoint.base import LATEST_VERSION
 from pydantic import BaseModel
 
 import tractian_agent.checkpoint as checkpoint_module
 from tractian_agent.checkpoint import create_checkpoint_serializer, open_checkpointer
+from tractian_agent.contracts import Identity, SupportRequest
+from tractian_agent.state import AgentState, ThreadScope
+from tractian_agent.tools.runtime import TrustedIdentity
+from tractian_agent.write_policy import ReprocessProposal
 
 
 class _ArbitraryModel(BaseModel):
@@ -88,3 +93,85 @@ def test_checkpoint_namespace_has_only_one_active_local_owner(tmp_path: Path):
             )
 
     asyncio.run(scenario())
+
+
+def test_sqlite_checkpoint_reopens_the_legacy_pending_reprocess_shape(
+    tmp_path: Path,
+):
+    checkpoint_path = tmp_path / "legacy-pending-proposal.sqlite3"
+    state = AgentState(
+        request=SupportRequest(
+            case_id="case_tkt_inv_04",
+            ticket_id="TKT-INV-04",
+            asset_id="asset_G501",
+            message="Reprocesse a análise após a troca do rolamento.",
+            identity=Identity(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+            ),
+        ),
+        identity=TrustedIdentity(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+        ),
+        permissions=frozenset({"read", "action_low"}),
+        request_id="req_legacy_01",
+        thread_id="thread_case_tkt_inv_04",
+        execution_id="exec_legacy_01",
+        thread_scope=ThreadScope(
+            thread_id="thread_case_tkt_inv_04",
+            case_id="case_tkt_inv_04",
+            company_id="comp_mineracao_andes",
+            user_id="usr_pedro",
+        ),
+        step_limit=3,
+        pending_proposal=ReprocessProposal(
+            analysis_id="an_9906",
+            justification="Rolamento substituído; solicitar novo processamento.",
+        ),
+    )
+    legacy_payload = state.model_dump(mode="json")
+    del legacy_payload["pending_proposal"]["action"]
+    assert legacy_payload["pending_proposal"] == {
+        "analysis_id": "an_9906",
+        "justification": "Rolamento substituído; solicitar novo processamento.",
+    }
+    config = {
+        "configurable": {
+            "thread_id": state.thread_id,
+            "checkpoint_ns": "",
+        }
+    }
+    checkpoint = {
+        "v": LATEST_VERSION,
+        "id": "00000000-0000-6000-8000-000000000001",
+        "ts": "2026-08-30T12:00:00+00:00",
+        "channel_values": {"agent_state": legacy_payload},
+        "channel_versions": {"agent_state": "legacy-v1"},
+        "versions_seen": {},
+        "pending_sends": [],
+        "updated_channels": ["agent_state"],
+    }
+
+    async def scenario():
+        async with open_checkpointer(checkpoint_path) as saver:
+            await saver.aput(
+                config,
+                checkpoint,
+                {"source": "update", "step": 0, "parents": {}},
+                {"agent_state": "legacy-v1"},
+            )
+
+        async with open_checkpointer(checkpoint_path) as reopened_saver:
+            restored_checkpoint = await reopened_saver.aget(config)
+        return restored_checkpoint
+
+    restored_checkpoint = asyncio.run(scenario())
+    assert restored_checkpoint is not None
+
+    restored = AgentState.model_validate(
+        restored_checkpoint["channel_values"]["agent_state"]
+    )
+
+    assert restored.pending_proposal == state.pending_proposal
+    assert restored.pending_proposal.action == "reprocess_analysis"

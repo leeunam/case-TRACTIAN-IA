@@ -244,6 +244,60 @@ def test_pending_proposal_restores_each_discriminated_variant(proposal):
     assert type(restored.pending_proposal) is type(proposal)
 
 
+def test_agent_state_restores_the_unambiguous_legacy_reprocess_proposal():
+    current = _state(
+        pending_proposal=ReprocessProposal(
+            analysis_id="an_9906",
+            justification="Há dados novos para reprocessar esta análise.",
+        )
+    )
+    legacy_payload = current.model_dump(mode="json")
+    del legacy_payload["pending_proposal"]["action"]
+
+    restored = AgentState.model_validate(legacy_payload)
+
+    assert restored.pending_proposal == current.pending_proposal
+    assert restored.pending_proposal.action == "reprocess_analysis"
+
+
+@pytest.mark.parametrize(
+    "unknown_proposal",
+    [
+        {"analysis_id": "an_9906"},
+        {"justification": "Há dados novos para reprocessar esta análise."},
+        {
+            "analysis_id": "an_9906",
+            "justification": "Há dados novos para reprocessar esta análise.",
+            "criticality": "high",
+        },
+        {
+            "analysis_id": "an_9906",
+            "justification": "Há dados novos para reprocessar esta análise.",
+            "expected_path": ["POST /analyses/an_9906/reprocess"],
+        },
+        {
+            "action": "unknown_action",
+            "analysis_id": "an_9906",
+            "justification": "Há dados novos para reprocessar esta análise.",
+        },
+        {
+            "action": "reprocess_analysis",
+            "analysis_id": "an_9906",
+            "justification": "Há dados novos para reprocessar esta análise.",
+            "expected_path": ["POST /analyses/an_9906/reprocess"],
+        },
+    ],
+)
+def test_agent_state_does_not_migrate_incomplete_ambiguous_or_unknown_proposals(
+    unknown_proposal,
+):
+    payload = _state().model_dump(mode="json")
+    payload["pending_proposal"] = unknown_proposal
+
+    with pytest.raises(ValidationError, match="pending_proposal"):
+        AgentState.model_validate(payload)
+
+
 def test_same_thread_accepts_new_request_and_execution_for_the_same_scope():
     continued = _state().continue_with(
         request=_request(),
