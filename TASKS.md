@@ -149,23 +149,25 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decidir:** matriz de permissões, formato da justificativa, quando pedir confirmação e quando expandir idempotência.
 
-**Decisões implementadas na primeira fatia:**
+**Decisões implementadas:**
 
-- A política inicial é uma função pura e cobre somente a proposta de reprocessar uma análise; ela não recebe cliente HTTP nem executa escrita.
-- Reprocesso exige `action_low`, justificativa com pelo menos 20 caracteres após remover espaços externos e aprovação confiável para a mesma ação e o mesmo `analysis_id`.
-- Aprovação ausente ou com alvo diferente produz `require_confirmation`; falta de permissão ou justificativa inválida produz `deny`; somente o escopo exato produz `allow`.
-- Decisões carregam códigos estáveis e a aprovação registra se veio do pedido original ou de confirmação posterior. Esse objeto pertence à fronteira confiável e nunca será argumento público do modelo.
-- Execução HTTP, persistência da chave idempotente e tratamento de retry permanecem para fatias posteriores.
+- As cinco proposal tools são união imutável por `action`, expõem schemas públicos fechados e retornam artifact com `effect_executed=false`; não recebem runtime, cliente nem fazem HTTP. Política, identidade, empresa, ativo, caso, modelo, aprovação e URLs permanecem na fronteira confiável.
+- A política determinística exige pedido explícito, permissão, justificativa válida e escopo integral (ação, alvo e parâmetros materiais; criticidade é material). Ausência ou divergência de aprovação pede confirmação; permissão ou justificativa inválida nega; somente `allow` pode preparar uma intenção.
+- Confirmação usa o escopo persistido e aprovação estruturada pela fronteira. O nó determinístico, em vez de texto livre ou da proposal tool, é o único ponto que recebe as cinco operações HTTP fixas após o checkpoint.
+- Reprocesso é a única ação suscetível a retry: recebe a chave persistida `tractian-agent:<uuid>`, com TTL de sete dias, e no máximo um retry com mesma chave e mesmo corpo. Especialista, criticidade, retreinamento e escalonamento não recebem chave, têm no máximo um despacho e jamais fazem retry automático.
+- Para as quatro ações não idempotentes, timeout, transporte, `5xx`, resposta inválida ou queda no despacho tornam o resultado `uncertain`; `4xx` torna-o `failed`. Retomada `prepared` por outro `execution_id` termina `uncertain/0` sem rede, em vez de repetir o efeito.
 
-**Evidência da primeira fatia:** os 6 testes focados da política, os 404 testes do agente e os 59 testes da API passaram; `make test` totalizou 463 testes, com apenas o aviso de depreciação já conhecido do `python_multipart`.
+**Evidência histórica da primeira fatia:** os 6 testes focados da política, os 404 testes do agente e os 59 testes da API passaram; `make test` totalizou 463 testes, com apenas o aviso de depreciação já conhecido do `python_multipart`.
 
-- [ ] Separar proposta de ação e execução efetiva.
-- [ ] Exigir pedido explícito, permissão, escopo claro e justificativa.
-- [ ] Pedir confirmação para ação inferida, ampliada ou ambígua.
-- [ ] Aplicar idempotência a cada nova ação suscetível a retry.
-- [ ] Testar permitido, proibido, ambíguo, repetido e conflitante.
+**Evidência final de aceite (30/08/2026):** a suíte focada de `test_write_policy.py`, `test_write_policy_matrix.py`, `test_write_proposal_contracts.py`, `test_write_proposal_tools.py`, `test_write_operations.py`, `test_write_contracts.py`, `test_checkpoint.py`, `test_graph_entrypoint.py`, `test_reprocess_flow.py` e `test_non_idempotent_flow.py` passou com **389 testes**. `uv lock --check` resolveu 47 pacotes. `make test` passou com **59 testes da API + 1.053 do agente = 1.112 testes**, e somente o `PendingDeprecationWarning` já conhecido de `python_multipart`. A revisão independente da Task 7 foi aprovada, sem achados Critical/Important; os casos cobrem permitido, negado, ambíguo, conflito de escopo, repetição/replay e retomada conservadora.
 
-**Aceite:** nenhuma escrita ocorre apenas porque o LLM a sugeriu.
+- [x] Separar proposta de ação e execução efetiva.
+- [x] Exigir pedido explícito, permissão, escopo claro e justificativa.
+- [x] Pedir confirmação para ação inferida, ampliada ou ambígua.
+- [x] Aplicar idempotência a cada nova ação suscetível a retry: somente reprocesso é retryable; as outras quatro ações não repetem e retomam conservadoramente.
+- [x] Testar permitido, proibido, ambíguo, repetido e conflitante.
+
+**Aceite verificado:** nenhuma escrita ocorre apenas porque o LLM a sugeriu.
 
 ## Fase 5 — estado LangGraph e SQLite
 
@@ -173,12 +175,22 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decidir:** schema do estado, política de retenção, relação entre `request_id`, `thread_id` e execução e primeira fronteira de entrada do agente (função, CLI ou endpoint HTTP).
 
-- [ ] Definir estado tipado com solicitação, identidade, mensagens, chamadas, evidências, decisão, passos, chaves idempotentes e revisão.
-- [ ] Montar um grafo mínimo sem LLM para provar as transições.
-- [ ] Configurar checkpointer SQLite.
-- [ ] Testar persistência e retomada após reinício.
+**Decisões implementadas:**
 
-**Aceite:** uma execução interrompida retoma sem perder evidências nem repetir uma ação confirmada.
+- `thread_id` identifica a linha persistida e pode receber novos `request_id`; toda invocação ou retomada usa novo `execution_id`. Caso, empresa, pessoa usuária ou alvo confiável divergentes falham fechados. O estado tipado mantém somente valores JSON-safe e observáveis, incluindo mensagens, chamadas, evidências, proposta, decisão, intenções, passos, resultado e revisão.
+- A fronteira é a função Python assíncrona `invoke_agent`, que exige runtime autenticado e `thread_id`. Runtime, cliente, credenciais, seed, golden set, resposta HTTP bruta e raciocínio não são checkpointados.
+- O desenvolvimento usa `AsyncSqliteSaver` em `.run/agent-checkpoints.sqlite3`, serializer restrito e ciclo de vida fechado. Não há expiração ou remoção automática de threads; `adelete_thread(thread_id)` é explícito. Isso é distinto do SQLite idempotente da API e do TTL de sete dias da chave de reprocesso. PostgreSQL continua futuro.
+- Criação e retomada que podem escrever usam `durability="sync"`; `prepare_intent` e `execute_action` ocupam supersteps distintos. `interrupt()` estruturado e `Command` pelo ID retomam uma confirmação sem efeito anterior.
+- O grafo é determinístico e sem LLM: leitura percorre `ingest → route → finish`, e escritas passam por política, confirmação quando aplicável, preparação persistida e execução. Locks por `thread_id` são locais ao processo/event loop; não há lease distribuído.
+
+**Evidência final de aceite (30/08/2026):** a suíte focada de estado, checkpoint, entrada, reprocesso e ações não idempotentes passou com **389 testes**; `uv lock --check` resolveu 47 pacotes; `make test` passou com **59 testes da API + 1.053 do agente = 1.112 testes**, mantendo somente o `PendingDeprecationWarning` conhecido. A Task 6 provou SQLite temporário real, fechamento/reabertura do saver, `prepared` antes do HTTP, replay de recibo e ausência de segundo efeito; a Task 7, revisada sem achados Critical/Important, provou que a retomada de uma ação não idempotente por novo `execution_id` não toca a rede.
+
+- [x] Definir estado tipado com solicitação, identidade, mensagens, chamadas, evidências, decisão, passos, chaves idempotentes e revisão.
+- [x] Montar um grafo mínimo sem LLM para provar as transições.
+- [x] Configurar checkpointer SQLite.
+- [x] Testar persistência e retomada após reinício.
+
+**Aceite verificado:** uma execução interrompida retoma seu estado persistido sem repetir uma ação confirmada; o grafo não implementa planner, writer, ledger completo, gate de liberação, Logfire nem avaliação.
 
 ## Fase 6 — provider e planner
 
@@ -420,8 +432,10 @@ parâmetros materiais; somente a criticidade é material nesta entrega. Ativo
 central, caso atual e modelo configurado ficam em `TrustedWriteContext`, fora
 dos schemas públicos. A ordem fechada é permissão, justificativa, presença de
 aprovação e igualdade integral do escopo. `AgentState.pending_proposal`
-persiste e restaura as cinco variantes, enquanto `WriteIntent` e
-`ReprocessIntentScope` continuam exclusivos do reprocesso.
+persiste e restaura as cinco variantes. Nesta fatia, `WriteIntent` e
+`ReprocessIntentScope` ainda cobriam somente reprocesso; a Task 7 generalizou
+`WriteIntent.scope` para uma união discriminada das cinco ações, preservando o
+wire e o nome de `ReprocessIntentScope`.
 
 As cinco tools LangChain retornam conteúdo de proposta e artifact próprio com
 `effect_executed=false`, sem runtime, cliente ou HTTP. O catálogo
@@ -481,6 +495,24 @@ também passou para o projeto do agente.
 
 **Objetivo:** fechar a dependência circular com o primeiro fluxo de escrita seguro e retomável.
 
+**Decisões implementadas:** o fluxo determinístico percorre `proposal → policy
+→ confirmation/deny → prepare_intent → checkpoint sync → execute_action`.
+Após `allow`, a chave `tractian-agent:<uuid>` nasce uma vez, é vinculada ao
+escopo e hash canônico e expira em sete dias; ela é checkpointada antes do
+HTTP. A confirmação interrompe sem efeito anterior e retorna por `Command`
+estruturado. Timeout, transporte, `5xx` e resposta inválida podem receber no
+máximo um retry com a mesma chave e corpo; `4xx`, conflito, `IN_PROGRESS`,
+`OUTCOME_UNKNOWN` e chave vencida não criam chave ou retry novo. `completed`
+é replay imutável, sem novo HTTP. A precisão de `attempts` pode subcontar um
+crash pós-efeito; o lock é local ao processo/event loop.
+
+**Evidência final:** a Task 6 foi aprovada após re-review independente. SQLite
+temporário real comprovou fechamento/reabertura após `prepared`, a mesma chave
+na retomada, perda de resposta após commit com um único efeito e replay do
+recibo, e falha de checkpoint antes do HTTP sem chamada. A evidência histórica
+mais recente da Task 6 foi 59 testes da API + 882 do agente = 941; a execução
+final da Task 8 atualizou a evidência integrada para 59 + 1.053 = 1.112.
+
 **Arquivos:** evoluir grafo, entrypoint e contratos; criar testes de integração de reprocesso com SQLite real temporário e transporte HTTP simulado.
 
 **Contrato e testes:**
@@ -496,6 +528,26 @@ também passou para o projeto do agente.
 ### Task 7 — integrar as quatro ações não idempotentes
 
 **Objetivo:** concluir o caminho agir/escalar sem prometer garantias que a API não oferece.
+
+**Decisões implementadas:** `WriteIntent.scope` é união discriminada por
+`action`: especialista guarda `analysis_id`, criticidade guarda `asset_id` e
+`criticality`, retreinamento guarda `model_id` e escalonamento usa o `case_id`.
+As quatro ações persistem `prepared_execution_id`, sem chave ou expiração. A
+primeira execução pode fazer um único dispatch tipado; com outro
+`execution_id`, o guard ocorre antes de policy, preflight ou rede e termina em
+`uncertain/0`. Na mesma execução, drift de runtime, escopo, hash ou autorização
+falha sem rede. Receipt aceito conclui; receipt rejeitado ou `4xx` falha;
+timeout, transporte, `5xx` ou resposta inválida ficam incertos, sem retry.
+Uma nova ação exige nova intenção e nova aprovação. Especialista tem preflight
+opaco; o runtime de restart precisa realmente gerar novo `execution_id`.
+
+**Evidência final:** a Task 7 foi aprovada na revisão independente, sem
+achados Critical/Important. Os testes com SQLite temporário real cobriram as
+quatro ações para policy, confirmação, escopo, reinício, falhas, replay e
+concorrência; a última execução da Task 7 foi 285 focados, 1.053 do agente e
+59 da API (1.112 no total). A suíte final integrada da Task 8 repetiu os 389
+testes focados relevantes, `uv lock --check` e `make test` com os mesmos totais
+globais.
 
 **Arquivos:** evoluir o grafo/entrypoint e testes de integração parametrizados.
 
