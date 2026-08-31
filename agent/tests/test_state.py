@@ -131,6 +131,27 @@ def _intent() -> WriteIntent:
     )
 
 
+def test_agent_state_requires_unique_intent_ids_and_one_active_per_request():
+    first_data = _intent().model_dump(mode="python")
+    first_data.update(
+        request_id="req_write_01",
+        status=IntentStatus.PROPOSED,
+        idempotency_key=None,
+        expires_at=None,
+        prepared_execution_id=None,
+    )
+    first = WriteIntent.model_validate(first_data)
+
+    with pytest.raises(ValidationError, match="IDs de intenção.*únicos"):
+        _state(intents=(first, first))
+
+    second_data = first.model_dump(mode="python")
+    second_data["intent_id"] = "intent_second"
+    second = WriteIntent.model_validate(second_data)
+    with pytest.raises(ValidationError, match="no máximo uma intenção ativa"):
+        _state(intents=(first, second))
+
+
 def test_agent_state_contains_the_complete_persistable_contract():
     proposal = ReprocessProposal(
         analysis_id="an_9906",

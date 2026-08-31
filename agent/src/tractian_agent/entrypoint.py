@@ -4,14 +4,26 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from langgraph.graph import START
+from langgraph.types import Command
 
 from tractian_agent.contracts import SupportRequest
-from tractian_agent.graph import MINIMAL_GRAPH_STEP_COUNT
+from tractian_agent.graph import MINIMAL_GRAPH_STEP_COUNT, REPROCESS_GRAPH_STEP_COUNT
 from tractian_agent.state import AgentState, ThreadScope
-from tractian_agent.tools.runtime import ReadToolRuntime
+from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
+from tractian_agent.write_contracts import (
+    ConfirmationReply,
+    IntentStatus,
+    WriteIntent,
+)
+from tractian_agent.write_policy import (
+    ApprovalSource,
+    ReprocessProposal,
+    TrustedActionApproval,
+    WriteProposal,
+)
 
 
 class AgentInvocationProtocolError(RuntimeError):
@@ -26,6 +38,7 @@ class GraphStateSnapshot(Protocol):
     values: Mapping[str, object]
     config: dict[str, object]
     next: tuple[str, ...]
+    interrupts: tuple[Any, ...]
 
 
 class AgentGraph(Protocol):
@@ -38,7 +51,7 @@ class AgentGraph(Protocol):
 
     async def ainvoke(
         self,
-        input: dict[str, object] | None,
+        input: object,
         config: dict[str, object],
         *,
         context: ReadToolRuntime,
@@ -58,7 +71,19 @@ _PENDING_PREDECESSORS = {
     "ingest": START,
     "route": "ingest",
     "finish": "route",
+    "write_policy": "ingest",
+    "confirmation_gate": "write_policy",
+    "prepare_intent": "confirmation_gate",
+    "execute_action": "prepare_intent",
 }
+
+_ACTIVE_INTENT_STATUSES = frozenset(
+    {
+        IntentStatus.PROPOSED,
+        IntentStatus.AWAITING_CONFIRMATION,
+        IntentStatus.PREPARED,
+    }
+)
 
 
 def _require_opaque_id(value: str, *, name: str) -> str:
@@ -90,6 +115,149 @@ def _pending_predecessor(next_nodes: tuple[str, ...]) -> str:
         ) from error
 
 
+def _replace_state(state: AgentState, **changes: object) -> AgentState:
+    data = state.model_dump(mode="python")
+    data.update(changes)
+    return AgentState.model_validate(data)
+
+
+def _required_step_count(state: AgentState) -> int:
+    return (
+        REPROCESS_GRAPH_STEP_COUNT
+        if state.pending_proposal is not None
+        else MINIMAL_GRAPH_STEP_COUNT
+    )
+
+
+def _current_request_intents(state: AgentState) -> tuple[WriteIntent, ...]:
+    return tuple(
+        intent for intent in state.intents if intent.request_id == state.request_id
+    )
+
+
+def _terminal_confirmation_replay(
+    state: AgentState,
+    confirmation: ConfirmationReply,
+) -> bool:
+    matches = _current_request_intents(state)
+    return (
+        len(matches) == 1
+        and matches[0].intent_id == confirmation.intent_id
+        and matches[0].status
+        not in _ACTIVE_INTENT_STATUSES
+    )
+
+
+def _validate_write_boundary(
+    *,
+    request: SupportRequest,
+    runtime: ReadToolRuntime,
+    proposal: WriteProposal | None,
+    confirmation: ConfirmationReply | None,
+    original_approval: TrustedActionApproval | None,
+) -> None:
+    write_requested = (
+        proposal is not None
+        or confirmation is not None
+        or original_approval is not None
+    )
+    if not write_requested:
+        return
+    if not isinstance(runtime, WriteToolRuntime):
+        raise AgentInvocationProtocolError(
+            "WRITE_RUNTIME_REQUIRED",
+            "o fluxo de escrita exige contexto confiável de escrita",
+        )
+    if proposal is not None and not isinstance(proposal, ReprocessProposal):
+        raise AgentInvocationProtocolError(
+            "UNSUPPORTED_WRITE_ACTION",
+            "esta entrega executa somente propostas de reprocesso",
+        )
+    if original_approval is not None and proposal is None:
+        raise AgentInvocationProtocolError(
+            "ORIGINAL_APPROVAL_WITHOUT_PROPOSAL",
+            "aprovação original exige proposta na mesma entrada",
+        )
+    if runtime.current_case_id != request.case_id:
+        raise AgentInvocationProtocolError(
+            "WRITE_CASE_SCOPE_MISMATCH",
+            "o caso atual do runtime diverge da solicitação",
+        )
+    if runtime.identity.model_dump() != request.identity.model_dump():
+        raise AgentInvocationProtocolError(
+            "WRITE_IDENTITY_SCOPE_MISMATCH",
+            "a identidade confiável diverge da solicitação",
+        )
+    if (
+        request.asset_id is not None
+        and runtime.central_asset_id != request.asset_id
+    ):
+        raise AgentInvocationProtocolError(
+            "WRITE_ASSET_SCOPE_MISMATCH",
+            "o ativo central do runtime diverge da solicitação",
+        )
+
+
+def _validate_legacy_intents_for_write(state: AgentState) -> None:
+    if any(
+        intent.request_id is None and intent.status in _ACTIVE_INTENT_STATUSES
+        for intent in state.intents
+    ):
+        raise AgentInvocationProtocolError(
+            "LEGACY_INTENT_REQUIRES_REVIEW",
+            "uma intenção legada ativa exige revisão antes de nova escrita",
+        )
+
+
+def _confirmation_command(
+    *,
+    snapshot: GraphStateSnapshot,
+    state: AgentState,
+    confirmation: ConfirmationReply,
+) -> Command:
+    if snapshot.next != ("confirmation_gate",):
+        raise AgentInvocationProtocolError(
+            "STALE_CONFIRMATION",
+            "a intenção não está aguardando esta confirmação",
+        )
+    if len(snapshot.interrupts) != 1:
+        raise AgentInvocationProtocolError(
+            "AMBIGUOUS_CONFIRMATION",
+            "o checkpoint deve possuir exatamente um interrupt",
+        )
+    matches = tuple(
+        intent
+        for intent in _current_request_intents(state)
+        if intent.status is IntentStatus.AWAITING_CONFIRMATION
+    )
+    if len(matches) != 1 or matches[0].intent_id != confirmation.intent_id:
+        raise AgentInvocationProtocolError(
+            "STALE_CONFIRMATION",
+            "a confirmação não corresponde à intenção pendente",
+        )
+    proposal = state.pending_proposal
+    if not isinstance(proposal, ReprocessProposal):
+        raise AgentInvocationProtocolError(
+            "INVALID_CONFIRMATION_SCOPE",
+            "a confirmação pendente não possui proposta de reprocesso",
+        )
+    approval = (
+        TrustedActionApproval(
+            action="reprocess_analysis",
+            target_id=proposal.analysis_id,
+            source=ApprovalSource.CONFIRMATION,
+        )
+        if confirmation.decision == "approve"
+        else None
+    )
+    continued = _replace_state(state, approval=approval)
+    interrupt_id = snapshot.interrupts[0].id
+    return Command(
+        resume={interrupt_id: confirmation.model_dump(mode="json")},
+        update=continued.model_dump(mode="json"),
+    )
+
+
 async def invoke_agent(
     graph: AgentGraph,
     *,
@@ -98,7 +266,10 @@ async def invoke_agent(
     thread_id: str,
     request_id: str,
     execution_id: str,
-    step_limit: int = 3,
+    step_limit: int | None = None,
+    proposal: WriteProposal | None = None,
+    original_approval: TrustedActionApproval | None = None,
+    confirmation: ConfirmationReply | None = None,
 ) -> AgentState:
     """Cria ou continua estado confiável e executa com checkpoint síncrono."""
     if not isinstance(runtime, ReadToolRuntime):
@@ -106,6 +277,20 @@ async def invoke_agent(
     thread_id = _require_opaque_id(thread_id, name="thread_id")
     request_id = _require_opaque_id(request_id, name="request_id")
     execution_id = _require_opaque_id(execution_id, name="execution_id")
+    _validate_write_boundary(
+        request=request,
+        runtime=runtime,
+        proposal=proposal,
+        confirmation=confirmation,
+        original_approval=original_approval,
+    )
+    resolved_step_limit = step_limit
+    if resolved_step_limit is None:
+        resolved_step_limit = (
+            REPROCESS_GRAPH_STEP_COUNT
+            if proposal is not None or confirmation is not None
+            else MINIMAL_GRAPH_STEP_COUNT
+        )
     config: dict[str, object] = {"configurable": {"thread_id": thread_id}}
 
     async with graph.thread_lock(thread_id):
@@ -114,13 +299,35 @@ async def invoke_agent(
         if persisted_values:
             persisted = AgentState.model_validate(persisted_values)
             new_request = request_id != persisted.request_id
+            write_flow = (
+                proposal is not None
+                or confirmation is not None
+                or original_approval is not None
+                or (
+                    not new_request
+                    and persisted.pending_proposal is not None
+                )
+            )
+            if write_flow:
+                _validate_write_boundary(
+                    request=request,
+                    runtime=runtime,
+                    proposal=(
+                        proposal
+                        if proposal is not None
+                        else persisted.pending_proposal
+                    ),
+                    confirmation=confirmation,
+                    original_approval=None,
+                )
+                _validate_legacy_intents_for_write(persisted)
             state = persisted.continue_with(
                 request=request,
                 identity=runtime.identity,
                 permissions=runtime.permissions,
                 request_id=request_id,
                 execution_id=execution_id,
-                step_limit=step_limit,
+                step_limit=resolved_step_limit,
             )
             if not new_request and persisted.final_result is not None:
                 if snapshot.next:
@@ -128,8 +335,50 @@ async def invoke_agent(
                         "TERMINAL_WITH_PENDING_WORK",
                         "checkpoint terminal ainda possui trabalho pendente",
                     )
+                if confirmation is not None and not _terminal_confirmation_replay(
+                    persisted,
+                    confirmation,
+                ):
+                    raise AgentInvocationProtocolError(
+                        "STALE_CONFIRMATION",
+                        "a confirmação não corresponde ao resultado terminal",
+                    )
                 return persisted
             if new_request:
+                if confirmation is not None:
+                    raise AgentInvocationProtocolError(
+                        "STALE_CONFIRMATION",
+                        "confirmação não pode iniciar uma nova solicitação",
+                    )
+                if proposal is not None and any(
+                    intent.request_id == request_id
+                    for intent in persisted.intents
+                ):
+                    raise AgentInvocationProtocolError(
+                        "REQUEST_ID_ALREADY_USED",
+                        "request_id de escrita já pertence ao histórico do thread",
+                    )
+                if any(
+                    intent.status in _ACTIVE_INTENT_STATUSES
+                    for intent in persisted.intents
+                ):
+                    raise AgentInvocationProtocolError(
+                        "ACTIVE_INTENT_BLOCKS_NEW_REQUEST",
+                        "uma intenção não terminal bloqueia nova solicitação",
+                    )
+                state = _replace_state(
+                    state,
+                    pending_proposal=proposal,
+                    approval=original_approval,
+                )
+                if (
+                    state.pending_proposal is not None
+                    and state.step_limit < _required_step_count(state)
+                ):
+                    raise AgentInvocationProtocolError(
+                        "STEP_LIMIT_EXHAUSTED",
+                        "o orçamento não comporta o fluxo solicitado",
+                    )
                 config = await graph.aupdate_state(
                     snapshot.config,
                     state.model_dump(mode="json"),
@@ -137,19 +386,58 @@ async def invoke_agent(
                 )
                 invocation_input = None
             else:
-                predecessor = _pending_predecessor(snapshot.next)
-                if state.step_limit < MINIMAL_GRAPH_STEP_COUNT:
+                if proposal is not None and proposal != persisted.pending_proposal:
+                    raise AgentInvocationProtocolError(
+                        "PROPOSAL_DRIFT",
+                        "a proposta diverge da solicitação persistida",
+                    )
+                if (
+                    original_approval is not None
+                    and original_approval != persisted.approval
+                ):
+                    raise AgentInvocationProtocolError(
+                        "ORIGINAL_APPROVAL_DRIFT",
+                        "a aprovação original diverge da solicitação persistida",
+                    )
+                if state.step_limit < _required_step_count(state):
                     raise AgentInvocationProtocolError(
                         "STEP_LIMIT_EXHAUSTED",
                         "checkpoint parcial esgotou o orçamento de passos",
                     )
-                config = await graph.aupdate_state(
-                    snapshot.config,
-                    state.model_dump(mode="json"),
-                    as_node=predecessor,
-                )
-                invocation_input = None
+                if confirmation is not None:
+                    invocation_input = _confirmation_command(
+                        snapshot=snapshot,
+                        state=state,
+                        confirmation=confirmation,
+                    )
+                    config = snapshot.config
+                else:
+                    if snapshot.interrupts:
+                        raise AgentInvocationProtocolError(
+                            "CONFIRMATION_REQUIRED",
+                            "o fluxo aguarda uma confirmação estruturada",
+                        )
+                    predecessor = _pending_predecessor(snapshot.next)
+                    config = await graph.aupdate_state(
+                        snapshot.config,
+                        state.model_dump(mode="json"),
+                        as_node=predecessor,
+                    )
+                    invocation_input = None
         else:
+            if confirmation is not None:
+                raise AgentInvocationProtocolError(
+                    "STALE_CONFIRMATION",
+                    "não existe intenção persistida para confirmar",
+                )
+            if (
+                proposal is not None
+                and resolved_step_limit < REPROCESS_GRAPH_STEP_COUNT
+            ):
+                raise AgentInvocationProtocolError(
+                    "STEP_LIMIT_EXHAUSTED",
+                    "o orçamento não comporta o fluxo solicitado",
+                )
             state = AgentState(
                 request=request,
                 identity=runtime.identity,
@@ -163,16 +451,22 @@ async def invoke_agent(
                     company_id=runtime.identity.company_id,
                     user_id=runtime.identity.user_id,
                 ),
-                step_limit=step_limit,
+                step_limit=resolved_step_limit,
+                pending_proposal=proposal,
+                approval=original_approval,
             )
             invocation_input = state.model_dump(mode="json")
 
-        result = await graph.ainvoke(
+        await graph.ainvoke(
             invocation_input,
             config,
             context=runtime,
             durability="sync",
         )
-    if not isinstance(result, Mapping):
-        raise TypeError("o grafo devolveu estado inválido")
-    return AgentState.model_validate(result)
+        final_snapshot = await graph.aget_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        if not final_snapshot.values:
+            raise TypeError("o grafo não persistiu estado após a execução")
+        final_state = AgentState.model_validate(final_snapshot.values)
+    return final_state

@@ -35,6 +35,15 @@ class IntentStatus(str, Enum):
     UNCERTAIN = "uncertain"
 
 
+class ConfirmationReply(StrictModel):
+    """Resposta pública mínima para um interrupt de confirmação."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    intent_id: str = Field(min_length=1, pattern=r"^\S+$")
+    decision: Literal["approve", "deny"]
+
+
 class ReprocessIntentScope(StrictModel):
     """Escopo fechado da única ação suportada nesta fatia."""
 
@@ -90,6 +99,11 @@ class WriteIntent(StrictModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     intent_id: str = Field(min_length=1, pattern=r"^\S+$")
+    request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        pattern=r"^\S+$",
+    )
     scope: ReprocessIntentScope
     payload_hash: CanonicalHash
     decision: WritePolicyResult
@@ -101,7 +115,7 @@ class WriteIntent(StrictModel):
         min_length=1,
         pattern=r"^\S+$",
     )
-    attempts: int = Field(default=0, ge=0)
+    attempts: int = Field(default=0, ge=0, le=2)
     receipt: PersistedActionReceipt | None = None
     error: PersistedApiError | None = None
 
@@ -123,6 +137,7 @@ class WriteIntent(StrictModel):
             PolicyDecision.DENY: {
                 PolicyReason.MISSING_PERMISSION,
                 PolicyReason.INVALID_JUSTIFICATION,
+                PolicyReason.CONFIRMATION_REJECTED,
             },
         }
         if self.decision.reason not in valid_reasons[self.decision.decision]:
@@ -166,11 +181,48 @@ class WriteIntent(StrictModel):
                 raise ValueError("status prepared não aceita tentativa ou resultado")
             return self
 
-        if self.attempts < 1:
-            raise ValueError("status terminal exige ao menos uma tentativa")
         if self.status is IntentStatus.COMPLETED:
-            if self.receipt is None or self.error is not None:
-                raise ValueError("status completed exige somente recibo")
-        elif self.error is None or self.receipt is not None:
-            raise ValueError("status failed/uncertain exige somente erro")
+            if self.attempts < 1:
+                raise ValueError("status terminal exige ao menos uma tentativa")
+            if (
+                self.receipt is None
+                or not self.receipt.accepted
+                or self.error is not None
+            ):
+                raise ValueError("status completed exige somente recibo aceito")
+            return self
+
+        if self.receipt is not None:
+            if (
+                self.status is not IntentStatus.FAILED
+                or self.receipt.accepted
+                or self.error is not None
+                or self.attempts < 1
+            ):
+                raise ValueError(
+                    "status failed é o único que aceita recibo rejeitado"
+                )
+            return self
+
+        if self.error is None:
+            raise ValueError("status failed/uncertain exige erro ou recibo rejeitado")
+        if self.attempts == 0:
+            expected_codes = {
+                IntentStatus.FAILED: {
+                    "IDEMPOTENCY_KEY_EXPIRED",
+                    "IDEMPOTENCY_KEY_INTENT_MISMATCH",
+                    "PAYLOAD_HASH_MISMATCH",
+                    "INTENT_SCOPE_MISMATCH",
+                },
+                IntentStatus.UNCERTAIN: {
+                    "IDEMPOTENCY_KEY_EXPIRED_OUTCOME_UNKNOWN"
+                },
+            }[self.status]
+            if (
+                self.error.code not in expected_codes
+                or self.error.category is not ApiErrorCategory.API
+            ):
+                raise ValueError(
+                    "zero tentativa só aceita falha local pré-despacho"
+                )
         return self

@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from tractian_agent.contracts import ActionReceipt, ApiError, ApiErrorCategory
 from tractian_agent.write_contracts import (
+    ConfirmationReply,
     IntentStatus,
     PersistedActionReceipt,
     PersistedApiError,
@@ -70,6 +71,49 @@ def _intent(**changes: object) -> WriteIntent:
     return WriteIntent(**data)
 
 
+def test_write_intent_request_id_is_optional_only_for_legacy_wire():
+    legacy = _intent()
+    current = _intent(request_id="req_reprocess_01")
+
+    assert legacy.request_id is None
+    assert current.request_id == "req_reprocess_01"
+    assert WriteIntent.model_validate_json(current.model_dump_json()) == current
+
+    with pytest.raises(ValidationError):
+        _intent(request_id="req with spaces")
+
+
+def test_confirmation_reply_contains_only_intent_reference_and_decision():
+    reply = ConfirmationReply(
+        intent_id="intent_018f3a",
+        decision="approve",
+    )
+
+    assert reply.model_dump(mode="json") == {
+        "intent_id": "intent_018f3a",
+        "decision": "approve",
+    }
+    assert reply.model_config["frozen"] is True
+    with pytest.raises(ValidationError):
+        ConfirmationReply(
+            intent_id="intent_018f3a",
+            decision="approve",
+            analysis_id="an_9906",
+        )
+
+
+@pytest.mark.parametrize(
+    ("intent_id", "decision"),
+    [
+        ("intent with spaces", "approve"),
+        ("intent_018f3a", "approved"),
+    ],
+)
+def test_confirmation_reply_rejects_invalid_public_wire(intent_id, decision):
+    with pytest.raises(ValidationError):
+        ConfirmationReply(intent_id=intent_id, decision=decision)
+
+
 def test_write_intent_records_the_complete_persistable_contract():
     intent = _intent()
 
@@ -131,6 +175,64 @@ def test_write_intent_accepts_typed_receipt_or_typed_error():
 
     assert completed.receipt.action_id == "act_1234abcd"
     assert failed.error.code == "NOT_FOUND"
+
+
+def test_rejected_receipt_is_a_failed_terminal_result_without_error():
+    failed = _intent(
+        request_id="req_reprocess_01",
+        status=IntentStatus.FAILED,
+        attempts=1,
+        receipt=ActionReceipt(
+            accepted=False,
+            action_id="act_rejected_01",
+            message="Reprocesso recusado pela plataforma.",
+        ),
+    )
+
+    assert failed.receipt is not None
+    assert failed.receipt.accepted is False
+    assert failed.error is None
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (IntentStatus.FAILED, "IDEMPOTENCY_KEY_EXPIRED"),
+        (
+            IntentStatus.UNCERTAIN,
+            "IDEMPOTENCY_KEY_EXPIRED_OUTCOME_UNKNOWN",
+        ),
+    ],
+)
+def test_expired_pre_dispatch_intent_allows_zero_observed_attempts(status, code):
+    intent = _intent(
+        request_id="req_reprocess_01",
+        status=status,
+        attempts=0,
+        error=ApiError(
+            category=ApiErrorCategory.API,
+            code=code,
+            message="A chave idempotente persistida expirou.",
+        ),
+    )
+
+    assert intent.attempts == 0
+    assert intent.error is not None
+    assert intent.error.code == code
+
+
+def test_zero_attempt_terminal_state_is_closed_to_other_errors():
+    with pytest.raises(ValidationError, match="zero tentativa"):
+        _intent(
+            request_id="req_reprocess_01",
+            status=IntentStatus.UNCERTAIN,
+            attempts=0,
+            error=ApiError(
+                category=ApiErrorCategory.TRANSPORT,
+                code="CONNECTION_LOST",
+                message="Conexão encerrada sem resposta.",
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -201,6 +303,7 @@ _VALID_REASONS = {
     PolicyDecision.DENY: {
         PolicyReason.MISSING_PERMISSION,
         PolicyReason.INVALID_JUSTIFICATION,
+        PolicyReason.CONFIRMATION_REJECTED,
     },
 }
 
@@ -327,6 +430,7 @@ def test_write_intent_rejects_inconsistent_status_fields(changes):
         {"payload_hash": "a" * 64},
         {"payload_hash": "sha256:v1:not-hex"},
         {"attempts": -1},
+        {"attempts": 3},
     ],
 )
 def test_write_intent_rejects_invalid_hash_or_attempt_count(changes):

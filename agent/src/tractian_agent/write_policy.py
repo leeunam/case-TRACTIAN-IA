@@ -39,6 +39,7 @@ class PolicyReason(str, Enum):
     EXPLICIT_APPROVAL_REQUIRED = "explicit_approval_required"
     APPROVAL_SCOPE_MISMATCH = "approval_scope_mismatch"
     INVALID_JUSTIFICATION = "invalid_justification"
+    CONFIRMATION_REJECTED = "confirmation_rejected"
 
 
 class ReprocessProposal(StrictModel):

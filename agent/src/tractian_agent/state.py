@@ -22,7 +22,7 @@ from pydantic import (
 from tractian_agent.contracts import ResponseMode, StrictModel, SupportRequest, ToolCall
 from tractian_agent.tools.observations import ToolArtifact
 from tractian_agent.tools.runtime import Permission, TrustedIdentity
-from tractian_agent.write_contracts import PersistedApiError, WriteIntent
+from tractian_agent.write_contracts import IntentStatus, PersistedApiError, WriteIntent
 from tractian_agent.write_policy import TrustedActionApproval, WriteProposal
 
 
@@ -505,6 +505,22 @@ class AgentState(FrozenStateModel):
             for intent in self.intents
         ):
             raise ValueError("intenção persistida fora do escopo do thread")
+        intent_ids = tuple(intent.intent_id for intent in self.intents)
+        if len(intent_ids) != len(set(intent_ids)):
+            raise ValueError("IDs de intenção devem ser únicos no estado")
+        active_statuses = {
+            IntentStatus.PROPOSED,
+            IntentStatus.AWAITING_CONFIRMATION,
+            IntentStatus.PREPARED,
+        }
+        active_request_ids = [
+            intent.request_id
+            for intent in self.intents
+            if intent.request_id is not None
+            and intent.status in active_statuses
+        ]
+        if len(active_request_ids) != len(set(active_request_ids)):
+            raise ValueError("cada request_id aceita no máximo uma intenção ativa")
         if self.step_count > self.step_limit:
             raise ValueError("contador de passos excede o orçamento")
         return self
