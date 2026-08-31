@@ -15,8 +15,14 @@ from tractian_agent.contracts import (
     IdempotencyKey,
     StrictModel,
 )
-from tractian_agent.tools.identifiers import AnalysisId
-from tractian_agent.write_policy import PolicyDecision, PolicyReason, WritePolicyResult
+from tractian_agent.tools.identifiers import AnalysisId, AssetId, ModelId
+from tractian_agent.write_policy import (
+    AssetCriticality,
+    PolicyDecision,
+    PolicyReason,
+    WriteMaterialParameters,
+    WritePolicyResult,
+)
 
 
 CanonicalHash = Annotated[
@@ -45,7 +51,7 @@ class ConfirmationReply(StrictModel):
 
 
 class ReprocessIntentScope(StrictModel):
-    """Escopo fechado da única ação suportada nesta fatia."""
+    """Escopo persistido do reprocessamento idempotente."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -55,6 +61,93 @@ class ReprocessIntentScope(StrictModel):
     user_id: str = Field(min_length=1, pattern=r"^\S+$")
     analysis_id: AnalysisId
     justification: str = Field(min_length=1, pattern=r"\S")
+
+
+class RequestSpecialistAnalysisIntentScope(StrictModel):
+    """Escopo persistido da solicitação de análise especializada."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action: Literal["request_specialist_analysis"]
+    case_id: str = Field(min_length=1, pattern=r"^\S+$")
+    company_id: str = Field(min_length=1, pattern=r"^\S+$")
+    user_id: str = Field(min_length=1, pattern=r"^\S+$")
+    analysis_id: AnalysisId
+    justification: str = Field(min_length=1, pattern=r"\S")
+
+
+class UpdateAssetCriticalityIntentScope(StrictModel):
+    """Escopo persistido da atualização de criticidade do ativo central."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action: Literal["update_asset_criticality"]
+    case_id: str = Field(min_length=1, pattern=r"^\S+$")
+    company_id: str = Field(min_length=1, pattern=r"^\S+$")
+    user_id: str = Field(min_length=1, pattern=r"^\S+$")
+    asset_id: AssetId
+    criticality: AssetCriticality
+    justification: str = Field(min_length=1, pattern=r"\S")
+
+
+class RequestModelRetrainingIntentScope(StrictModel):
+    """Escopo persistido da solicitação de retreinamento do modelo atual."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action: Literal["request_model_retraining"]
+    case_id: str = Field(min_length=1, pattern=r"^\S+$")
+    company_id: str = Field(min_length=1, pattern=r"^\S+$")
+    user_id: str = Field(min_length=1, pattern=r"^\S+$")
+    model_id: ModelId
+    justification: str = Field(min_length=1, pattern=r"\S")
+
+
+class EscalateCaseIntentScope(StrictModel):
+    """Escopo persistido do escalonamento do caso atual."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action: Literal["escalate_case"]
+    case_id: str = Field(min_length=1, pattern=r"^\S+$")
+    company_id: str = Field(min_length=1, pattern=r"^\S+$")
+    user_id: str = Field(min_length=1, pattern=r"^\S+$")
+    justification: str = Field(min_length=1, pattern=r"\S")
+
+
+WriteIntentScope = Annotated[
+    ReprocessIntentScope
+    | RequestSpecialistAnalysisIntentScope
+    | UpdateAssetCriticalityIntentScope
+    | RequestModelRetrainingIntentScope
+    | EscalateCaseIntentScope,
+    Field(discriminator="action"),
+]
+
+
+def intent_scope_target_id(scope: WriteIntentScope) -> str:
+    """Projeta o alvo já persistido sem consultar um runtime novo."""
+
+    if isinstance(
+        scope,
+        (ReprocessIntentScope, RequestSpecialistAnalysisIntentScope),
+    ):
+        return scope.analysis_id
+    if isinstance(scope, UpdateAssetCriticalityIntentScope):
+        return scope.asset_id
+    if isinstance(scope, RequestModelRetrainingIntentScope):
+        return scope.model_id
+    return scope.case_id
+
+
+def intent_scope_material_parameters(
+    scope: WriteIntentScope,
+) -> WriteMaterialParameters:
+    """Reconstrói somente parâmetros materiais já mostrados e persistidos."""
+
+    if isinstance(scope, UpdateAssetCriticalityIntentScope):
+        return WriteMaterialParameters(criticality=scope.criticality)
+    return WriteMaterialParameters()
 
 
 class PersistedActionReceipt(StrictModel):
@@ -104,7 +197,7 @@ class WriteIntent(StrictModel):
         min_length=1,
         pattern=r"^\S+$",
     )
-    scope: ReprocessIntentScope
+    scope: WriteIntentScope
     payload_hash: CanonicalHash
     decision: WritePolicyResult
     status: IntentStatus
@@ -155,6 +248,10 @@ class WriteIntent(StrictModel):
         if self.decision.decision is not expected_decision:
             raise ValueError("decisão incompatível com o status da intenção")
 
+        is_reprocess = isinstance(self.scope, ReprocessIntentScope)
+        if not is_reprocess and self.attempts > 1:
+            raise ValueError("ação não idempotente aceita no máximo uma tentativa")
+
         prepared_fields = (
             self.idempotency_key,
             self.expires_at,
@@ -174,8 +271,17 @@ class WriteIntent(StrictModel):
                 raise ValueError("status anterior ao preparo contém dados de despacho")
             return self
 
-        if any(value is None for value in prepared_fields):
-            raise ValueError("intenção preparada exige chave, expiração e execução")
+        if self.prepared_execution_id is None:
+            raise ValueError("intenção preparada exige execução")
+        if is_reprocess:
+            if self.idempotency_key is None or self.expires_at is None:
+                raise ValueError(
+                    "intenção de reprocesso preparada exige chave e expiração"
+                )
+        elif self.idempotency_key is not None or self.expires_at is not None:
+            raise ValueError(
+                "intenção não idempotente preparada proíbe chave e expiração"
+            )
         if self.status is IntentStatus.PREPARED:
             if self.attempts != 0 or self.receipt is not None or self.error is not None:
                 raise ValueError("status prepared não aceita tentativa ou resultado")
@@ -207,19 +313,31 @@ class WriteIntent(StrictModel):
         if self.error is None:
             raise ValueError("status failed/uncertain exige erro ou recibo rejeitado")
         if self.attempts == 0:
-            expected_codes = {
-                IntentStatus.FAILED: {
-                    "AUTHORIZATION_CHANGED_BEFORE_DISPATCH",
-                    "IDEMPOTENCY_KEY_EXPIRED",
-                    "IDEMPOTENCY_KEY_INTENT_MISMATCH",
-                    "PAYLOAD_HASH_MISMATCH",
-                    "INTENT_SCOPE_MISMATCH",
-                },
-                IntentStatus.UNCERTAIN: {
-                    "AUTHORIZATION_CHANGED_OUTCOME_UNKNOWN",
-                    "IDEMPOTENCY_KEY_EXPIRED_OUTCOME_UNKNOWN"
-                },
-            }[self.status]
+            if is_reprocess:
+                expected_codes = {
+                    IntentStatus.FAILED: {
+                        "AUTHORIZATION_CHANGED_BEFORE_DISPATCH",
+                        "IDEMPOTENCY_KEY_EXPIRED",
+                        "IDEMPOTENCY_KEY_INTENT_MISMATCH",
+                        "PAYLOAD_HASH_MISMATCH",
+                        "INTENT_SCOPE_MISMATCH",
+                    },
+                    IntentStatus.UNCERTAIN: {
+                        "AUTHORIZATION_CHANGED_OUTCOME_UNKNOWN",
+                        "IDEMPOTENCY_KEY_EXPIRED_OUTCOME_UNKNOWN",
+                    },
+                }[self.status]
+            else:
+                expected_codes = {
+                    IntentStatus.FAILED: {
+                        "AUTHORIZATION_CHANGED_BEFORE_DISPATCH",
+                        "PAYLOAD_HASH_MISMATCH",
+                        "INTENT_SCOPE_MISMATCH",
+                    },
+                    IntentStatus.UNCERTAIN: {
+                        "NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME",
+                    },
+                }[self.status]
             if (
                 self.error.code not in expected_codes
                 or self.error.category is not ApiErrorCategory.API

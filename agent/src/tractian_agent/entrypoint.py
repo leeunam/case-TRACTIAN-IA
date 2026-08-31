@@ -17,11 +17,12 @@ from tractian_agent.write_contracts import (
     ConfirmationReply,
     IntentStatus,
     WriteIntent,
+    intent_scope_material_parameters,
+    intent_scope_target_id,
 )
 from tractian_agent.write_policy import (
     ApprovalSource,
     PolicyReason,
-    ReprocessProposal,
     TrustedActionApproval,
     WriteProposal,
 )
@@ -149,12 +150,13 @@ def _terminal_confirmation_replay(
         return False
     intent = matches[0]
     if confirmation.decision == "approve":
-        return (
-            state.approval is not None
-            and state.approval.source is ApprovalSource.CONFIRMATION
-            and state.approval.action == "reprocess_analysis"
-            and state.approval.target_id == intent.scope.analysis_id
+        expected_approval = TrustedActionApproval(
+            action=intent.scope.action,
+            target_id=intent_scope_target_id(intent.scope),
+            material_parameters=intent_scope_material_parameters(intent.scope),
+            source=ApprovalSource.CONFIRMATION,
         )
+        return state.approval == expected_approval
     return (
         intent.status is IntentStatus.DENIED
         and intent.decision.reason is PolicyReason.CONFIRMATION_REJECTED
@@ -199,11 +201,6 @@ def _validate_write_boundary(
         raise AgentInvocationProtocolError(
             "WRITE_RUNTIME_REQUIRED",
             "o fluxo de escrita exige contexto confiável de escrita",
-        )
-    if proposal is not None and not isinstance(proposal, ReprocessProposal):
-        raise AgentInvocationProtocolError(
-            "UNSUPPORTED_WRITE_ACTION",
-            "esta entrega executa somente propostas de reprocesso",
         )
     if original_approval is not None and proposal is None:
         raise AgentInvocationProtocolError(
@@ -275,16 +272,12 @@ def _confirmation_command(
             "STALE_CONFIRMATION",
             "a confirmação não corresponde à intenção pendente",
         )
-    proposal = state.pending_proposal
-    if not isinstance(proposal, ReprocessProposal):
-        raise AgentInvocationProtocolError(
-            "INVALID_CONFIRMATION_SCOPE",
-            "a confirmação pendente não possui proposta de reprocesso",
-        )
+    intent = matches[0]
     approval = (
         TrustedActionApproval(
-            action="reprocess_analysis",
-            target_id=proposal.analysis_id,
+            action=intent.scope.action,
+            target_id=intent_scope_target_id(intent.scope),
+            material_parameters=intent_scope_material_parameters(intent.scope),
             source=ApprovalSource.CONFIRMATION,
         )
         if confirmation.decision == "approve"

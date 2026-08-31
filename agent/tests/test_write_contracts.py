@@ -7,10 +7,14 @@ from pydantic import ValidationError
 from tractian_agent.contracts import ActionReceipt, ApiError, ApiErrorCategory
 from tractian_agent.write_contracts import (
     ConfirmationReply,
+    EscalateCaseIntentScope,
     IntentStatus,
     PersistedActionReceipt,
     PersistedApiError,
     ReprocessIntentScope,
+    RequestModelRetrainingIntentScope,
+    RequestSpecialistAnalysisIntentScope,
+    UpdateAssetCriticalityIntentScope,
     WriteIntent,
 )
 from tractian_agent.write_policy import (
@@ -511,3 +515,201 @@ def test_reprocess_proposal_adds_only_the_internal_discriminator():
         "permissions",
         "idempotency_key",
     } & set(proposal_fields)
+
+
+_NON_IDEMPOTENT_SCOPE_CASES = (
+    (
+        RequestSpecialistAnalysisIntentScope,
+        {
+            "action": "request_specialist_analysis",
+            "case_id": "case_tkt_exe_12",
+            "company_id": "comp_forja_br",
+            "user_id": "usr_ana",
+            "analysis_id": "an_9901",
+            "justification": "Solicitar análise especializada com contexto suficiente.",
+        },
+    ),
+    (
+        UpdateAssetCriticalityIntentScope,
+        {
+            "action": "update_asset_criticality",
+            "case_id": "case_tkt_exe_12",
+            "company_id": "comp_forja_br",
+            "user_id": "usr_ana",
+            "asset_id": "asset_M101",
+            "criticality": "critical",
+            "justification": "Atualizar criticidade após avaliação operacional completa.",
+        },
+    ),
+    (
+        RequestModelRetrainingIntentScope,
+        {
+            "action": "request_model_retraining",
+            "case_id": "case_tkt_exe_12",
+            "company_id": "comp_forja_br",
+            "user_id": "usr_ana",
+            "model_id": "mdl_vib_v3",
+            "justification": "Solicitar retreinamento após evidência sistemática suficiente.",
+        },
+    ),
+    (
+        EscalateCaseIntentScope,
+        {
+            "action": "escalate_case",
+            "case_id": "case_tkt_exe_12",
+            "company_id": "comp_forja_br",
+            "user_id": "usr_ana",
+            "justification": "Escalar o caso por ultrapassar o atendimento remoto seguro.",
+        },
+    ),
+)
+
+
+@pytest.mark.parametrize(("scope_type", "scope_data"), _NON_IDEMPOTENT_SCOPE_CASES)
+def test_non_idempotent_scope_round_trips_frozen_and_extra_forbid(
+    scope_type,
+    scope_data,
+):
+    scope = scope_type(**scope_data)
+    intent = _intent(
+        request_id="req_non_idempotent_01",
+        scope=scope,
+        idempotency_key=None,
+        expires_at=None,
+    )
+
+    restored = WriteIntent.model_validate_json(intent.model_dump_json())
+
+    assert type(restored.scope) is scope_type
+    assert restored.scope.model_dump(mode="json") == scope_data
+    assert restored.idempotency_key is None
+    assert restored.expires_at is None
+    with pytest.raises(ValidationError):
+        scope.justification = "mutação proibida"
+    with pytest.raises(ValidationError):
+        scope_type(**scope_data, client="industrial-api-client")
+
+
+@pytest.mark.parametrize(("scope_type", "scope_data"), _NON_IDEMPOTENT_SCOPE_CASES)
+def test_non_idempotent_prepared_requires_execution_and_forbids_key_or_expiry(
+    scope_type,
+    scope_data,
+):
+    scope = scope_type(**scope_data)
+
+    assert _intent(
+        scope=scope,
+        idempotency_key=None,
+        expires_at=None,
+    ).prepared_execution_id == "exec_02"
+    with pytest.raises(ValidationError, match="execução"):
+        _intent(
+            scope=scope,
+            idempotency_key=None,
+            expires_at=None,
+            prepared_execution_id=None,
+        )
+    with pytest.raises(ValidationError, match="chave|expiração"):
+        _intent(scope=scope, expires_at=None)
+    with pytest.raises(ValidationError, match="chave|expiração"):
+        _intent(scope=scope, idempotency_key=None)
+
+
+@pytest.mark.parametrize(("scope_type", "scope_data"), _NON_IDEMPOTENT_SCOPE_CASES)
+def test_non_idempotent_intent_rejects_second_attempt(
+    scope_type,
+    scope_data,
+):
+    with pytest.raises(ValidationError, match="uma tentativa"):
+        _intent(
+            scope=scope_type(**scope_data),
+            status=IntentStatus.COMPLETED,
+            idempotency_key=None,
+            expires_at=None,
+            attempts=2,
+            receipt=ActionReceipt(
+                accepted=True,
+                action_id="act_non_idempotent_01",
+                message="Ação aceita.",
+            ),
+        )
+
+
+@pytest.mark.parametrize(("scope_type", "scope_data"), _NON_IDEMPOTENT_SCOPE_CASES)
+def test_non_idempotent_resume_unknown_allows_only_the_stable_zero_attempt_code(
+    scope_type,
+    scope_data,
+):
+    scope = scope_type(**scope_data)
+    unknown = _intent(
+        scope=scope,
+        status=IntentStatus.UNCERTAIN,
+        idempotency_key=None,
+        expires_at=None,
+        attempts=0,
+        error=ApiError(
+            category=ApiErrorCategory.API,
+            code="NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME",
+            message="O despacho anterior pode ter ocorrido.",
+        ),
+    )
+
+    assert unknown.status is IntentStatus.UNCERTAIN
+    assert unknown.attempts == 0
+    with pytest.raises(ValidationError, match="zero tentativa"):
+        _intent(
+            scope=scope,
+            status=IntentStatus.UNCERTAIN,
+            idempotency_key=None,
+            expires_at=None,
+            attempts=0,
+            error=ApiError(
+                category=ApiErrorCategory.API,
+                code="AUTHORIZATION_CHANGED_OUTCOME_UNKNOWN",
+                message="Código exclusivo do reprocesso.",
+            ),
+        )
+
+
+def test_non_idempotent_resume_code_is_rejected_for_reprocess_scope():
+    with pytest.raises(ValidationError, match="zero tentativa"):
+        _intent(
+            status=IntentStatus.UNCERTAIN,
+            attempts=0,
+            error=ApiError(
+                category=ApiErrorCategory.API,
+                code="NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME",
+                message="Código incompatível com reprocesso idempotente.",
+            ),
+        )
+
+
+def test_task_6_reprocess_wire_still_reopens_without_backfill():
+    wire = {
+        "intent_id": "intent_task_6_fixture",
+        "request_id": "req_task_6_fixture",
+        "scope": {
+            "action": "reprocess_analysis",
+            "case_id": "case_tkt_exe_12",
+            "company_id": "comp_forja_br",
+            "user_id": "usr_ana",
+            "analysis_id": "an_9901",
+            "justification": (
+                "O rolamento foi trocado e a análise precisa ser refeita."
+            ),
+        },
+        "payload_hash": "sha256:v1:" + "b" * 64,
+        "decision": {"decision": "allow", "reason": "authorized"},
+        "status": "prepared",
+        "idempotency_key": "tractian-agent:intent_task_6_fixture",
+        "expires_at": "2026-09-06T12:30:00Z",
+        "prepared_execution_id": "exec_task_6_fixture",
+        "attempts": 0,
+        "receipt": None,
+        "error": None,
+    }
+
+    restored = WriteIntent.model_validate(wire)
+
+    assert type(restored.scope) is ReprocessIntentScope
+    assert restored.model_dump(mode="json")["scope"] == wire["scope"]

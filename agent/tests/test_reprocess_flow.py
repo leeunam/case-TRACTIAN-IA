@@ -1025,38 +1025,44 @@ def test_policy_deny_without_interrupt_is_never_confirmation_replay(
     assert requests == []
 
 
-def test_other_write_action_fails_closed_before_checkpoint_or_http(tmp_path: Path):
+def test_other_write_action_uses_shared_policy_and_denies_without_permission(
+    tmp_path: Path,
+):
     requests: list[httpx.Request] = []
 
     async def scenario():
-        runtime = _runtime(lambda request: requests.append(request))
+        runtime = _runtime(
+            lambda request: requests.append(request),
+            permissions=frozenset({"read"}),
+        )
         try:
             async with open_checkpointer(tmp_path / "checkpoints.sqlite3") as saver:
                 graph = build_agent_graph(saver)
-                with pytest.raises(AgentInvocationProtocolError) as error:
-                    await invoke_agent(
-                        graph,
-                        request=_request(),
-                        runtime=runtime,
-                        thread_id="thread_unsupported_write",
-                        request_id="req_unsupported_write",
-                        execution_id="exec_unsupported_write",
-                        proposal=RequestSpecialistAnalysisProposal(
-                            analysis_id="an_9901",
-                            justification=JUSTIFICATION,
-                        ),
-                    )
-                snapshot = await graph.aget_state(
-                    {"configurable": {"thread_id": "thread_unsupported_write"}}
+                state = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_specialist_denied",
+                    request_id="req_specialist_denied",
+                    execution_id="exec_specialist_denied",
+                    proposal=RequestSpecialistAnalysisProposal(
+                        analysis_id="an_9901",
+                        justification=JUSTIFICATION,
+                    ),
                 )
-                return error.value, snapshot
+                snapshot = await graph.aget_state(
+                    {"configurable": {"thread_id": "thread_specialist_denied"}}
+                )
+                return state, snapshot
         finally:
             await runtime.client.aclose()
 
-    error, snapshot = asyncio.run(scenario())
+    state, snapshot = asyncio.run(scenario())
 
-    assert error.code == "UNSUPPORTED_WRITE_ACTION"
-    assert snapshot.values == {}
+    assert state.step_count == 2
+    assert state.intents[0].status is IntentStatus.DENIED
+    assert state.intents[0].decision.reason is PolicyReason.MISSING_PERMISSION
+    assert snapshot.next == ()
     assert requests == []
 
 
