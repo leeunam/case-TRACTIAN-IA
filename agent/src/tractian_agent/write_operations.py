@@ -69,9 +69,11 @@ async def _preflight_analysis_scope(
     analysis_id: str,
     runtime: WriteToolRuntime,
 ) -> ApiError | None:
+    if "read" not in runtime.permissions:
+        return _unconfirmed_analysis_scope()
     try:
         result = await execute_get_analysis(analysis_id, runtime)
-    except (AnalysisScopeValidationError, PermissionError):
+    except AnalysisScopeValidationError:
         return _unconfirmed_analysis_scope()
     if result.error is not None:
         return result.error

@@ -677,6 +677,36 @@ def test_unexpected_value_error_from_client_propagates_without_write():
     assert all(request.method not in {"POST", "PATCH"} for request in requests)
 
 
+def test_unexpected_permission_error_from_client_propagates_without_write():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise PermissionError("unexpected transport permission defect")
+
+    runtime = _runtime(handler)
+    proposal = RequestSpecialistAnalysisProposal(
+        analysis_id="an_9901",
+        justification="Os dados conflitantes exigem uma análise especializada.",
+    )
+
+    with pytest.raises(
+        PermissionError,
+        match="unexpected transport permission defect",
+    ):
+        asyncio.run(
+            _execute_and_close(
+                execute_request_specialist_analysis(proposal, runtime),
+                runtime,
+            )
+        )
+
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/analyses/an_9901")
+    ]
+    assert all(request.method not in {"POST", "PATCH"} for request in requests)
+
+
 @pytest.mark.parametrize(
     ("operation_name", "failure", "expected_error", "expected_requests"),
     [
