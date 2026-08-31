@@ -13,7 +13,10 @@ from tractian_agent.contracts import (
     IdempotencyKey,
     StrictModel,
 )
-from tractian_agent.tools.analyses import execute_get_analysis
+from tractian_agent.tools.analyses import (
+    AnalysisScopeValidationError,
+    execute_get_analysis,
+)
 from tractian_agent.tools.runtime import WriteToolRuntime
 from tractian_agent.write_policy import (
     AssetCriticality,
@@ -68,7 +71,7 @@ async def _preflight_analysis_scope(
 ) -> ApiError | None:
     try:
         result = await execute_get_analysis(analysis_id, runtime)
-    except (PermissionError, ValueError):
+    except (AnalysisScopeValidationError, PermissionError):
         return _unconfirmed_analysis_scope()
     if result.error is not None:
         return result.error

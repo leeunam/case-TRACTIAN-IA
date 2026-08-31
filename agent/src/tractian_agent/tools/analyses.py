@@ -47,6 +47,10 @@ _SEVERITY = TypeAdapter(AnalysisSeverity)
 _DEGRADED_LIST_FLAGS = frozenset({"conflict", "inconclusive"})
 
 
+class AnalysisScopeValidationError(ValueError):
+    """Falha esperada ao validar o vínculo da análise ao escopo confiável."""
+
+
 def _validate_asset_id(value: object) -> AssetId:
     return _ASSET_ID.validate_python(value, strict=True)
 
@@ -215,7 +219,9 @@ def _assert_list_scope(asset_id: AssetId, runtime: ReadToolRuntime) -> None:
 
 def _assert_analysis_asset(asset_id: AssetId, runtime: ReadToolRuntime) -> None:
     if asset_id != runtime.central_asset_id:
-        raise ValueError("A API retornou um ativo fora do escopo.")
+        raise AnalysisScopeValidationError(
+            "A API retornou um ativo fora do escopo."
+        )
 
 
 def _normalize_analysis(analysis: _AnalysisWire) -> AnalysisArtifact:
@@ -298,7 +304,10 @@ def _detail_common(analysis_id: str, path: str) -> dict[str, object]:
 
 
 def _assert_degraded_scope(data: JsonValue, *, runtime: ReadToolRuntime) -> None:
-    assert_safe_partial_json(data)
+    try:
+        assert_safe_partial_json(data)
+    except ValueError as exc:
+        raise AnalysisScopeValidationError(str(exc)) from exc
     pending: list[JsonValue] = [data]
     while pending:
         current = pending.pop()
@@ -306,7 +315,9 @@ def _assert_degraded_scope(data: JsonValue, *, runtime: ReadToolRuntime) -> None
             if "asset_id" in current:
                 asset_id = current["asset_id"]
                 if asset_id is None or asset_id != runtime.central_asset_id:
-                    raise ValueError("A resposta degradada contém um ativo fora do escopo.")
+                    raise AnalysisScopeValidationError(
+                        "A resposta degradada contém um ativo fora do escopo."
+                    )
             pending.extend(current.values())
         elif isinstance(current, list):
             pending.extend(current)
@@ -321,13 +332,19 @@ def _assert_degraded_detail_id(data: JsonValue, requested_analysis_id: str) -> N
             continue
         analysis_id = data[key]
         if analysis_id is None:
-            raise ValueError("A resposta degradada contém um identificador nulo.")
+            raise AnalysisScopeValidationError(
+                "A resposta degradada contém um identificador nulo."
+            )
         try:
             validated_id = _validate_analysis_id(analysis_id)
         except ValidationError as exc:
-            raise ValueError("A resposta degradada contém um identificador inválido.") from exc
+            raise AnalysisScopeValidationError(
+                "A resposta degradada contém um identificador inválido."
+            ) from exc
         if validated_id != requested_analysis_id:
-            raise ValueError("A resposta degradada contém um identificador diferente do solicitado.")
+            raise AnalysisScopeValidationError(
+                "A resposta degradada contém um identificador diferente do solicitado."
+            )
 
 
 def _validate_degraded_summary_item(item: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
@@ -587,7 +604,9 @@ async def execute_get_analysis(
     if not isinstance(analysis, _AnalysisWire):
         raise TypeError("A resposta completa da análise não foi validada.")
     if analysis.id != analysis_id:
-        raise ValueError("A API retornou um identificador de análise diferente do solicitado.")
+        raise AnalysisScopeValidationError(
+            "A API retornou um identificador de análise diferente do solicitado."
+        )
     _assert_analysis_asset(analysis.asset_id, runtime)
     normalized = _normalize_analysis(analysis)
     return GetAnalysisResult(

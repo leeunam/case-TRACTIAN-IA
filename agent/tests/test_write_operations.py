@@ -61,6 +61,9 @@ def _analysis_payload(
 def _runtime(
     handler: Any,
     *,
+    permissions: frozenset[str] = frozenset(
+        {"read", "action_low", "action_high", "escalate"}
+    ),
     central_asset_id: str = "asset_M101",
     current_case_id: str = "case_tkt_exe_12",
     configured_model_id: str = "mdl_vib_v3",
@@ -68,7 +71,7 @@ def _runtime(
     return WriteToolRuntime.create(
         user_id="usr_ana",
         company_id="comp_forja_br",
-        permissions=frozenset({"read", "action_low", "action_high", "escalate"}),
+        permissions=permissions,
         central_asset_id=central_asset_id,
         current_case_id=current_case_id,
         configured_model_id=configured_model_id,
@@ -478,11 +481,58 @@ def test_degraded_analysis_never_authorizes_a_write(mode: str):
     ]
 
 
+def test_invalid_degraded_analysis_scope_returns_stable_error_without_write():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "mode": "partial",
+                "notes": "A análise não está completa.",
+                "data": {"id": "an_other", "asset_id": "asset_M101"},
+            },
+        )
+
+    runtime = _runtime(handler)
+    proposal = RequestSpecialistAnalysisProposal(
+        analysis_id="an_9901",
+        justification="Os dados conflitantes exigem uma análise especializada.",
+    )
+
+    result = asyncio.run(
+        _execute_and_close(
+            execute_request_specialist_analysis(proposal, runtime),
+            runtime,
+        )
+    )
+
+    assert result == ApiError(
+        category=ApiErrorCategory.INVALID_RESPONSE,
+        code="ANALYSIS_SCOPE_UNCONFIRMED",
+        message="Não foi possível confirmar que a análise pertence ao ativo central.",
+    )
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/analyses/an_9901")
+    ]
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_error"),
     [
         (
             _analysis_payload(asset_id="asset_other"),
+            ApiError(
+                category=ApiErrorCategory.INVALID_RESPONSE,
+                code="ANALYSIS_SCOPE_UNCONFIRMED",
+                message=(
+                    "Não foi possível confirmar que a análise pertence ao ativo central."
+                ),
+            ),
+        ),
+        (
+            _analysis_payload(analysis_id="an_other"),
             ApiError(
                 category=ApiErrorCategory.INVALID_RESPONSE,
                 code="ANALYSIS_SCOPE_UNCONFIRMED",
@@ -570,6 +620,61 @@ def test_preflight_preserves_the_api_error_and_never_posts():
     assert [(request.method, request.url.path) for request in requests] == [
         ("GET", "/analyses/an_9901")
     ]
+
+
+def test_missing_read_permission_returns_stable_error_before_http():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    runtime = _runtime(handler, permissions=frozenset({"action_low"}))
+    proposal = RequestSpecialistAnalysisProposal(
+        analysis_id="an_9901",
+        justification="Os dados conflitantes exigem uma análise especializada.",
+    )
+
+    result = asyncio.run(
+        _execute_and_close(
+            execute_request_specialist_analysis(proposal, runtime),
+            runtime,
+        )
+    )
+
+    assert result == ApiError(
+        category=ApiErrorCategory.INVALID_RESPONSE,
+        code="ANALYSIS_SCOPE_UNCONFIRMED",
+        message="Não foi possível confirmar que a análise pertence ao ativo central.",
+    )
+    assert requests == []
+
+
+def test_unexpected_value_error_from_client_propagates_without_write():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise ValueError("unexpected client/transport defect")
+
+    runtime = _runtime(handler)
+    proposal = RequestSpecialistAnalysisProposal(
+        analysis_id="an_9901",
+        justification="Os dados conflitantes exigem uma análise especializada.",
+    )
+
+    with pytest.raises(ValueError, match="unexpected client/transport defect"):
+        asyncio.run(
+            _execute_and_close(
+                execute_request_specialist_analysis(proposal, runtime),
+                runtime,
+            )
+        )
+
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/analyses/an_9901")
+    ]
+    assert all(request.method not in {"POST", "PATCH"} for request in requests)
 
 
 @pytest.mark.parametrize(
