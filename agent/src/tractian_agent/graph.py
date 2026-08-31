@@ -398,6 +398,37 @@ def _failed_before_dispatch(
     )
 
 
+def _authorization_changed_before_dispatch(
+    state: AgentState,
+    intent: WriteIntent,
+) -> dict[str, object]:
+    same_execution = intent.prepared_execution_id == state.execution_id
+    terminal = _updated_intent(
+        intent,
+        status=(
+            IntentStatus.FAILED
+            if same_execution
+            else IntentStatus.UNCERTAIN
+        ),
+        attempts=0,
+        error=_local_intent_error(
+            (
+                "AUTHORIZATION_CHANGED_BEFORE_DISPATCH"
+                if same_execution
+                else "AUTHORIZATION_CHANGED_OUTCOME_UNKNOWN"
+            ),
+            "A autorização atual não permite a intenção preparada.",
+        ),
+    )
+    return _checkpoint_update(
+        _terminal_result(
+            _replace_intent(state, terminal),
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            message="A autorização mudou antes do reprocesso.",
+        )
+    )
+
+
 def _status_for_first_error(error: ApiError) -> IntentStatus:
     if error.code in _UNCERTAIN_IDEMPOTENCY_CODES:
         return IntentStatus.UNCERTAIN
@@ -537,6 +568,14 @@ async def _execute_action(
                 message="A chave idempotente preparada expirou sem novo envio.",
             )
         )
+
+    current_policy = evaluate_reprocess_policy(
+        proposal,
+        permissions=advanced.permissions,
+        approval=advanced.approval,
+    )
+    if current_policy.decision is not PolicyDecision.ALLOW:
+        return _authorization_changed_before_dispatch(advanced, intent)
 
     first = await execute_reprocess_analysis(
         proposal,

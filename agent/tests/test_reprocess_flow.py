@@ -388,6 +388,49 @@ def test_write_boundary_fails_before_first_checkpoint(
     assert requests == []
 
 
+def test_original_approval_rejects_confirmation_source_before_checkpoint(
+    tmp_path: Path,
+):
+    requests: list[httpx.Request] = []
+
+    async def scenario():
+        runtime = _runtime(lambda request: requests.append(request))
+        try:
+            async with open_checkpointer(tmp_path / "checkpoints.sqlite3") as saver:
+                graph = build_agent_graph(saver)
+                with pytest.raises(AgentInvocationProtocolError) as error:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=runtime,
+                        thread_id="thread_invalid_original_source",
+                        request_id="req_invalid_original_source",
+                        execution_id="exec_invalid_original_source",
+                        proposal=_proposal(),
+                        original_approval=TrustedActionApproval(
+                            action="reprocess_analysis",
+                            target_id="an_9901",
+                            source=ApprovalSource.CONFIRMATION,
+                        ),
+                    )
+                snapshot = await graph.aget_state(
+                    {
+                        "configurable": {
+                            "thread_id": "thread_invalid_original_source"
+                        }
+                    }
+                )
+                return error.value, snapshot
+        finally:
+            await runtime.client.aclose()
+
+    error, snapshot = asyncio.run(scenario())
+
+    assert error.code == "INVALID_ORIGINAL_APPROVAL_SOURCE"
+    assert snapshot.values == {}
+    assert requests == []
+
+
 @pytest.mark.parametrize(
     ("drift", "expected_code"),
     [
@@ -658,6 +701,15 @@ def test_exact_terminal_confirmation_is_immutable_replay_and_stale_is_rejected(
         try:
             async with open_checkpointer(tmp_path / "checkpoints.sqlite3") as saver:
                 graph = build_agent_graph(saver)
+                waiting = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_terminal_confirmation",
+                    request_id="req_terminal_confirmation",
+                    execution_id="exec_terminal_waiting",
+                    proposal=_proposal(),
+                )
                 completed = await invoke_agent(
                     graph,
                     request=_request(),
@@ -665,8 +717,10 @@ def test_exact_terminal_confirmation_is_immutable_replay_and_stale_is_rejected(
                     thread_id="thread_terminal_confirmation",
                     request_id="req_terminal_confirmation",
                     execution_id="exec_terminal_original",
-                    proposal=_proposal(),
-                    original_approval=_approval(),
+                    confirmation=ConfirmationReply(
+                        intent_id=waiting.intents[0].intent_id,
+                        decision="approve",
+                    ),
                 )
                 original_invoke = graph.ainvoke
 
@@ -710,6 +764,265 @@ def test_exact_terminal_confirmation_is_immutable_replay_and_stale_is_rejected(
     assert replayed.execution_id == "exec_terminal_original"
     assert stale_error.code == "STALE_CONFIRMATION"
     assert len(requests) == 2
+
+
+@pytest.mark.parametrize("drift", ["proposal", "approval"])
+def test_terminal_replay_rejects_write_scope_drift_before_return(
+    tmp_path: Path,
+    drift: str,
+):
+    requests: list[httpx.Request] = []
+
+    async def scenario():
+        runtime = _runtime(_success_handler(requests))
+        try:
+            async with open_checkpointer(
+                tmp_path / f"checkpoints-{drift}.sqlite3"
+            ) as saver:
+                graph = build_agent_graph(saver)
+                completed = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=f"thread_terminal_drift_{drift}",
+                    request_id=f"req_terminal_drift_{drift}",
+                    execution_id="exec_terminal_drift_original",
+                    proposal=_proposal(),
+                    original_approval=_approval(),
+                )
+                config = {
+                    "configurable": {
+                        "thread_id": f"thread_terminal_drift_{drift}"
+                    }
+                }
+                before = await graph.aget_state(config)
+                replay_proposal = _proposal()
+                replay_approval = _approval()
+                if drift == "proposal":
+                    replay_proposal = ReprocessProposal(
+                        analysis_id="an_other",
+                        justification=JUSTIFICATION,
+                    )
+                else:
+                    replay_approval = TrustedActionApproval(
+                        action="reprocess_analysis",
+                        target_id="an_other",
+                        source=ApprovalSource.ORIGINAL_REQUEST,
+                    )
+                with pytest.raises(AgentInvocationProtocolError) as error:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=runtime,
+                        thread_id=f"thread_terminal_drift_{drift}",
+                        request_id=f"req_terminal_drift_{drift}",
+                        execution_id="exec_terminal_drift_replay",
+                        proposal=replay_proposal,
+                        original_approval=replay_approval,
+                    )
+                after = await graph.aget_state(config)
+                return completed, error.value, before, after
+        finally:
+            await runtime.client.aclose()
+
+    completed, error, before, after = asyncio.run(scenario())
+
+    assert completed.intents[0].status is IntentStatus.COMPLETED
+    assert error.code == (
+        "PROPOSAL_DRIFT" if drift == "proposal" else "ORIGINAL_APPROVAL_DRIFT"
+    )
+    assert before.config == after.config
+    assert before.values == after.values
+    assert len(requests) == 2
+
+
+def test_terminal_confirmation_replay_rejects_opposite_consumed_decision(
+    tmp_path: Path,
+):
+    requests: list[httpx.Request] = []
+
+    async def scenario():
+        runtime = _runtime(_success_handler(requests))
+        try:
+            async with open_checkpointer(tmp_path / "checkpoints.sqlite3") as saver:
+                graph = build_agent_graph(saver)
+                waiting = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_terminal_opposite",
+                    request_id="req_terminal_opposite",
+                    execution_id="exec_terminal_opposite_waiting",
+                    proposal=_proposal(),
+                )
+                completed = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_terminal_opposite",
+                    request_id="req_terminal_opposite",
+                    execution_id="exec_terminal_opposite_approved",
+                    confirmation=ConfirmationReply(
+                        intent_id=waiting.intents[0].intent_id,
+                        decision="approve",
+                    ),
+                )
+                config = {
+                    "configurable": {"thread_id": "thread_terminal_opposite"}
+                }
+                before = await graph.aget_state(config)
+                with pytest.raises(AgentInvocationProtocolError) as error:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=runtime,
+                        thread_id="thread_terminal_opposite",
+                        request_id="req_terminal_opposite",
+                        execution_id="exec_terminal_opposite_denied",
+                        confirmation=ConfirmationReply(
+                            intent_id=waiting.intents[0].intent_id,
+                            decision="deny",
+                        ),
+                    )
+                after = await graph.aget_state(config)
+                return completed, error.value, before, after
+        finally:
+            await runtime.client.aclose()
+
+    completed, error, before, after = asyncio.run(scenario())
+
+    assert completed.approval is not None
+    assert completed.approval.source is ApprovalSource.CONFIRMATION
+    assert error.code == "STALE_CONFIRMATION"
+    assert before.config == after.config
+    assert before.values == after.values
+    assert len(requests) == 2
+
+
+def test_terminal_human_deny_accepts_only_matching_deny_replay(tmp_path: Path):
+    requests: list[httpx.Request] = []
+
+    async def scenario():
+        runtime = _runtime(lambda request: requests.append(request))
+        try:
+            async with open_checkpointer(tmp_path / "checkpoints.sqlite3") as saver:
+                graph = build_agent_graph(saver)
+                waiting = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_human_deny_replay",
+                    request_id="req_human_deny_replay",
+                    execution_id="exec_human_deny_waiting",
+                    proposal=_proposal(),
+                )
+                denied = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_human_deny_replay",
+                    request_id="req_human_deny_replay",
+                    execution_id="exec_human_deny_original",
+                    confirmation=ConfirmationReply(
+                        intent_id=waiting.intents[0].intent_id,
+                        decision="deny",
+                    ),
+                )
+                replayed = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_human_deny_replay",
+                    request_id="req_human_deny_replay",
+                    execution_id="exec_human_deny_replay",
+                    confirmation=ConfirmationReply(
+                        intent_id=waiting.intents[0].intent_id,
+                        decision="deny",
+                    ),
+                )
+                with pytest.raises(AgentInvocationProtocolError) as error:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=runtime,
+                        thread_id="thread_human_deny_replay",
+                        request_id="req_human_deny_replay",
+                        execution_id="exec_human_deny_opposite",
+                        confirmation=ConfirmationReply(
+                            intent_id=waiting.intents[0].intent_id,
+                            decision="approve",
+                        ),
+                    )
+                return denied, replayed, error.value
+        finally:
+            await runtime.client.aclose()
+
+    denied, replayed, error = asyncio.run(scenario())
+
+    assert denied.intents[0].decision.reason is PolicyReason.CONFIRMATION_REJECTED
+    assert denied.approval is None
+    assert replayed == denied
+    assert error.code == "STALE_CONFIRMATION"
+    assert requests == []
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+def test_policy_deny_without_interrupt_is_never_confirmation_replay(
+    tmp_path: Path,
+    decision: str,
+):
+    requests: list[httpx.Request] = []
+
+    async def scenario():
+        runtime = _runtime(
+            lambda request: requests.append(request),
+            permissions=frozenset({"read"}),
+        )
+        try:
+            async with open_checkpointer(
+                tmp_path / f"checkpoints-{decision}.sqlite3"
+            ) as saver:
+                graph = build_agent_graph(saver)
+                denied = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=f"thread_policy_deny_replay_{decision}",
+                    request_id=f"req_policy_deny_replay_{decision}",
+                    execution_id="exec_policy_deny_original",
+                    proposal=_proposal(),
+                )
+                config = {
+                    "configurable": {
+                        "thread_id": f"thread_policy_deny_replay_{decision}"
+                    }
+                }
+                before = await graph.aget_state(config)
+                with pytest.raises(AgentInvocationProtocolError) as error:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=runtime,
+                        thread_id=f"thread_policy_deny_replay_{decision}",
+                        request_id=f"req_policy_deny_replay_{decision}",
+                        execution_id="exec_policy_deny_replay",
+                        confirmation=ConfirmationReply(
+                            intent_id=denied.intents[0].intent_id,
+                            decision=decision,
+                        ),
+                    )
+                after = await graph.aget_state(config)
+                return denied, error.value, before, after
+        finally:
+            await runtime.client.aclose()
+
+    denied, error, before, after = asyncio.run(scenario())
+
+    assert denied.intents[0].decision.reason is PolicyReason.MISSING_PERMISSION
+    assert error.code == "STALE_CONFIRMATION"
+    assert before.config == after.config
+    assert before.values == after.values
+    assert requests == []
 
 
 def test_other_write_action_fails_closed_before_checkpoint_or_http(tmp_path: Path):
@@ -1345,6 +1658,156 @@ def test_pre_dispatch_integrity_mismatch_fails_with_zero_http(
     assert failed.intents[0].error is not None
     assert failed.intents[0].error.code == expected_code
     assert failed.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+    assert requests == []
+
+
+@pytest.mark.parametrize("change", ["permission", "approval"])
+def test_same_execution_authorization_change_fails_before_operation(
+    change: str,
+):
+    requests: list[httpx.Request] = []
+    runtime = _runtime(lambda request: requests.append(request))
+    intent_id = "intent_authorization_same_execution"
+    intent = WriteIntent(
+        intent_id=intent_id,
+        request_id="req_authorization_same_execution",
+        scope=ReprocessIntentScope(
+            action="reprocess_analysis",
+            case_id="case_tkt_exe_12",
+            company_id="comp_forja_br",
+            user_id="usr_ana",
+            analysis_id="an_9901",
+            justification=JUSTIFICATION,
+        ),
+        payload_hash=_expected_payload_hash(),
+        decision=WritePolicyResult(
+            decision=PolicyDecision.ALLOW,
+            reason=PolicyReason.AUTHORIZED,
+        ),
+        status=IntentStatus.PREPARED,
+        idempotency_key=f"tractian-agent:{intent_id}",
+        expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+        prepared_execution_id="exec_authorization_same_execution",
+    )
+    state = AgentState(
+        request=_request(),
+        identity=runtime.identity,
+        permissions=(
+            frozenset({"read"})
+            if change == "permission"
+            else runtime.permissions
+        ),
+        request_id="req_authorization_same_execution",
+        thread_id="thread_authorization_same_execution",
+        execution_id="exec_authorization_same_execution",
+        thread_scope=ThreadScope(
+            thread_id="thread_authorization_same_execution",
+            case_id="case_tkt_exe_12",
+            company_id="comp_forja_br",
+            user_id="usr_ana",
+        ),
+        step_count=4,
+        step_limit=5,
+        pending_proposal=_proposal(),
+        approval=(None if change == "approval" else _approval()),
+        intents=(intent,),
+    )
+
+    async def scenario():
+        try:
+            result = await graph_module._execute_action(
+                state,
+                SimpleNamespace(context=runtime),
+            )
+            return AgentState.model_validate(result)
+        finally:
+            await runtime.client.aclose()
+
+    failed = asyncio.run(scenario())
+
+    assert failed.intents[0].status is IntentStatus.FAILED
+    assert failed.intents[0].attempts == 0
+    assert failed.intents[0].error is not None
+    assert failed.intents[0].error.code == "AUTHORIZATION_CHANGED_BEFORE_DISPATCH"
+    assert failed.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+    assert requests == []
+
+
+def test_restart_with_revoked_permission_is_uncertain_without_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    checkpoint_path = tmp_path / "checkpoints.sqlite3"
+    requests: list[httpx.Request] = []
+    original_execute = graph_module.execute_reprocess_analysis
+
+    async def crash_after_prepared(*args, **kwargs):
+        raise RuntimeError("queda depois do checkpoint prepared")
+
+    async def scenario():
+        initial_runtime = _runtime(lambda request: requests.append(request))
+        revoked_runtime = _runtime(
+            _success_handler(requests),
+            permissions=frozenset({"read"}),
+        )
+        try:
+            monkeypatch.setattr(
+                graph_module,
+                "execute_reprocess_analysis",
+                crash_after_prepared,
+            )
+            async with open_checkpointer(checkpoint_path) as saver:
+                graph = build_agent_graph(saver)
+                with pytest.raises(RuntimeError, match="checkpoint prepared"):
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=initial_runtime,
+                        thread_id="thread_revoked_after_restart",
+                        request_id="req_revoked_after_restart",
+                        execution_id="exec_revoked_before_restart",
+                        proposal=_proposal(),
+                        original_approval=_approval(),
+                    )
+                prepared = AgentState.model_validate(
+                    (
+                        await graph.aget_state(
+                            {
+                                "configurable": {
+                                    "thread_id": "thread_revoked_after_restart"
+                                }
+                            }
+                        )
+                    ).values
+                )
+
+            monkeypatch.setattr(
+                graph_module,
+                "execute_reprocess_analysis",
+                original_execute,
+            )
+            async with open_checkpointer(checkpoint_path) as saver:
+                uncertain = await invoke_agent(
+                    build_agent_graph(saver),
+                    request=_request(),
+                    runtime=revoked_runtime,
+                    thread_id="thread_revoked_after_restart",
+                    request_id="req_revoked_after_restart",
+                    execution_id="exec_revoked_after_restart",
+                )
+            return prepared, uncertain
+        finally:
+            await initial_runtime.client.aclose()
+            await revoked_runtime.client.aclose()
+
+    prepared, uncertain = asyncio.run(scenario())
+
+    assert prepared.intents[0].status is IntentStatus.PREPARED
+    assert uncertain.intents[0].status is IntentStatus.UNCERTAIN
+    assert uncertain.intents[0].attempts == 0
+    assert uncertain.intents[0].error is not None
+    assert uncertain.intents[0].error.code == "AUTHORIZATION_CHANGED_OUTCOME_UNKNOWN"
+    assert uncertain.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
     assert requests == []
 
 

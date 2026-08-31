@@ -209,12 +209,14 @@ class WriteIntent(StrictModel):
         if self.attempts == 0:
             expected_codes = {
                 IntentStatus.FAILED: {
+                    "AUTHORIZATION_CHANGED_BEFORE_DISPATCH",
                     "IDEMPOTENCY_KEY_EXPIRED",
                     "IDEMPOTENCY_KEY_INTENT_MISMATCH",
                     "PAYLOAD_HASH_MISMATCH",
                     "INTENT_SCOPE_MISMATCH",
                 },
                 IntentStatus.UNCERTAIN: {
+                    "AUTHORIZATION_CHANGED_OUTCOME_UNKNOWN",
                     "IDEMPOTENCY_KEY_EXPIRED_OUTCOME_UNKNOWN"
                 },
             }[self.status]

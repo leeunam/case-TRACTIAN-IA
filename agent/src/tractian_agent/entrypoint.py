@@ -20,6 +20,7 @@ from tractian_agent.write_contracts import (
 )
 from tractian_agent.write_policy import (
     ApprovalSource,
+    PolicyReason,
     ReprocessProposal,
     TrustedActionApproval,
     WriteProposal,
@@ -140,12 +141,43 @@ def _terminal_confirmation_replay(
     confirmation: ConfirmationReply,
 ) -> bool:
     matches = _current_request_intents(state)
+    if (
+        len(matches) != 1
+        or matches[0].intent_id != confirmation.intent_id
+        or matches[0].status in _ACTIVE_INTENT_STATUSES
+    ):
+        return False
+    intent = matches[0]
+    if confirmation.decision == "approve":
+        return (
+            state.approval is not None
+            and state.approval.source is ApprovalSource.CONFIRMATION
+            and state.approval.action == "reprocess_analysis"
+            and state.approval.target_id == intent.scope.analysis_id
+        )
     return (
-        len(matches) == 1
-        and matches[0].intent_id == confirmation.intent_id
-        and matches[0].status
-        not in _ACTIVE_INTENT_STATUSES
+        intent.status is IntentStatus.DENIED
+        and intent.decision.reason is PolicyReason.CONFIRMATION_REJECTED
+        and state.approval is None
     )
+
+
+def _validate_persisted_write_inputs(
+    state: AgentState,
+    *,
+    proposal: WriteProposal | None,
+    original_approval: TrustedActionApproval | None,
+) -> None:
+    if proposal is not None and proposal != state.pending_proposal:
+        raise AgentInvocationProtocolError(
+            "PROPOSAL_DRIFT",
+            "a proposta diverge da solicitação persistida",
+        )
+    if original_approval is not None and original_approval != state.approval:
+        raise AgentInvocationProtocolError(
+            "ORIGINAL_APPROVAL_DRIFT",
+            "a aprovação original diverge da solicitação persistida",
+        )
 
 
 def _validate_write_boundary(
@@ -177,6 +209,14 @@ def _validate_write_boundary(
         raise AgentInvocationProtocolError(
             "ORIGINAL_APPROVAL_WITHOUT_PROPOSAL",
             "aprovação original exige proposta na mesma entrada",
+        )
+    if (
+        original_approval is not None
+        and original_approval.source is not ApprovalSource.ORIGINAL_REQUEST
+    ):
+        raise AgentInvocationProtocolError(
+            "INVALID_ORIGINAL_APPROVAL_SOURCE",
+            "aprovação original exige proveniência da solicitação original",
         )
     if runtime.current_case_id != request.case_id:
         raise AgentInvocationProtocolError(
@@ -329,6 +369,12 @@ async def invoke_agent(
                 execution_id=execution_id,
                 step_limit=resolved_step_limit,
             )
+            if not new_request:
+                _validate_persisted_write_inputs(
+                    persisted,
+                    proposal=proposal,
+                    original_approval=original_approval,
+                )
             if not new_request and persisted.final_result is not None:
                 if snapshot.next:
                     raise AgentInvocationProtocolError(
@@ -386,19 +432,6 @@ async def invoke_agent(
                 )
                 invocation_input = None
             else:
-                if proposal is not None and proposal != persisted.pending_proposal:
-                    raise AgentInvocationProtocolError(
-                        "PROPOSAL_DRIFT",
-                        "a proposta diverge da solicitação persistida",
-                    )
-                if (
-                    original_approval is not None
-                    and original_approval != persisted.approval
-                ):
-                    raise AgentInvocationProtocolError(
-                        "ORIGINAL_APPROVAL_DRIFT",
-                        "a aprovação original diverge da solicitação persistida",
-                    )
                 if state.step_limit < _required_step_count(state):
                     raise AgentInvocationProtocolError(
                         "STEP_LIMIT_EXHAUSTED",
