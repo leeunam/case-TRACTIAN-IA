@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import Sequence
 import json
 from pathlib import Path
+import traceback
 from typing import Any
 
 from langgraph.checkpoint.base import LATEST_VERSION
@@ -33,6 +34,7 @@ from tractian_agent.state import (
     ThreadScope,
     ToolObservation,
 )
+from tractian_agent.tools.analyses import get_analysis
 from tractian_agent.tools.assets import get_asset
 from tractian_agent.tools.observations import ToolArtifact, ToolOutcome, ToolSource
 from tractian_agent.tools.runtime import TrustedIdentity
@@ -112,6 +114,52 @@ def test_planner_system_prompt_has_a_versioned_safe_role():
     assert "não invente evidência" in normalized_prompt
     assert "não executam efeito" in normalized_prompt
     assert "raciocínio interno" in normalized_prompt
+
+
+@pytest.mark.parametrize(
+    "offered_tools",
+    [
+        (get_asset, get_asset),
+        (
+            get_analysis.model_copy(update={"name": get_asset.name}),
+            get_asset,
+        ),
+    ],
+    ids=["same-object", "different-tools-and-schemas"],
+)
+def test_planner_rejects_duplicate_tool_names_before_calling_the_model(
+    offered_tools,
+):
+    assert offered_tools[0].name == offered_tools[1].name
+    if offered_tools[0] is not offered_tools[1]:
+        assert (
+            offered_tools[0].tool_call_schema.model_json_schema()
+            != offered_tools[1].tool_call_schema.model_json_schema()
+        )
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "asset_G501"},
+                    "id": "call_ambiguous_tool",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                offered_tools=offered_tools,
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.DUPLICATE_TOOL_NAME
+    assert model._events == []
 
 
 def test_planner_selects_one_offered_tool_without_executing_it():
@@ -367,6 +415,72 @@ def test_planner_fails_closed_for_invalid_terminal_output():
     error_text = str(exc_info.value)
     assert "texto livre descartado" not in error_text
     assert "não deve chegar ao cliente" not in error_text
+
+
+@pytest.mark.parametrize(
+    ("invalid_boundary", "expected_code"),
+    [
+        ("terminal", PlannerErrorCode.INVALID_TERMINAL_OUTPUT),
+        ("arguments", PlannerErrorCode.INVALID_TOOL_ARGUMENTS),
+    ],
+)
+def test_planner_protocol_errors_discard_sensitive_validation_failures(
+    invalid_boundary,
+    expected_code,
+):
+    sentinel = f"SENSITIVE_{invalid_boundary.upper()}_PAYLOAD"
+    if invalid_boundary == "terminal":
+        model = _RecordingPlannerModel(
+            selector_response=AIMessage(content="texto livre descartado"),
+            terminal_response={
+                "decision": "act",
+                "stop_reason": "sufficient_evidence",
+                "response": sentinel,
+            },
+        )
+    else:
+        model = _RecordingPlannerModel(
+            selector_response=AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_asset",
+                        "args": {"asset_id": sentinel},
+                        "id": "call_sensitive_invalid_arguments",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                offered_tools=(get_asset,),
+            )
+        )
+
+    error = exc_info.value
+    exception_chain: list[BaseException] = []
+    current: BaseException | None = error
+    while current is not None and current not in exception_chain:
+        exception_chain.append(current)
+        current = current.__cause__ or current.__context__
+    accessible_text = "\n".join(
+        (
+            *(str(item) for item in exception_chain),
+            *(repr(item) for item in exception_chain),
+            *(repr(item.args) for item in exception_chain),
+            "".join(traceback.format_exception(error)),
+        )
+    )
+
+    assert error.code is expected_code
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert exception_chain == [error]
+    assert sentinel not in accessible_text
 
 
 def test_planner_uses_only_persisted_next_turn_content_after_a_tool_call():

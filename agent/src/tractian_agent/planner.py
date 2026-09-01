@@ -67,6 +67,7 @@ class PlannerStopReason(str, Enum):
 class PlannerErrorCode(str, Enum):
     INVALID_SELECTION = "invalid_selection"
     INVALID_HISTORY = "invalid_history"
+    DUPLICATE_TOOL_NAME = "duplicate_tool_name"
     UNKNOWN_TOOL = "unknown_tool"
     MULTIPLE_TOOL_CALLS = "multiple_tool_calls"
     INVALID_TOOL_ARGUMENTS = "invalid_tool_arguments"
@@ -147,6 +148,9 @@ class Planner:
         tool_observations: Sequence[ToolObservation] = (),
     ) -> PlannerToolTurn | PlannerDecisionTurn:
         tools = tuple(offered_tools)
+        tool_names = tuple(tool.name for tool in tools)
+        if len(tool_names) != len(set(tool_names)):
+            raise PlannerProtocolError(PlannerErrorCode.DUPLICATE_TOOL_NAME)
         tools_by_name = {tool.name: tool for tool in tools}
         request_content = json.dumps(
             {
@@ -197,6 +201,7 @@ class Planner:
         if selection.invalid_tool_calls:
             raise PlannerProtocolError(PlannerErrorCode.INVALID_TOOL_ARGUMENTS)
         if not selection.tool_calls:
+            terminal_decision: PlannerTerminalDecision | None = None
             try:
                 terminal_output = await self._model.with_structured_output(
                     PlannerTerminalDecision,
@@ -205,10 +210,12 @@ class Planner:
                 terminal_decision = PlannerTerminalDecision.model_validate(
                     terminal_output
                 )
-            except (TypeError, ValueError, ValidationError) as error:
+            except (TypeError, ValueError, ValidationError):
+                pass
+            if terminal_decision is None:
                 raise PlannerProtocolError(
                     PlannerErrorCode.INVALID_TERMINAL_OUTPUT
-                ) from error
+                )
             return PlannerDecisionTurn(decision=terminal_decision)
         if len(selection.tool_calls) != 1:
             raise PlannerProtocolError(PlannerErrorCode.MULTIPLE_TOOL_CALLS)
@@ -216,18 +223,22 @@ class Planner:
         selected_tool = tools_by_name.get(selected_call["name"])
         if selected_tool is None:
             raise PlannerProtocolError(PlannerErrorCode.UNKNOWN_TOOL)
+        tool_turn: PlannerToolTurn | None = None
         try:
             validated_arguments = selected_tool.tool_call_schema.model_validate(
                 selected_call["args"]
             )
-            return PlannerToolTurn(
+            tool_turn = PlannerToolTurn(
                 tool_call=PersistedToolCall(
                     call_id=selected_call["id"],
                     name=selected_call["name"],
                     arguments=validated_arguments.model_dump(mode="json"),
                 )
             )
-        except (TypeError, ValueError, ValidationError) as error:
+        except (TypeError, ValueError, ValidationError):
+            pass
+        if tool_turn is None:
             raise PlannerProtocolError(
                 PlannerErrorCode.INVALID_TOOL_ARGUMENTS
-            ) from error
+            )
+        return tool_turn
