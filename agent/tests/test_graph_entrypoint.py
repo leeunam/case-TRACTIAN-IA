@@ -17,17 +17,24 @@ from tractian_agent.state import (
     AgentDecision,
     AgentState,
     MessageRole,
+    ResumeAnchor,
     ThreadScope,
 )
-from tractian_agent.tools.runtime import ReadToolRuntime, TrustedIdentity
+from tractian_agent.tools.runtime import (
+    ReadToolRuntime,
+    TrustedIdentity,
+    WriteToolRuntime,
+)
 from tractian_agent.write_contracts import (
     IntentStatus,
     ReprocessIntentScope,
     WriteIntent,
 )
 from tractian_agent.write_policy import (
+    ApprovalSource,
     PolicyDecision,
     PolicyReason,
+    TrustedActionApproval,
     WritePolicyResult,
 )
 
@@ -94,10 +101,18 @@ def _initial_state(
 
 
 class _RecordingGraph:
-    def __init__(self, values=None, *, next_nodes=(), interrupts=()):
+    def __init__(
+        self,
+        values=None,
+        *,
+        next_nodes=(),
+        interrupts=(),
+        planner_enabled=False,
+    ):
         self.values = values or {}
         self.next_nodes = next_nodes
         self.interrupts = interrupts
+        self.planner_enabled = planner_enabled
         self.state_config = None
         self.invoke_config = None
         self.durability = None
@@ -265,6 +280,169 @@ def test_nonterminal_resume_rejects_invalid_pending_work_shape(
     assert error.code == expected_code
     assert graph.as_node is None
     assert graph.invoke_config is None
+
+
+@pytest.mark.parametrize(
+    ("anchor", "next_node"),
+    [
+        (ResumeAnchor.INGEST, "planner_select"),
+        (ResumeAnchor.PLANNER_TOOL, "planner_select"),
+    ],
+)
+def test_planner_select_resume_accepts_both_explicit_predecessors(
+    anchor: ResumeAnchor,
+    next_node: str,
+):
+    state = _initial_state(step_limit=20).model_copy(
+        update={"resume_anchor": anchor}
+    )
+    graph = _RecordingGraph(
+        state.model_dump(mode="json"),
+        next_nodes=(next_node,),
+        planner_enabled=True,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            return await invoke_agent(
+                graph,
+                request=_request(),
+                runtime=_runtime(client),
+                thread_id=state.thread_id,
+                request_id=state.request_id,
+                execution_id="exec_resume",
+            )
+
+    asyncio.run(scenario())
+
+    assert graph.as_node == anchor.value
+
+
+@pytest.mark.parametrize(
+    ("raw_anchor", "next_node", "expected_code"),
+    [
+        (None, "route", "MISSING_RESUME_ANCHOR"),
+        ("invented_node", "route", "UNKNOWN_RESUME_ANCHOR"),
+        (ResumeAnchor.INGEST.value, "planner_tool", "RESUME_ANCHOR_MISMATCH"),
+    ],
+)
+def test_resume_anchor_fails_closed_before_checkpoint_update(
+    raw_anchor: str | None,
+    next_node: str,
+    expected_code: str,
+):
+    values = _initial_state(step_limit=20).model_dump(mode="json")
+    if raw_anchor is None:
+        values.pop("resume_anchor")
+    else:
+        values["resume_anchor"] = raw_anchor
+    graph = _RecordingGraph(
+        values,
+        next_nodes=(next_node,),
+        planner_enabled=True,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=_runtime(client),
+                    thread_id="thread_case_tkt_inv_04",
+                    request_id="req_01",
+                    execution_id="exec_resume",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == expected_code
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+def test_planner_builder_defaults_to_20_and_rejects_21_before_checkpoint():
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            graph = _RecordingGraph(planner_enabled=True)
+            state = await invoke_agent(
+                graph,
+                request=_request(),
+                runtime=_runtime(client),
+                thread_id="thread_planner_budget",
+                request_id="req_planner_budget",
+                execution_id="exec_planner_budget",
+            )
+            rejected = _RecordingGraph(planner_enabled=True)
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    rejected,
+                    request=_request(),
+                    runtime=_runtime(client),
+                    thread_id="thread_planner_over_budget",
+                    request_id="req_planner_over_budget",
+                    execution_id="exec_planner_over_budget",
+                    step_limit=21,
+                )
+        return state, rejected, error.value
+
+    state, rejected, error = asyncio.run(scenario())
+
+    assert state.step_limit == 20
+    assert error.code == "PLANNER_STEP_LIMIT_EXCEEDED"
+    assert rejected.state_config is None
+    assert rejected.invoke_config is None
+
+
+def test_original_approval_without_proposal_is_only_accepted_with_planner():
+    approval = TrustedActionApproval(
+        action="update_asset_criticality",
+        target_id="asset_G501",
+        material_parameters={"criticality": "critical"},
+        source=ApprovalSource.ORIGINAL_REQUEST,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"action_high"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                client=client,
+            )
+            planner_graph = _RecordingGraph(planner_enabled=True)
+            accepted = await invoke_agent(
+                planner_graph,
+                request=_request(),
+                runtime=runtime,
+                thread_id="thread_planner_approval",
+                request_id="req_planner_approval",
+                execution_id="exec_planner_approval",
+                original_approval=approval,
+            )
+            fallback = _RecordingGraph()
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    fallback,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_fallback_approval",
+                    request_id="req_fallback_approval",
+                    execution_id="exec_fallback_approval",
+                    original_approval=approval,
+                )
+        return accepted, planner_graph, fallback, error.value
+
+    accepted, planner_graph, fallback, error = asyncio.run(scenario())
+
+    assert accepted.approval == approval
+    assert accepted.pending_proposal is None
+    assert planner_graph.state_config is not None
+    assert error.code == "ORIGINAL_APPROVAL_WITHOUT_PROPOSAL"
+    assert fallback.state_config is None
 
 
 def test_build_graph_rejects_checkpointer_outside_managed_lifecycle(

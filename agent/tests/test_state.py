@@ -20,6 +20,9 @@ from tractian_agent.state import (
     PersistedToolArtifact,
     PersistedToolCall,
     PersistedMessage,
+    PlannerFailureRecord,
+    PlannerTerminalRecord,
+    ResumeAnchor,
     ReviewRecord,
     ReviewStatus,
     StateEvidence,
@@ -256,6 +259,112 @@ def test_new_state_starts_with_empty_typed_evidence_and_observable_collections()
     assert state.approval is None
     assert state.final_result is None
     assert state.review is None
+    assert state.resume_anchor is ResumeAnchor.START
+    assert state.planner_terminal is None
+    assert state.planner_failure is None
+
+
+def test_planner_progress_round_trips_as_typed_json_safe_state():
+    state = _state(
+        resume_anchor=ResumeAnchor.PLANNER_SELECT,
+        planner_terminal=PlannerTerminalRecord(
+            decision="request_information",
+            stop_reason="missing_information",
+            missing_information="Informe o ponto de medição.",
+        ),
+    )
+
+    restored = AgentState.model_validate_json(state.model_dump_json())
+
+    assert restored == state
+    assert restored.resume_anchor is ResumeAnchor.PLANNER_SELECT
+    assert restored.planner_terminal is not None
+    assert restored.planner_terminal.missing_information == (
+        "Informe o ponto de medição."
+    )
+    assert restored.planner_failure is None
+
+    failed = _state(
+        resume_anchor=ResumeAnchor.PLANNER_TOOL,
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+        final_result=FinalResult(
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            message="O ciclo terminou de forma segura.",
+        ),
+        review=ReviewRecord(
+            status=ReviewStatus.REQUIRED,
+            reason="planner:planner_tool:invalid_tool_result",
+        ),
+        planner_failure=PlannerFailureRecord(
+            stage="planner_tool", code="invalid_tool_result"
+        ),
+    )
+    assert AgentState.model_validate_json(failed.model_dump_json()) == failed
+
+
+def test_planner_failure_requires_a_coherent_safe_terminal_state():
+    failure = PlannerFailureRecord(
+        stage="planner_tool",
+        code="invalid_tool_result",
+    )
+
+    with pytest.raises(ValidationError, match="falha do planner exige"):
+        _state(planner_failure=failure)
+
+    with pytest.raises(ValidationError, match="mutuamente exclusivos"):
+        _state(
+            planner_failure=failure,
+            planner_terminal=PlannerTerminalRecord(
+                decision="guide",
+                stop_reason="sufficient_evidence",
+            ),
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            final_result=FinalResult(
+                decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+                message="O ciclo terminou de forma segura.",
+            ),
+            review=ReviewRecord(status=ReviewStatus.REQUIRED),
+        )
+
+
+def test_new_request_resets_request_bound_planner_progress_and_anchor():
+    terminal_prior = _state(
+        resume_anchor=ResumeAnchor.PLANNER_TOOL,
+        planner_terminal=PlannerTerminalRecord(
+            decision="guide",
+            stop_reason="sufficient_evidence",
+        ),
+    )
+    failed_prior = _state(
+        resume_anchor=ResumeAnchor.PLANNER_SELECT,
+        planner_failure=PlannerFailureRecord(
+            stage="planner_select",
+            code="repeated_tool_call",
+        ),
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+        final_result=FinalResult(
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            message="O ciclo terminou de forma segura.",
+        ),
+        review=ReviewRecord(status=ReviewStatus.REQUIRED),
+    )
+
+    continued_states = tuple(
+        prior.continue_with(
+            request=_request(),
+            identity=prior.identity,
+            permissions=prior.permissions,
+            request_id="req_02",
+            execution_id="exec_02",
+            step_limit=20,
+        )
+        for prior in (terminal_prior, failed_prior)
+    )
+
+    for continued in continued_states:
+        assert continued.resume_anchor is ResumeAnchor.START
+        assert continued.planner_terminal is None
+        assert continued.planner_failure is None
 
 
 @pytest.mark.parametrize(

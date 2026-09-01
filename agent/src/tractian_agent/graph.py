@@ -1,7 +1,8 @@
-"""Grafo determinístico de leitura e dos fluxos verticais de escrita."""
+"""Grafo do planner com fronteiras determinísticas para os efeitos de escrita."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -9,24 +10,48 @@ import json
 from typing import Any, Literal
 from uuid import uuid4
 
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables.config import RunnableConfig
+from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
 from langgraph.types import StateSnapshot, interrupt
 
 from tractian_agent.checkpoint import get_checkpoint_owner
 from tractian_agent.client import IndustrialApiClient
 from tractian_agent.contracts import ActionReceipt, ApiError, ApiErrorCategory
+from tractian_agent.planner import (
+    Planner,
+    PlannerDecisionKind,
+    PlannerDecisionTurn,
+    PlannerProtocolError,
+    PlannerToolTurn,
+    select_planner_tools,
+    validate_planner_read_observation,
+)
 from tractian_agent.state import (
     AgentDecision,
     AgentState,
     FinalResult,
     MessageRole,
     PersistedMessage,
+    PersistedToolArtifact,
+    PersistedToolCall,
+    PlannerFailureRecord,
+    PlannerTerminalRecord,
+    ResumeAnchor,
+    ReviewRecord,
+    ReviewStatus,
+    ToolObservation,
 )
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
+from tractian_agent.tools.writes import (
+    WriteProposalArtifact,
+    WriteProposalContent,
+)
 from tractian_agent.write_contracts import (
     ConfirmationReply,
     EscalateCaseIntentScope,
@@ -64,6 +89,8 @@ from tractian_agent.write_policy import (
 
 MINIMAL_GRAPH_STEP_COUNT = 3
 REPROCESS_GRAPH_STEP_COUNT = 5
+PLANNER_GRAPH_STEP_LIMIT = 20
+_PLANNER_FIXED_WRITE_STEPS = 4
 _IDEMPOTENCY_TTL = timedelta(days=7)
 _AMBIGUOUS_ERROR_CATEGORIES = frozenset(
     {
@@ -76,14 +103,31 @@ _AMBIGUOUS_ERROR_CATEGORIES = frozenset(
 _UNCERTAIN_IDEMPOTENCY_CODES = frozenset(
     {"IDEMPOTENCY_IN_PROGRESS", "IDEMPOTENCY_OUTCOME_UNKNOWN"}
 )
+_PROPOSAL_ACTION_BY_TOOL = {
+    "propose_reprocess_analysis": "reprocess_analysis",
+    "propose_request_specialist_analysis": "request_specialist_analysis",
+    "propose_update_asset_criticality": "update_asset_criticality",
+    "propose_request_model_retraining": "request_model_retraining",
+    "propose_escalate_case": "escalate_case",
+}
 
 
 class CompiledAgentGraph:
     """Grafo compilado que reutiliza o owner local do checkpointer."""
 
-    def __init__(self, graph: CompiledStateGraph) -> None:
+    def __init__(
+        self,
+        graph: CompiledStateGraph,
+        *,
+        planner_enabled: bool = False,
+    ) -> None:
         self._graph = graph
         self._checkpoint_owner = get_checkpoint_owner(graph.checkpointer)
+        self._planner_enabled = planner_enabled
+
+    @property
+    def planner_enabled(self) -> bool:
+        return self._planner_enabled
 
     def thread_lock(self, thread_id: str) -> AbstractAsyncContextManager[None]:
         return self._checkpoint_owner.thread_lock(thread_id)
@@ -259,6 +303,48 @@ def _terminal_result(
     )
 
 
+def _planner_failure_result(
+    state: AgentState,
+    *,
+    stage: Literal["planner_select", "planner_tool", "planner_finalize"],
+    code: str,
+    anchor: ResumeAnchor,
+) -> AgentState:
+    decision = AgentDecision.REQUIRE_HUMAN_REVIEW
+    return _replace_state(
+        state,
+        resume_anchor=anchor,
+        planner_terminal=None,
+        planner_failure=PlannerFailureRecord(stage=stage, code=code),
+        decision=decision,
+        final_result=FinalResult(
+            decision=decision,
+            message="O ciclo do planner terminou de forma segura e exige revisão.",
+        ),
+        review=ReviewRecord(
+            status=ReviewStatus.REQUIRED,
+            reason=f"planner:{stage}:{code}",
+        ),
+    )
+
+
+def _planner_failure_update(
+    state: AgentState,
+    *,
+    stage: Literal["planner_select", "planner_tool", "planner_finalize"],
+    code: str,
+    anchor: ResumeAnchor,
+) -> dict[str, object]:
+    return _checkpoint_update(
+        _planner_failure_result(
+            state,
+            stage=stage,
+            code=code,
+            anchor=anchor,
+        )
+    )
+
+
 def _successful_action_decision(action: str) -> AgentDecision:
     return (
         AgentDecision.ESCALATE
@@ -287,6 +373,7 @@ def _ingest(
     advanced = state.advance_step()
     updated = _replace_state(
         advanced,
+        resume_anchor=ResumeAnchor.INGEST,
         messages=(
             *advanced.messages,
             PersistedMessage(role=MessageRole.USER, content=advanced.request.message),
@@ -297,7 +384,13 @@ def _ingest(
 
 def _route(state: AgentState) -> dict[str, object]:
     advanced = state.advance_step()
-    return _checkpoint_update(_replace_state(advanced, decision=AgentDecision.GUIDE))
+    return _checkpoint_update(
+        _replace_state(
+            advanced,
+            decision=AgentDecision.GUIDE,
+            resume_anchor=ResumeAnchor.ROUTE,
+        )
+    )
 
 
 def _finish(state: AgentState) -> dict[str, object]:
@@ -306,11 +399,378 @@ def _finish(state: AgentState) -> dict[str, object]:
         decision=AgentDecision.GUIDE,
         message="Fluxo determinístico de leitura concluído sem LLM.",
     )
-    return _checkpoint_update(_replace_state(advanced, final_result=result))
+    return _checkpoint_update(
+        _replace_state(
+            advanced,
+            final_result=result,
+            resume_anchor=ResumeAnchor.FINISH,
+        )
+    )
 
 
 def _after_ingest(state: AgentState) -> Literal["read", "write"]:
     return "write" if state.pending_proposal is not None else "read"
+
+
+def _after_ingest_with_planner(
+    state: AgentState,
+) -> Literal["planner", "write"]:
+    return "write" if state.pending_proposal is not None else "planner"
+
+
+def _planner_select_node(planner: Planner):
+    async def planner_select(
+        state: AgentState,
+        runtime: Runtime[ReadToolRuntime],
+    ) -> dict[str, object]:
+        try:
+            advanced = state.advance_step()
+        except ValueError:
+            return _planner_failure_update(
+                state,
+                stage="planner_select",
+                code="step_limit_exhausted",
+                anchor=ResumeAnchor.PLANNER_SELECT,
+            )
+        context = runtime.context
+        if not isinstance(context, ReadToolRuntime):
+            return _planner_failure_update(
+                advanced,
+                stage="planner_select",
+                code="runtime_required",
+                anchor=ResumeAnchor.PLANNER_SELECT,
+            )
+        try:
+            offered_tools = select_planner_tools(advanced, context)
+            turn = await planner.ainvoke(
+                advanced.request,
+                offered_tools=offered_tools,
+                request_id=advanced.request_id,
+                usage=advanced.planner_usage,
+                tool_calls=advanced.tool_calls,
+                tool_observations=advanced.tool_observations,
+            )
+        except PlannerProtocolError as error:
+            failed_state = advanced
+            if error.usage is not None:
+                failed_state = _replace_state(
+                    failed_state,
+                    planner_usage=error.usage,
+                )
+            return _planner_failure_update(
+                failed_state,
+                stage="planner_select",
+                code=error.code.value,
+                anchor=ResumeAnchor.PLANNER_SELECT,
+            )
+        except Exception:
+            return _planner_failure_update(
+                advanced,
+                stage="planner_select",
+                code="model_failure",
+                anchor=ResumeAnchor.PLANNER_SELECT,
+            )
+
+        updated = _replace_state(
+            advanced,
+            planner_usage=turn.usage,
+            planner_failure=None,
+            resume_anchor=ResumeAnchor.PLANNER_SELECT,
+        )
+        remaining_steps = updated.step_limit - updated.step_count
+        if isinstance(turn, PlannerToolTurn):
+            is_proposal = turn.tool_call.name in _PROPOSAL_ACTION_BY_TOOL
+            required_steps = 1 + (
+                _PLANNER_FIXED_WRITE_STEPS if is_proposal else 0
+            )
+            if remaining_steps < required_steps:
+                return _planner_failure_update(
+                    updated,
+                    stage="planner_select",
+                    code="step_limit_exhausted",
+                    anchor=ResumeAnchor.PLANNER_SELECT,
+                )
+            return _checkpoint_update(
+                _replace_state(
+                    updated,
+                    planner_terminal=None,
+                    tool_calls=(*updated.tool_calls, turn.tool_call),
+                )
+            )
+        if not isinstance(turn, PlannerDecisionTurn):
+            return _planner_failure_update(
+                updated,
+                stage="planner_select",
+                code="invalid_planner_turn",
+                anchor=ResumeAnchor.PLANNER_SELECT,
+            )
+        if remaining_steps < 1:
+            return _planner_failure_update(
+                updated,
+                stage="planner_select",
+                code="step_limit_exhausted",
+                anchor=ResumeAnchor.PLANNER_SELECT,
+            )
+        terminal = PlannerTerminalRecord.model_validate(
+            turn.decision.model_dump(mode="json")
+        )
+        return _checkpoint_update(
+            _replace_state(updated, planner_terminal=terminal)
+        )
+
+    return planner_select
+
+
+def _after_planner_select(
+    state: AgentState,
+) -> Literal["end", "finalize", "tool"]:
+    if state.final_result is not None:
+        return "end"
+    if state.planner_terminal is not None:
+        return "finalize"
+    return "tool"
+
+
+def _pending_planner_tool(
+    state: AgentState,
+    runtime: ReadToolRuntime,
+) -> tuple[PersistedToolCall, BaseTool]:
+    calls = tuple(
+        call for call in state.tool_calls if call.request_id == state.request_id
+    )
+    observations = tuple(
+        observation
+        for observation in state.tool_observations
+        if observation.request_id == state.request_id
+    )
+    if (
+        not calls
+        or state.tool_calls[-1] != calls[-1]
+        or len(calls) != len(observations) + 1
+        or any(
+            call.call_id != observation.call_id
+            for call, observation in zip(calls[:-1], observations, strict=True)
+        )
+    ):
+        raise ValueError("estado não possui uma única tool pendente")
+    pending = calls[-1]
+    prior = _replace_state(state, tool_calls=state.tool_calls[:-1])
+    offered_by_name = {
+        tool.name: tool for tool in select_planner_tools(prior, runtime)
+    }
+    selected_tool = offered_by_name.get(pending.name)
+    if selected_tool is None:
+        raise ValueError("tool pendente não pertence ao catálogo autorizado")
+    validated_arguments = selected_tool.tool_call_schema.model_validate(
+        pending.arguments.to_python()
+    ).model_dump(mode="json")
+    if validated_arguments != pending.arguments.to_python():
+        raise ValueError("argumentos persistidos divergem do schema público")
+    return pending, selected_tool
+
+
+def _proposal_matches_call(
+    call_arguments: object,
+    content: WriteProposalContent,
+    artifact: WriteProposalArtifact,
+) -> bool:
+    expected_action = _PROPOSAL_ACTION_BY_TOOL.get(artifact.tool_name)
+    proposal_arguments = artifact.proposal.model_dump(
+        mode="json",
+        exclude={"action"},
+    )
+    return (
+        expected_action == artifact.proposal.action
+        and artifact.effect_executed is False
+        and content.proposal == artifact.proposal
+        and proposal_arguments == call_arguments
+    )
+
+
+async def _planner_tool(
+    state: AgentState,
+    runtime: Runtime[ReadToolRuntime],
+) -> dict[str, object]:
+    try:
+        advanced = state.advance_step()
+    except ValueError:
+        return _planner_failure_update(
+            state,
+            stage="planner_tool",
+            code="step_limit_exhausted",
+            anchor=ResumeAnchor.PLANNER_TOOL,
+        )
+    context = runtime.context
+    if not isinstance(context, ReadToolRuntime):
+        return _planner_failure_update(
+            advanced,
+            stage="planner_tool",
+            code="runtime_required",
+            anchor=ResumeAnchor.PLANNER_TOOL,
+        )
+    try:
+        call, selected_tool = _pending_planner_tool(advanced, context)
+        raw_output = await ToolNode(
+            (selected_tool,),
+            handle_tool_errors=False,
+        ).ainvoke(
+            {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": call.name,
+                                "args": call.arguments.to_python(),
+                                "id": call.call_id,
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                ]
+            },
+            runtime=runtime,
+        )
+        if not isinstance(raw_output, Mapping):
+            raise ValueError("ToolNode devolveu envelope inválido")
+        messages = raw_output.get("messages")
+        if (
+            not isinstance(messages, list)
+            or len(messages) != 1
+            or not isinstance(messages[0], ToolMessage)
+        ):
+            raise ValueError("ToolNode deve devolver um único ToolMessage")
+        message = messages[0]
+        if (
+            message.status != "success"
+            or message.name != call.name
+            or message.tool_call_id != call.call_id
+            or not isinstance(message.content, str)
+        ):
+            raise ValueError("ToolMessage diverge da chamada persistida")
+        parsed_content = json.loads(message.content)
+
+        if call.name in _PROPOSAL_ACTION_BY_TOOL:
+            content = WriteProposalContent.model_validate(parsed_content)
+            artifact = WriteProposalArtifact.model_validate(message.artifact)
+            if artifact.tool_name != call.name or not _proposal_matches_call(
+                call.arguments.to_python(),
+                content,
+                artifact,
+            ):
+                raise ValueError("proposta diverge da tool selecionada")
+            updated = _replace_state(
+                advanced,
+                pending_proposal=artifact.proposal,
+                planner_terminal=None,
+                planner_failure=None,
+                resume_anchor=ResumeAnchor.PLANNER_TOOL,
+            )
+            if updated.step_limit - updated.step_count < _PLANNER_FIXED_WRITE_STEPS:
+                return _planner_failure_update(
+                    updated,
+                    stage="planner_tool",
+                    code="write_step_budget_exhausted",
+                    anchor=ResumeAnchor.PLANNER_TOOL,
+                )
+            return _checkpoint_update(updated)
+
+        artifact = PersistedToolArtifact.model_validate(message.artifact)
+        observation = ToolObservation(
+            request_id=advanced.request_id,
+            call_id=call.call_id,
+            content=parsed_content,
+            artifact=artifact,
+        )
+        validate_planner_read_observation(advanced, context, observation)
+        updated = _replace_state(
+            advanced,
+            tool_observations=(*advanced.tool_observations, observation),
+            planner_terminal=None,
+            planner_failure=None,
+            resume_anchor=ResumeAnchor.PLANNER_TOOL,
+        )
+        if updated.step_count >= updated.step_limit:
+            return _planner_failure_update(
+                updated,
+                stage="planner_tool",
+                code="step_limit_exhausted",
+                anchor=ResumeAnchor.PLANNER_TOOL,
+            )
+        return _checkpoint_update(updated)
+    except (PlannerProtocolError, TypeError, ValueError):
+        return _planner_failure_update(
+            advanced,
+            stage="planner_tool",
+            code="invalid_tool_result",
+            anchor=ResumeAnchor.PLANNER_TOOL,
+        )
+    except Exception:
+        return _planner_failure_update(
+            advanced,
+            stage="planner_tool",
+            code="tool_execution_failed",
+            anchor=ResumeAnchor.PLANNER_TOOL,
+        )
+
+
+def _after_planner_tool(
+    state: AgentState,
+) -> Literal["end", "planner", "write"]:
+    if state.final_result is not None:
+        return "end"
+    return "write" if state.pending_proposal is not None else "planner"
+
+
+def _planner_finalize(state: AgentState) -> dict[str, object]:
+    try:
+        advanced = state.advance_step()
+    except ValueError:
+        return _planner_failure_update(
+            state,
+            stage="planner_finalize",
+            code="step_limit_exhausted",
+            anchor=ResumeAnchor.PLANNER_FINALIZE,
+        )
+    terminal = advanced.planner_terminal
+    if terminal is None:
+        return _planner_failure_update(
+            advanced,
+            stage="planner_finalize",
+            code="missing_terminal_decision",
+            anchor=ResumeAnchor.PLANNER_FINALIZE,
+        )
+    decision = AgentDecision(terminal.decision)
+    messages = {
+        PlannerDecisionKind.GUIDE.value: (
+            "O planner encerrou com evidência suficiente; o writer ainda "
+            "não foi implementado."
+        ),
+        PlannerDecisionKind.REQUEST_INFORMATION.value: (
+            f"Informação adicional necessária: {terminal.missing_information}"
+        ),
+        PlannerDecisionKind.REQUIRE_HUMAN_REVIEW.value: (
+            "O planner determinou que o caso exige revisão humana."
+        ),
+    }
+    updated = _replace_state(
+        advanced,
+        resume_anchor=ResumeAnchor.PLANNER_FINALIZE,
+        decision=decision,
+        final_result=FinalResult(
+            decision=decision,
+            message=messages[terminal.decision],
+        ),
+        review=(
+            ReviewRecord(
+                status=ReviewStatus.REQUIRED,
+                reason="planner:human_review_required",
+            )
+            if decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+            else advanced.review
+        ),
+    )
+    return _checkpoint_update(updated)
 
 
 def _write_policy(
@@ -320,7 +780,10 @@ def _write_policy(
     context = runtime.context
     if not isinstance(context, WriteToolRuntime):
         raise TypeError("runtime de escrita é obrigatório para avaliar ação")
-    advanced = state.advance_step()
+    advanced = _replace_state(
+        state.advance_step(),
+        resume_anchor=ResumeAnchor.WRITE_POLICY,
+    )
     proposal = _current_write_proposal(advanced)
     trusted_context = _trusted_write_context(context)
     policy = evaluate_write_policy(
@@ -399,7 +862,10 @@ def _confirmation_gate(
         if reply.intent_id != intent.intent_id:
             raise ValueError("a confirmação não corresponde à intenção persistida")
 
-    advanced = state.advance_step()
+    advanced = _replace_state(
+        state.advance_step(),
+        resume_anchor=ResumeAnchor.CONFIRMATION_GATE,
+    )
     if reply is not None and reply.decision == "deny":
         denied_policy = WritePolicyResult(
             decision=PolicyDecision.DENY,
@@ -463,7 +929,10 @@ def _after_confirmation(state: AgentState) -> Literal["end", "prepare"]:
 
 
 def _prepare_intent(state: AgentState) -> dict[str, object]:
-    advanced = state.advance_step()
+    advanced = _replace_state(
+        state.advance_step(),
+        resume_anchor=ResumeAnchor.PREPARE_INTENT,
+    )
     intent = _current_intent(advanced)
     if intent.status is not IntentStatus.PROPOSED:
         raise ValueError("somente intenção autorizada pode ser preparada")
@@ -709,7 +1178,10 @@ async def _execute_action(
     context = runtime.context
     if not isinstance(context, WriteToolRuntime):
         raise TypeError("runtime de escrita é obrigatório para executar ação")
-    advanced = state.advance_step()
+    advanced = _replace_state(
+        state.advance_step(),
+        resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+    )
     proposal = _current_write_proposal(advanced)
     intent = _current_intent(advanced)
     if intent.status is not IntentStatus.PREPARED:
@@ -848,24 +1320,47 @@ async def _execute_action(
 
 def build_agent_graph(
     checkpointer: BaseCheckpointSaver[str],
+    *,
+    planner: Planner | None = None,
 ) -> CompiledAgentGraph:
-    """Compila leitura e os fluxos verticais de escrita."""
+    """Compila o fallback determinístico ou o ciclo opt-in do planner."""
     builder = StateGraph(AgentState, context_schema=ReadToolRuntime)
     builder.add_node("ingest", _ingest)
-    builder.add_node("route", _route)
-    builder.add_node("finish", _finish)
     builder.add_node("write_policy", _write_policy)
     builder.add_node("confirmation_gate", _confirmation_gate)
     builder.add_node("prepare_intent", _prepare_intent)
     builder.add_node("execute_action", _execute_action)
     builder.add_edge(START, "ingest")
-    builder.add_conditional_edges(
-        "ingest",
-        _after_ingest,
-        {"read": "route", "write": "write_policy"},
-    )
-    builder.add_edge("route", "finish")
-    builder.add_edge("finish", END)
+    if planner is None:
+        builder.add_node("route", _route)
+        builder.add_node("finish", _finish)
+        builder.add_conditional_edges(
+            "ingest",
+            _after_ingest,
+            {"read": "route", "write": "write_policy"},
+        )
+        builder.add_edge("route", "finish")
+        builder.add_edge("finish", END)
+    else:
+        builder.add_node("planner_select", _planner_select_node(planner))
+        builder.add_node("planner_tool", _planner_tool)
+        builder.add_node("planner_finalize", _planner_finalize)
+        builder.add_conditional_edges(
+            "ingest",
+            _after_ingest_with_planner,
+            {"planner": "planner_select", "write": "write_policy"},
+        )
+        builder.add_conditional_edges(
+            "planner_select",
+            _after_planner_select,
+            {"end": END, "finalize": "planner_finalize", "tool": "planner_tool"},
+        )
+        builder.add_conditional_edges(
+            "planner_tool",
+            _after_planner_tool,
+            {"end": END, "planner": "planner_select", "write": "write_policy"},
+        )
+        builder.add_edge("planner_finalize", END)
     builder.add_conditional_edges(
         "write_policy",
         _after_write_policy,
@@ -878,4 +1373,7 @@ def build_agent_graph(
     )
     builder.add_edge("prepare_intent", "execute_action")
     builder.add_edge("execute_action", END)
-    return CompiledAgentGraph(builder.compile(checkpointer=checkpointer))
+    return CompiledAgentGraph(
+        builder.compile(checkpointer=checkpointer),
+        planner_enabled=planner is not None,
+    )

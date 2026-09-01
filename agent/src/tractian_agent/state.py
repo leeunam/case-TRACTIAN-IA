@@ -499,6 +499,22 @@ class ReviewStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class ResumeAnchor(str, Enum):
+    """Último nó concluído, inclusive o pseudo-nó inicial."""
+
+    START = "__start__"
+    INGEST = "ingest"
+    ROUTE = "route"
+    FINISH = "finish"
+    PLANNER_SELECT = "planner_select"
+    PLANNER_TOOL = "planner_tool"
+    PLANNER_FINALIZE = "planner_finalize"
+    WRITE_POLICY = "write_policy"
+    CONFIRMATION_GATE = "confirmation_gate"
+    PREPARE_INTENT = "prepare_intent"
+    EXECUTE_ACTION = "execute_action"
+
+
 class ThreadScope(FrozenStateModel):
     thread_id: str = Field(min_length=1, pattern=r"^\S+$")
     case_id: str = Field(min_length=1, pattern=r"^\S+$")
@@ -572,6 +588,55 @@ class PlannerUsage(FrozenStateModel):
     finalization_count: int = Field(default=0, ge=0, le=1, strict=True)
 
 
+class PlannerTerminalRecord(FrozenStateModel):
+    """Decisão terminal observável, ainda sem texto do futuro writer."""
+
+    decision: Literal[
+        "guide",
+        "request_information",
+        "require_human_review",
+    ]
+    stop_reason: Literal[
+        "sufficient_evidence",
+        "missing_information",
+        "human_review_required",
+    ]
+    missing_information: str | None = Field(default=None, max_length=300)
+
+    @field_validator("missing_information", mode="before")
+    @classmethod
+    def _normalize_missing_information(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("missing_information deve ser texto ou null")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("missing_information não pode ser vazio")
+        return normalized
+
+    @model_validator(mode="after")
+    def _require_coherent_stop_contract(self) -> PlannerTerminalRecord:
+        expected_reason = {
+            "guide": "sufficient_evidence",
+            "request_information": "missing_information",
+            "require_human_review": "human_review_required",
+        }[self.decision]
+        if self.stop_reason != expected_reason:
+            raise ValueError("stop_reason diverge da decisão terminal")
+        requires_information = self.decision == "request_information"
+        if requires_information != (self.missing_information is not None):
+            raise ValueError("missing_information diverge da decisão terminal")
+        return self
+
+
+class PlannerFailureRecord(FrozenStateModel):
+    """Falha sanitizada do ciclo; nunca guarda exceção ou saída livre."""
+
+    stage: Literal["planner_select", "planner_tool", "planner_finalize"]
+    code: str = Field(min_length=1, pattern=r"^[a-z0-9_]+$")
+
+
 class AgentState(FrozenStateModel):
     request: PersistedSupportRequest
     identity: TrustedIdentity
@@ -593,6 +658,9 @@ class AgentState(FrozenStateModel):
     final_result: FinalResult | None = None
     review: ReviewRecord | None = None
     planner_usage: PlannerUsage
+    resume_anchor: ResumeAnchor = ResumeAnchor.START
+    planner_terminal: PlannerTerminalRecord | None = None
+    planner_failure: PlannerFailureRecord | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -698,6 +766,21 @@ class AgentState(FrozenStateModel):
             or len(current_observation_ids) != len(set(current_observation_ids))
         ):
             raise ValueError("IDs de tool call devem ser únicos por request_id")
+        if self.planner_terminal is not None and self.planner_failure is not None:
+            raise ValueError(
+                "decisão terminal e falha do planner são mutuamente exclusivos"
+            )
+        if self.planner_failure is not None and (
+            self.decision is not AgentDecision.REQUIRE_HUMAN_REVIEW
+            or self.final_result is None
+            or self.final_result.decision
+            is not AgentDecision.REQUIRE_HUMAN_REVIEW
+            or self.review is None
+            or self.review.status is not ReviewStatus.REQUIRED
+        ):
+            raise ValueError(
+                "falha do planner exige encerramento seguro e revisão humana"
+            )
         return self
 
     def continue_with(
@@ -738,6 +821,9 @@ class AgentState(FrozenStateModel):
                 final_result=None,
                 review=None,
                 planner_usage=PlannerUsage(request_id=request_id),
+                resume_anchor=ResumeAnchor.START,
+                planner_terminal=None,
+                planner_failure=None,
             )
         return type(self).model_validate(data)
 

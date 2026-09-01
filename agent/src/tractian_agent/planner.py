@@ -1832,6 +1832,28 @@ def _validated_current_interactions(
     return tuple(interactions)
 
 
+def validate_planner_read_observation(
+    state: AgentState,
+    runtime: ReadToolRuntime,
+    observation: ToolObservation,
+) -> ToolObservation:
+    """Valida uma nova observação pelo mesmo contrato usado no prompt."""
+    interactions = _validated_current_interactions(
+        state.request,
+        state.request_id,
+        state.tool_calls,
+        (*state.tool_observations, observation),
+        usage=state.planner_usage,
+        configured_model_id=runtime.configured_model_id,
+    )
+    if not interactions or interactions[-1][1] != observation:
+        raise PlannerProtocolError(
+            PlannerErrorCode.INVALID_HISTORY,
+            usage=state.planner_usage,
+        )
+    return observation
+
+
 def select_planner_tools(
     state: AgentState,
     runtime: ReadToolRuntime,

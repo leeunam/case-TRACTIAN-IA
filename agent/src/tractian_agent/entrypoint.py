@@ -1,4 +1,4 @@
-"""Fronteira Python assíncrona do grafo determinístico."""
+"""Fronteira Python assíncrona do grafo de atendimento."""
 
 from __future__ import annotations
 
@@ -10,8 +10,12 @@ from langgraph.graph import START
 from langgraph.types import Command
 
 from tractian_agent.contracts import SupportRequest
-from tractian_agent.graph import MINIMAL_GRAPH_STEP_COUNT, REPROCESS_GRAPH_STEP_COUNT
-from tractian_agent.state import AgentState, ThreadScope
+from tractian_agent.graph import (
+    MINIMAL_GRAPH_STEP_COUNT,
+    PLANNER_GRAPH_STEP_LIMIT,
+    REPROCESS_GRAPH_STEP_COUNT,
+)
+from tractian_agent.state import AgentState, ResumeAnchor, ThreadScope
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.write_contracts import (
     ConfirmationReply,
@@ -44,6 +48,9 @@ class GraphStateSnapshot(Protocol):
 
 
 class AgentGraph(Protocol):
+    @property
+    def planner_enabled(self) -> bool: ...
+
     def thread_lock(self, thread_id: str) -> AbstractAsyncContextManager[None]: ...
 
     async def aget_state(
@@ -69,15 +76,21 @@ class AgentGraph(Protocol):
     ) -> dict[str, object]: ...
 
 
-_PENDING_PREDECESSORS = {
-    "ingest": START,
-    "route": "ingest",
-    "finish": "route",
-    "write_policy": "ingest",
-    "confirmation_gate": "write_policy",
-    "prepare_intent": "confirmation_gate",
-    "execute_action": "prepare_intent",
+_ALLOWED_RESUME_PAIRS = {
+    (ResumeAnchor.START, "ingest"),
+    (ResumeAnchor.INGEST, "route"),
+    (ResumeAnchor.INGEST, "planner_select"),
+    (ResumeAnchor.INGEST, "write_policy"),
+    (ResumeAnchor.ROUTE, "finish"),
+    (ResumeAnchor.PLANNER_SELECT, "planner_tool"),
+    (ResumeAnchor.PLANNER_SELECT, "planner_finalize"),
+    (ResumeAnchor.PLANNER_TOOL, "planner_select"),
+    (ResumeAnchor.PLANNER_TOOL, "write_policy"),
+    (ResumeAnchor.WRITE_POLICY, "confirmation_gate"),
+    (ResumeAnchor.CONFIRMATION_GATE, "prepare_intent"),
+    (ResumeAnchor.PREPARE_INTENT, "execute_action"),
 }
+_KNOWN_PENDING_NODES = frozenset(node for _, node in _ALLOWED_RESUME_PAIRS)
 
 _ACTIVE_INTENT_STATUSES = frozenset(
     {
@@ -96,7 +109,7 @@ def _require_opaque_id(value: str, *, name: str) -> str:
     return value
 
 
-def _pending_predecessor(next_nodes: tuple[str, ...]) -> str:
+def _pending_node(next_nodes: tuple[str, ...]) -> str:
     if not next_nodes:
         raise AgentInvocationProtocolError(
             "NON_TERMINAL_WITHOUT_PENDING_WORK",
@@ -108,13 +121,40 @@ def _pending_predecessor(next_nodes: tuple[str, ...]) -> str:
             "checkpoint possui múltiplos nós pendentes",
         )
     pending_node = next_nodes[0]
-    try:
-        return _PENDING_PREDECESSORS[pending_node]
-    except KeyError as error:
+    if pending_node not in _KNOWN_PENDING_NODES:
         raise AgentInvocationProtocolError(
             "UNKNOWN_PENDING_NODE",
             f"checkpoint possui nó pendente desconhecido: {pending_node}",
+        )
+    return pending_node
+
+
+def _resume_predecessor(
+    persisted_values: Mapping[str, object],
+    next_nodes: tuple[str, ...],
+) -> str:
+    pending_node = _pending_node(next_nodes)
+    if "resume_anchor" not in persisted_values or persisted_values.get(
+        "resume_anchor"
+    ) is None:
+        raise AgentInvocationProtocolError(
+            "MISSING_RESUME_ANCHOR",
+            "checkpoint parcial não registra o último nó concluído",
+        )
+    raw_anchor = persisted_values["resume_anchor"]
+    try:
+        anchor = ResumeAnchor(raw_anchor)
+    except (TypeError, ValueError) as error:
+        raise AgentInvocationProtocolError(
+            "UNKNOWN_RESUME_ANCHOR",
+            "checkpoint parcial registra uma âncora desconhecida",
         ) from error
+    if (anchor, pending_node) not in _ALLOWED_RESUME_PAIRS:
+        raise AgentInvocationProtocolError(
+            "RESUME_ANCHOR_MISMATCH",
+            "a âncora persistida diverge do próximo nó",
+        )
+    return anchor.value
 
 
 def _replace_state(state: AgentState, **changes: object) -> AgentState:
@@ -189,6 +229,7 @@ def _validate_write_boundary(
     proposal: WriteProposal | None,
     confirmation: ConfirmationReply | None,
     original_approval: TrustedActionApproval | None,
+    planner_enabled: bool = False,
 ) -> None:
     write_requested = (
         proposal is not None
@@ -202,7 +243,11 @@ def _validate_write_boundary(
             "WRITE_RUNTIME_REQUIRED",
             "o fluxo de escrita exige contexto confiável de escrita",
         )
-    if original_approval is not None and proposal is None:
+    if (
+        original_approval is not None
+        and proposal is None
+        and not planner_enabled
+    ):
         raise AgentInvocationProtocolError(
             "ORIGINAL_APPROVAL_WITHOUT_PROPOSAL",
             "aprovação original exige proposta na mesma entrada",
@@ -310,19 +355,33 @@ async def invoke_agent(
     thread_id = _require_opaque_id(thread_id, name="thread_id")
     request_id = _require_opaque_id(request_id, name="request_id")
     execution_id = _require_opaque_id(execution_id, name="execution_id")
+    planner_enabled = bool(getattr(graph, "planner_enabled", False))
     _validate_write_boundary(
         request=request,
         runtime=runtime,
         proposal=proposal,
         confirmation=confirmation,
         original_approval=original_approval,
+        planner_enabled=planner_enabled,
     )
     resolved_step_limit = step_limit
     if resolved_step_limit is None:
-        resolved_step_limit = (
-            REPROCESS_GRAPH_STEP_COUNT
-            if proposal is not None or confirmation is not None
-            else MINIMAL_GRAPH_STEP_COUNT
+        if planner_enabled:
+            resolved_step_limit = PLANNER_GRAPH_STEP_LIMIT
+        else:
+            resolved_step_limit = (
+                REPROCESS_GRAPH_STEP_COUNT
+                if proposal is not None or confirmation is not None
+                else MINIMAL_GRAPH_STEP_COUNT
+            )
+    if planner_enabled and (
+        isinstance(resolved_step_limit, bool)
+        or not isinstance(resolved_step_limit, int)
+        or resolved_step_limit > PLANNER_GRAPH_STEP_LIMIT
+    ):
+        raise AgentInvocationProtocolError(
+            "PLANNER_STEP_LIMIT_EXCEEDED",
+            "o caminho do planner aceita no máximo 20 passos",
         )
     config: dict[str, object] = {"configurable": {"thread_id": thread_id}}
 
@@ -330,12 +389,36 @@ async def invoke_agent(
         snapshot = await graph.aget_state(config)
         persisted_values = snapshot.values
         if persisted_values:
+            resume_predecessor = (
+                _resume_predecessor(persisted_values, snapshot.next)
+                if snapshot.next
+                else None
+            )
             persisted = AgentState.model_validate(persisted_values)
+            if (
+                planner_enabled
+                and persisted.step_limit > PLANNER_GRAPH_STEP_LIMIT
+            ):
+                raise AgentInvocationProtocolError(
+                    "PLANNER_STEP_LIMIT_EXCEEDED",
+                    "checkpoint do planner excede o teto de 20 passos",
+                )
             new_request = request_id != persisted.request_id
+            persisted_original_approval = (
+                persisted.approval
+                if (
+                    not new_request
+                    and persisted.approval is not None
+                    and persisted.approval.source
+                    is ApprovalSource.ORIGINAL_REQUEST
+                )
+                else None
+            )
             write_flow = (
                 proposal is not None
                 or confirmation is not None
                 or original_approval is not None
+                or persisted_original_approval is not None
                 or (
                     not new_request
                     and persisted.pending_proposal is not None
@@ -351,7 +434,8 @@ async def invoke_agent(
                         else persisted.pending_proposal
                     ),
                     confirmation=confirmation,
-                    original_approval=None,
+                    original_approval=persisted_original_approval,
+                    planner_enabled=planner_enabled,
                 )
                 _validate_legacy_intents_for_write(persisted)
             state = persisted.continue_with(
@@ -443,7 +527,11 @@ async def invoke_agent(
                             "CONFIRMATION_REQUIRED",
                             "o fluxo aguarda uma confirmação estruturada",
                         )
-                    predecessor = _pending_predecessor(snapshot.next)
+                    predecessor = (
+                        resume_predecessor
+                        if resume_predecessor is not None
+                        else _resume_predecessor(persisted_values, snapshot.next)
+                    )
                     config = await graph.aupdate_state(
                         snapshot.config,
                         state.model_dump(mode="json"),
