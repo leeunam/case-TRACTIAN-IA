@@ -6,6 +6,26 @@ from tractian_agent.groq_provider import GroqModelProvider
 from tractian_agent.model_provider import ModelConfig
 
 
+def test_groq_provider_masks_a_direct_string_key_in_its_state():
+    secret = "direct-test-groq-secret"
+
+    provider = GroqModelProvider(api_key=secret)
+
+    assert secret not in repr(provider)
+    assert secret not in repr(vars(provider))
+    assert isinstance(vars(provider)["_api_key"], SecretStr)
+
+
+@pytest.mark.parametrize("raw_key", ["", "   ", "\t"])
+def test_groq_provider_rejects_blank_secret_str_without_leaking(raw_key):
+    with pytest.raises(ValueError) as exc_info:
+        GroqModelProvider(api_key=SecretStr(raw_key))
+
+    assert str(exc_info.value) == "GROQ_API_KEY must be set and non-empty"
+    if raw_key:
+        assert raw_key not in str(exc_info.value)
+
+
 @pytest.mark.parametrize(
     "environment",
     [{}, {"GROQ_API_KEY": ""}, {"GROQ_API_KEY": "   "}],

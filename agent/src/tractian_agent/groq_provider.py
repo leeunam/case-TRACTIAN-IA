@@ -12,8 +12,15 @@ from tractian_agent.model_provider import ModelConfig
 class GroqModelProvider:
     """Cria modelos LangChain hospedados pela Groq."""
 
-    def __init__(self, *, api_key: SecretStr) -> None:
-        self._api_key = api_key
+    def __init__(self, *, api_key: str | SecretStr) -> None:
+        raw_api_key = (
+            api_key.get_secret_value()
+            if isinstance(api_key, SecretStr)
+            else api_key
+        )
+        if not isinstance(raw_api_key, str) or not raw_api_key.strip():
+            raise ValueError("GROQ_API_KEY must be set and non-empty")
+        self._api_key = SecretStr(raw_api_key)
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str]) -> "GroqModelProvider":
