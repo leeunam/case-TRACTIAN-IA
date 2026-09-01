@@ -739,6 +739,14 @@ No sexto ciclo corretivo, a suíte focada completa passou externamente com
 casos adicionais de adulteração exatamente nos cortes passaram localmente,
 assim como **751 testes sem SQLite**. Os locks offline continuaram resolvendo
 49 pacotes no agente e 55 na API.
+No sétimo ciclo corretivo, a validação degradada de `get_asset` passou a
+reutilizar a mesma regra do executor para o `id` primário, aliases recursivos
+normalizados de ativo/empresa e estrutura de pontos, preservando
+`point_id: null` apenas como ausência de evidência. O planner eliminou seu
+parser divergente de timestamps e reutiliza `parse_aware_iso_timestamp` em
+análises, baseline, RMS, espectro e modelo. Passaram **782 testes sem SQLite**;
+o novo restore SQLite passou externamente, e os locks offline permaneceram em
+49 pacotes do agente e 55 da API.
 
 ### Task 12 — integrar o planner ao LangGraph e preservar as escritas
 

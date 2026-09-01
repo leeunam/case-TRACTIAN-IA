@@ -49,7 +49,11 @@ from tractian_agent.tools.analyses import (
     AnalysisSummary,
     DegradedAnalysisListModelContent,
 )
-from tractian_agent.tools.assets import AssetModelContent, AssetToolArtifact
+from tractian_agent.tools.assets import (
+    AssetModelContent,
+    AssetToolArtifact,
+    validate_degraded_asset_scope,
+)
 from tractian_agent.tools.identifiers import (
     AnalysisId,
     KnowledgeDocumentId,
@@ -79,6 +83,7 @@ from tractian_agent.tools.technical import (
     SpectrumModelContent,
     SpectrumToolArtifact,
 )
+from tractian_agent.tools.timestamps import parse_aware_iso_timestamp
 
 
 PLANNER_SYSTEM_PROMPT_VERSION: Final = "planner-v1"
@@ -348,7 +353,7 @@ def _analysis_artifact_is_concrete(analysis: AnalysisArtifact) -> bool:
         and _finite_number(analysis.confidence, minimum=0)
         and analysis.confidence <= 1
         and _nonblank(analysis.model_version)
-        and _aware_timestamp(analysis.created_at)
+        and _is_canonical_timestamp(analysis.created_at)
         and all(
             _nonblank(item.metric)
             and _finite_number(item.value)
@@ -364,11 +369,11 @@ def _baseline_artifact_is_concrete(baseline: BaselineArtifact) -> bool:
         re.fullmatch(r"bs_[A-Za-z0-9_-]{1,64}", baseline.id) is None
         or (
             baseline.established_at is not None
-            and not _aware_timestamp(baseline.established_at)
+            and not _is_canonical_timestamp(baseline.established_at)
         )
         or (
             baseline.invalidated_at is not None
-            and not _aware_timestamp(baseline.invalidated_at)
+            and not _is_canonical_timestamp(baseline.invalidated_at)
         )
         or not all(
             _nonblank(feature.feature)
@@ -419,7 +424,7 @@ def _rms_artifact_is_concrete(artifact: RmsToolArtifact) -> bool:
         )
         and all(
             all(
-                _aware_timestamp(sample.ts)
+                _is_canonical_timestamp(sample.ts)
                 and _finite_number(sample.value, minimum=0)
                 for sample in samples
             )
@@ -442,7 +447,7 @@ def _spectrum_artifact_is_concrete(artifact: SpectrumToolArtifact) -> bool:
         peak_groups.append(artifact.model_content.peaks)
     return (
         _validated_id(spectrum.point_id, _POINT_ID_ADAPTER) is not None
-        and _aware_timestamp(spectrum.collected_at)
+        and _is_canonical_timestamp(spectrum.collected_at)
         and all(
             all(
                 _finite_number(peak.freq_hz, minimum=0)
@@ -559,10 +564,15 @@ def _complete_content_matches_artifact(
     if tool_name == "get_model" and isinstance(artifact, ModelToolArtifact):
         model = artifact.outcome.model
         model_wire = _exact_model_wire(ModelArtifact, model)
-        return model_wire is not None and _exact_model_wire(
-            ModelArtifact,
-            content,
-        ) == model_wire
+        return (
+            model_wire is not None
+            and _degraded_model_is_concrete(model_wire)
+            and _exact_model_wire(
+                ModelArtifact,
+                content,
+            )
+            == model_wire
+        )
     if tool_name == "search_knowledge" and isinstance(
         artifact, KnowledgeSearchToolArtifact
     ):
@@ -758,14 +768,14 @@ def _degraded_flags_are_valid(value: object) -> bool:
     )
 
 
-def _aware_timestamp(value: object) -> bool:
+def _is_canonical_timestamp(value: object) -> bool:
     if not isinstance(value, str):
         return False
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parse_aware_iso_timestamp(value)
     except ValueError:
         return False
-    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+    return True
 
 
 def _degraded_analysis_rows_are_concrete(rows: object) -> bool:
@@ -820,7 +830,7 @@ def _degraded_analysis_rows_are_concrete(rows: object) -> bool:
             ):
                 return False
         if "created_at" in row:
-            if saw_undated or not _aware_timestamp(row["created_at"]):
+            if saw_undated or not _is_canonical_timestamp(row["created_at"]):
                 return False
             dated.append(
                 datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
@@ -887,7 +897,7 @@ def _degraded_model_is_concrete(model: object) -> bool:
     }:
         return False
     if "last_run_at" in model and model["last_run_at"] is not None and not (
-        _aware_timestamp(model["last_run_at"])
+        _is_canonical_timestamp(model["last_run_at"])
     ):
         return False
     if "coverage" in model:
@@ -1480,6 +1490,12 @@ def _read_observation_is_semantically_valid(
             "get_spectrum",
             "get_data_quality",
         }:
+            if call.name == "get_asset":
+                validate_degraded_asset_scope(
+                    outcome.partial_data,
+                    asset_id=request.asset_id,
+                    company_id=request.identity.company_id,
+                )
             if call.name == "get_analysis" and isinstance(
                 outcome.partial_data,
                 Mapping,
