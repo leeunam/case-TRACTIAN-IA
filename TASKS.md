@@ -661,19 +661,27 @@ de nova chamada, nunca aumenta o limite silenciosamente.
 
 **Decisões implementadas nesta fatia:** `select_planner_tools` reutiliza os
 catálogos estáticos e filtra somente por escopo confiável, permissões, tipo do
-runtime e IDs tipados presentes no pedido ou no conteúdo validado de observações
-da mesma `request_id`. Chamadas, observações e `PlannerUsage` ficam vinculados à
-solicitação; checkpoints anteriores sem os novos campos são migrados para a
-solicitação que já os continha, e uma nova solicitação zera somente os
-contadores transitórios. A fronteira bloqueia antes de `bind_tools` quando já
-há sete chamadas concluídas, oito seleções ou uma finalização; saídas inválidas
+runtime e IDs tipados presentes no pedido ou em campos estruturais específicos
+das tools que realmente os produzem, sempre na mesma `request_id`; notas,
+erros, snippets e texto livre incidental não concedem acesso. A chamada
+selecionada é validada novamente contra esses conjuntos, o ativo central e os
+pontos explícitos ou observados. Chamadas, observações e `PlannerUsage` ficam
+vinculados à solicitação; histórico legado sem `request_id` permanece
+auditável como não atribuído e não entra no contexto, fingerprint ou orçamento
+atuais, enquanto uma nova solicitação zera somente os contadores transitórios.
+A fronteira exige `request_id` e `PlannerUsage` e bloqueia antes de `bind_tools`
+quando já há sete chamadas concluídas, oito seleções ou uma finalização; saídas
+inválidas
 do modelo consomem e devolvem o uso atualizado no erro de protocolo. O
 fingerprint canônico usa somente tool e argumentos, sem o `call_id` do provider.
 O orçamento de contexto mede o wire OpenAI-compatible de mensagens e schemas
 das tools, remove apenas pares completos antigos com marcador explícito e não
 remove a observação mais recente nem erros/modos degradados; se o conjunto
-protegido não couber, falha antes do modelo. O limite de 20 passos permanece no
-`AgentState.step_limit` e será integrado ao caminho do planner somente na Task
+protegido não couber, falha antes do modelo. Antes da segunda requisição, o
+contexto é recalculado com o schema real de `PlannerTerminalDecision`; falha de
+espaço preserva a seleção consumida sem iniciar a finalização. O limite de 20
+passos permanece no `AgentState.step_limit` e será integrado ao caminho do
+planner somente na Task
 12, sem alterar grafo ou entrypoint nesta fatia.
 
 **Arquivos:** evoluir `planner.py`, contratos persistíveis estritamente

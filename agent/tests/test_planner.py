@@ -39,10 +39,12 @@ from tractian_agent.state import (
     ThreadScope,
     ToolObservation,
 )
-from tractian_agent.tools.analyses import get_analysis
+from tractian_agent.tools.analyses import get_analysis, list_asset_analyses
 from tractian_agent.tools.assets import get_asset
+from tractian_agent.tools.knowledge import get_knowledge_document, search_knowledge
 from tractian_agent.tools.observations import ToolArtifact, ToolOutcome, ToolSource
 from tractian_agent.tools import READ_TOOLS, WRITE_PROPOSAL_TOOLS
+from tractian_agent.tools.technical import get_baseline
 from tractian_agent.tools.runtime import (
     ReadToolRuntime,
     TrustedIdentity,
@@ -327,6 +329,150 @@ def test_select_planner_tools_uses_only_ids_observed_for_current_request():
     assert "get_analysis" in names_with_current
 
 
+def test_select_planner_tools_does_not_authorize_id_from_degraded_notes():
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_degraded_notes",
+        name="list_asset_analyses",
+        arguments={"asset_id": "asset_G501"},
+    )
+    observation = ToolObservation(
+        request_id="req_planner_01",
+        call_id=call.call_id,
+        content={
+            "mode": "partial",
+            "notes": "Texto incidental cita an_injetada.",
+            "analyses": [],
+            "partial_data": {},
+        },
+        artifact=ToolArtifact(
+            tool_name=call.name,
+            arguments={"asset_id": "asset_G501"},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/analyses",
+            ),
+            outcome=ToolOutcome(mode="partial", notes="Dados parciais."),
+        ),
+    )
+
+    offered_names = {
+        tool.name
+        for tool in select_planner_tools(
+            _state(
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            ),
+            _read_runtime(),
+        )
+    }
+
+    assert "get_analysis" not in offered_names
+
+
+def test_planner_rejects_analysis_id_not_authorized_by_typed_request():
+    request = _request().model_copy(
+        update={"message": "Detalhe a análise an_permitida."}
+    )
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_analysis",
+                    "args": {"analysis_id": "an_nao_observada"},
+                    "id": "call_wrong_analysis",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+    usage = PlannerUsage(request_id="req_planner_01")
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                request,
+                offered_tools=(get_analysis,),
+                request_id="req_planner_01",
+                usage=usage,
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_TOOL_ARGUMENTS
+    assert exc_info.value.usage == usage.model_copy(update={"selection_count": 1})
+    assert str(exc_info.value) == (
+        "planner protocol error: invalid_tool_arguments"
+    )
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("tool", "request_message", "arguments"),
+    [
+        (
+            get_knowledge_document,
+            "Consulte kb_permitido.",
+            {"document_id": "kb_nao_observado"},
+        ),
+        (
+            get_asset,
+            "Consulte o ativo central.",
+            {"asset_id": "asset_G999"},
+        ),
+        (
+            get_baseline,
+            "Consulte o ponto pt_permitido.",
+            {"asset_id": "asset_G501", "point_id": "pt_nao_observado"},
+        ),
+        (
+            next(
+                tool
+                for tool in WRITE_PROPOSAL_TOOLS
+                if tool.name == "propose_request_model_retraining"
+            ),
+            "Reavalie mdl_vib_v3.",
+            {"model_id": "mdl_substituto", "justification": "Drift confirmado."},
+        ),
+    ],
+    ids=["knowledge", "asset", "point", "hidden-model"],
+)
+def test_planner_rejects_untrusted_or_hidden_tool_targets(
+    tool,
+    request_message,
+    arguments,
+):
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": tool.name,
+                    "args": arguments,
+                    "id": "call_untrusted_target",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request().model_copy(update={"message": request_message}),
+                request_id="req_planner_01",
+                usage=PlannerUsage(request_id="req_planner_01"),
+                offered_tools=(tool,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_TOOL_ARGUMENTS
+    assert exc_info.value.usage == PlannerUsage(
+        request_id="req_planner_01",
+        selection_count=1,
+    )
+
+
 def test_select_planner_tools_offers_proposals_only_with_write_runtime():
     permissions = frozenset({"read", "action_low", "action_high", "escalate"})
     request = _request().model_copy(
@@ -497,11 +643,42 @@ def test_planner_rejects_duplicate_tool_names_before_calling_the_model(
         asyncio.run(
             Planner(model).ainvoke(
                 _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(request_id="req_planner_01"),
                 offered_tools=offered_tools,
             )
         )
 
     assert exc_info.value.code is PlannerErrorCode.DUPLICATE_TOOL_NAME
+    assert model._events == []
+
+
+def test_planner_requires_request_id_and_usage_before_calling_the_model():
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(TypeError):
+        Planner(model).ainvoke(
+            _request(),
+            offered_tools=(get_asset,),
+        )
+
+    assert model._events == []
+
+
+def test_planner_rejects_explicit_null_usage_before_calling_the_model():
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=None,  # type: ignore[arg-type]
+                offered_tools=(get_asset,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_USAGE
     assert model._events == []
 
 
@@ -523,6 +700,8 @@ def test_planner_selects_one_offered_tool_without_executing_it():
     result = asyncio.run(
         Planner(model).ainvoke(
             _request(),
+            request_id="req_planner_01",
+            usage=PlannerUsage(request_id="req_planner_01"),
             offered_tools=(get_asset,),
         )
     )
@@ -683,7 +862,7 @@ def test_planner_usage_is_json_safe_and_resets_for_a_new_request():
     assert continued.planner_usage == PlannerUsage(request_id="req_planner_02")
 
 
-def test_agent_state_binds_legacy_planner_history_to_the_checkpoint_request():
+def test_agent_state_keeps_legacy_planner_history_unattributed():
     legacy_calls, legacy_observations = _planner_history(1, request_id="req_legacy")
     legacy_wire = _state().model_dump(mode="json")
     legacy_wire.pop("planner_usage")
@@ -705,8 +884,21 @@ def test_agent_state_binds_legacy_planner_history_to_the_checkpoint_request():
     restored = AgentState.model_validate(legacy_wire)
 
     assert restored.planner_usage == PlannerUsage(request_id="req_planner_01")
-    assert restored.tool_calls[0].request_id == "req_planner_01"
-    assert restored.tool_observations[0].request_id == "req_planner_01"
+    assert restored.tool_calls[0].request_id is None
+    assert restored.tool_observations[0].request_id is None
+
+    continued = restored.continue_with(
+        request=_request().model_copy(update={"message": "Segunda solicitação."}),
+        identity=restored.identity,
+        permissions=restored.permissions,
+        request_id="req_planner_02",
+        execution_id="exec_planner_02",
+    )
+    reparsed = AgentState.model_validate_json(continued.model_dump_json())
+
+    assert reparsed.planner_usage == PlannerUsage(request_id="req_planner_02")
+    assert reparsed.tool_calls[0].request_id is None
+    assert reparsed.tool_observations[0].request_id is None
 
 
 def test_agent_state_rejects_current_planner_history_above_tool_budget():
@@ -771,8 +963,8 @@ def test_planner_tool_call_limit_boundaries(
             content="",
             tool_calls=[
                 {
-                    "name": "get_asset",
-                    "args": {"asset_id": "asset_G999"},
+                    "name": "list_asset_analyses",
+                    "args": {"asset_id": "asset_G501"},
                     "id": "call_tool_boundary",
                     "type": "tool_call",
                 }
@@ -783,7 +975,7 @@ def test_planner_tool_call_limit_boundaries(
         _request(),
         request_id="req_planner_01",
         usage=PlannerUsage(request_id="req_planner_01"),
-        offered_tools=(get_asset,),
+        offered_tools=(list_asset_analyses,),
         tool_calls=calls,
         tool_observations=observations,
     )
@@ -799,14 +991,36 @@ def test_planner_tool_call_limit_boundaries(
 
 
 def test_planner_rejects_canonical_repeat_but_allows_distinct_arguments():
-    calls, observations = _planner_history(1)
+    base_calls, base_observations = _planner_history(1)
+    calls = (
+        PersistedToolCall(
+            request_id=base_calls[0].request_id,
+            call_id=base_calls[0].call_id,
+            name="search_knowledge",
+            arguments={"query": "rolamento", "document_type": None},
+        ),
+    )
+    observations = (
+        ToolObservation(
+            request_id=base_observations[0].request_id,
+            call_id=base_observations[0].call_id,
+            content=base_observations[0].content,
+            artifact=base_observations[0].artifact.__class__.model_validate(
+                {
+                    **base_observations[0].artifact.model_dump(mode="python"),
+                    "tool_name": "search_knowledge",
+                    "arguments": {"query": "rolamento", "document_type": None},
+                }
+            ),
+        ),
+    )
     repeated_model = _RecordingPlannerModel(
         selector_response=AIMessage(
             content="",
             tool_calls=[
                 {
-                    "name": "get_asset",
-                    "args": {"asset_id": "asset_G500"},
+                    "name": "search_knowledge",
+                    "args": {"query": "rolamento"},
                     "id": "provider_changed_call_id",
                     "type": "tool_call",
                 }
@@ -820,7 +1034,7 @@ def test_planner_rejects_canonical_repeat_but_allows_distinct_arguments():
                 _request(),
                 request_id="req_planner_01",
                 usage=PlannerUsage(request_id="req_planner_01"),
-                offered_tools=(get_asset,),
+                offered_tools=(search_knowledge,),
                 tool_calls=calls,
                 tool_observations=observations,
             )
@@ -833,8 +1047,8 @@ def test_planner_rejects_canonical_repeat_but_allows_distinct_arguments():
             content="",
             tool_calls=[
                 {
-                    "name": "get_asset",
-                    "args": {"asset_id": "asset_G501"},
+                    "name": "search_knowledge",
+                    "args": {"query": "lubrificacao"},
                     "id": "call_distinct_arguments",
                     "type": "tool_call",
                 }
@@ -846,14 +1060,17 @@ def test_planner_rejects_canonical_repeat_but_allows_distinct_arguments():
             _request(),
             request_id="req_planner_01",
             usage=PlannerUsage(request_id="req_planner_01"),
-            offered_tools=(get_asset,),
+            offered_tools=(search_knowledge,),
             tool_calls=calls,
             tool_observations=observations,
         )
     )
 
     assert isinstance(distinct, PlannerToolTurn)
-    assert distinct.tool_call.arguments.to_python() == {"asset_id": "asset_G501"}
+    assert distinct.tool_call.arguments.to_python() == {
+        "query": "lubrificacao",
+        "document_type": None,
+    }
 
 
 def test_planner_rejects_provider_call_id_reused_with_distinct_arguments():
@@ -900,7 +1117,7 @@ def test_planner_excludes_other_request_history_from_prompt_and_fingerprint():
             tool_calls=[
                 {
                     "name": "get_asset",
-                    "args": {"asset_id": "asset_G500"},
+                    "args": {"asset_id": "asset_G501"},
                     "id": "call_current_same_arguments",
                     "type": "tool_call",
                 }
@@ -920,7 +1137,7 @@ def test_planner_excludes_other_request_history_from_prompt_and_fingerprint():
     )
 
     assert isinstance(result, PlannerToolTurn)
-    assert result.tool_call.arguments.to_python() == {"asset_id": "asset_G500"}
+    assert result.tool_call.arguments.to_python() == {"asset_id": "asset_G501"}
     sent_context = str(model._selection_messages)
     assert "req_old" not in sent_context
     assert "asset_G500" not in sent_context
@@ -935,8 +1152,8 @@ def test_planner_filters_interleaved_history_as_current_request_pairs():
             content="",
             tool_calls=[
                 {
-                    "name": "get_asset",
-                    "args": {"asset_id": "asset_G999"},
+                    "name": "list_asset_analyses",
+                    "args": {"asset_id": "asset_G501"},
                     "id": "call_after_interleaved_history",
                     "type": "tool_call",
                 }
@@ -952,7 +1169,7 @@ def test_planner_filters_interleaved_history_as_current_request_pairs():
                 request_id="req_planner_01",
                 selection_count=2,
             ),
-            offered_tools=(get_asset,),
+            offered_tools=(list_asset_analyses,),
             tool_calls=(
                 old_calls[0],
                 current_calls[0],
@@ -1115,6 +1332,54 @@ def test_planner_context_limit_is_exactly_48000_characters():
     assert above_model._events == []
 
 
+@pytest.mark.parametrize("terminal_characters", [47_999, 48_000, 48_001])
+def test_planner_recalculates_exact_context_for_terminal_schema(
+    terminal_characters,
+):
+    terminal = PlannerTerminalDecision(
+        decision=PlannerDecisionKind.GUIDE,
+        stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+    )
+
+    def invoke(message: str):
+        model = _RecordingPlannerModel(
+            selector_response=AIMessage(content=""),
+            terminal_response=terminal,
+        )
+        request = _request().model_copy(update={"message": message})
+        try:
+            result = asyncio.run(
+                Planner(model).ainvoke(
+                    request,
+                    request_id="req_terminal_context",
+                    usage=PlannerUsage(request_id="req_terminal_context"),
+                    offered_tools=(get_asset,),
+                )
+            )
+        except PlannerProtocolError as error:
+            return error, model
+        return result, model
+
+    baseline, _ = invoke("x")
+    assert isinstance(baseline, PlannerDecisionTurn)
+    assert baseline.context is not None
+    terminal_fixed = baseline.context.characters - 1
+    result, model = invoke("x" * (terminal_characters - terminal_fixed))
+
+    if terminal_characters <= 48_000:
+        assert isinstance(result, PlannerDecisionTurn)
+        assert result.context is not None
+        assert result.context.characters == terminal_characters
+    else:
+        assert isinstance(result, PlannerProtocolError)
+        assert result.code is PlannerErrorCode.CONTEXT_LIMIT_EXCEEDED
+        assert result.usage == PlannerUsage(
+            request_id="req_terminal_context",
+            selection_count=1,
+        )
+        assert model._events == ["bind_tools", "selection_request"]
+
+
 def test_planner_context_counts_the_bound_tool_wire_before_model():
     oversized_tool = get_asset.model_copy(update={"description": "x" * 48_000})
     model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
@@ -1162,8 +1427,8 @@ def test_planner_omits_old_interactions_whole_and_keeps_latest_degraded_error():
             content="",
             tool_calls=[
                 {
-                    "name": "get_asset",
-                    "args": {"asset_id": "asset_G999"},
+                    "name": "list_asset_analyses",
+                    "args": {"asset_id": "asset_G501"},
                     "id": "call_after_degraded",
                     "type": "tool_call",
                 }
@@ -1179,7 +1444,7 @@ def test_planner_omits_old_interactions_whole_and_keeps_latest_degraded_error():
                 request_id="req_planner_01",
                 selection_count=2,
             ),
-            offered_tools=(get_asset,),
+            offered_tools=(list_asset_analyses,),
             tool_calls=calls,
             tool_observations=observations,
         )
@@ -1249,6 +1514,8 @@ def test_planner_discards_selector_text_and_uses_a_separate_terminal_request():
     result = asyncio.run(
         Planner(model).ainvoke(
             _request(),
+            request_id="req_planner_01",
+            usage=PlannerUsage(request_id="req_planner_01"),
             offered_tools=(get_asset,),
         )
     )
@@ -1425,6 +1692,8 @@ def test_planner_fails_closed_for_unsafe_tool_selections(
         asyncio.run(
             Planner(model).ainvoke(
                 _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(request_id="req_planner_01"),
                 offered_tools=(get_asset,),
             )
         )
@@ -1447,6 +1716,8 @@ def test_planner_fails_closed_for_invalid_terminal_output():
         asyncio.run(
             Planner(model).ainvoke(
                 _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(request_id="req_planner_01"),
                 offered_tools=(get_asset,),
             )
         )
@@ -1527,6 +1798,8 @@ def test_planner_protocol_errors_discard_sensitive_validation_failures(
         asyncio.run(
             Planner(model).ainvoke(
                 _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(request_id="req_planner_01"),
                 offered_tools=(get_asset,),
             )
         )
@@ -1555,11 +1828,13 @@ def test_planner_protocol_errors_discard_sensitive_validation_failures(
 
 def test_planner_uses_only_persisted_next_turn_content_after_a_tool_call():
     call = PersistedToolCall(
+        request_id="req_planner_01",
         call_id="call_get_asset_01",
         name="get_asset",
         arguments={"asset_id": "asset_G501"},
     )
     observation = ToolObservation(
+        request_id="req_planner_01",
         call_id=call.call_id,
         content={"id": "asset_G501", "sensor_status": "online"},
         artifact=ToolArtifact(
@@ -1586,6 +1861,8 @@ def test_planner_uses_only_persisted_next_turn_content_after_a_tool_call():
     result = asyncio.run(
         Planner(model).ainvoke(
             _request(),
+            request_id="req_planner_01",
+            usage=PlannerUsage(request_id="req_planner_01"),
             offered_tools=(get_asset,),
             tool_calls=(call,),
             tool_observations=(observation,),
@@ -1603,7 +1880,9 @@ def test_planner_uses_only_persisted_next_turn_content_after_a_tool_call():
     assert model._terminal_messages == model._selection_messages
 
 
-def test_planner_tool_cycle_survives_sqlite_close_and_reopen(tmp_path: Path):
+def test_legacy_and_two_request_planner_state_survives_sqlite_reopen(
+    tmp_path: Path,
+):
     checkpoint_path = tmp_path / "planner-cycle.sqlite3"
     request = _request()
     call = PersistedToolCall(
@@ -1628,6 +1907,12 @@ def test_planner_tool_cycle_survives_sqlite_close_and_reopen(tmp_path: Path):
             ),
         ),
     )
+    legacy_call = call.model_copy(
+        update={"request_id": None, "call_id": "call_legacy_unattributed"}
+    )
+    legacy_observation = observation.model_copy(
+        update={"request_id": None, "call_id": legacy_call.call_id}
+    )
     state = AgentState(
         request=request,
         identity=TrustedIdentity(
@@ -1644,13 +1929,20 @@ def test_planner_tool_cycle_survives_sqlite_close_and_reopen(tmp_path: Path):
             company_id=request.identity.company_id,
             user_id=request.identity.user_id,
         ),
-        tool_calls=(call,),
-        tool_observations=(observation,),
+        tool_calls=(call, legacy_call),
+        tool_observations=(observation, legacy_observation),
         planner_usage=PlannerUsage(
             request_id="req_planner_01",
             selection_count=1,
         ),
         step_limit=3,
+    )
+    state = state.continue_with(
+        request=request.model_copy(update={"message": "Segunda solicitação."}),
+        identity=state.identity,
+        permissions=state.permissions,
+        request_id="req_planner_02",
+        execution_id="exec_planner_02",
     )
     serialized_state = state.model_dump(mode="json")
     json.dumps(serialized_state, allow_nan=False)
@@ -1688,8 +1980,13 @@ def test_planner_tool_cycle_survives_sqlite_close_and_reopen(tmp_path: Path):
     restored_state = AgentState.model_validate(
         restored_checkpoint["channel_values"]["agent_state"]
     )
-    assert restored_state.tool_calls == (call,)
-    assert restored_state.tool_observations == (observation,)
+    assert restored_state.request_id == "req_planner_02"
+    assert restored_state.tool_calls == (call, legacy_call)
+    assert restored_state.tool_observations == (observation, legacy_observation)
+    assert tuple(item.request_id for item in restored_state.tool_calls) == (
+        "req_planner_01",
+        None,
+    )
     assert restored_state.planner_usage == state.planner_usage
     assert restored_state.tool_observations[0].content is not None
     assert restored_state.tool_observations[0].content.to_python() == {

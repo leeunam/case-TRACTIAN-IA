@@ -491,7 +491,7 @@ class AgentState(FrozenStateModel):
     @model_validator(mode="before")
     @classmethod
     def _restore_request_bound_planner_state(cls, value: object) -> object:
-        """Vincula o wire legado do planner à solicitação do checkpoint."""
+        """Inicializa uso legado sem inventar proveniência para o histórico."""
         if isinstance(value, Mapping) and isinstance(value.get("request_id"), str):
             request_id = value["request_id"]
             restored = dict(value)
@@ -501,33 +501,6 @@ class AgentState(FrozenStateModel):
                     "selection_count": 0,
                     "finalization_count": 0,
                 }
-
-            def bind_legacy_items(field_name: str) -> None:
-                items = value.get(field_name)
-                if not isinstance(items, (list, tuple)):
-                    return
-                bound: list[object] = []
-                for item in items:
-                    if isinstance(item, Mapping) and item.get("request_id") is None:
-                        bound.append({**item, "request_id": request_id})
-                    elif isinstance(item, ToolCall):
-                        bound.append(
-                            {
-                                **item.model_dump(mode="python"),
-                                "request_id": request_id,
-                            }
-                        )
-                    elif (
-                        isinstance(item, (PersistedToolCall, ToolObservation))
-                        and item.request_id is None
-                    ):
-                        bound.append(item.model_copy(update={"request_id": request_id}))
-                    else:
-                        bound.append(item)
-                restored[field_name] = bound
-
-            bind_legacy_items("tool_calls")
-            bind_legacy_items("tool_observations")
             return restored
         return value
 

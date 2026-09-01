@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from enum import Enum
 import json
 import re
@@ -41,6 +42,7 @@ from tractian_agent.tools.identifiers import (
     AnalysisId,
     KnowledgeDocumentId,
     ModelId,
+    PointId,
 )
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 
@@ -78,6 +80,7 @@ PLANNER_LIMITS: Final = PlannerLimits()
 _ANALYSIS_ID_ADAPTER: Final = TypeAdapter(AnalysisId)
 _KNOWLEDGE_ID_ADAPTER: Final = TypeAdapter(KnowledgeDocumentId)
 _MODEL_ID_ADAPTER: Final = TypeAdapter(ModelId)
+_POINT_ID_ADAPTER: Final = TypeAdapter(PointId)
 _ANALYSIS_ID_PATTERN: Final = re.compile(
     r"(?<![A-Za-z0-9_-])an_[A-Za-z0-9_-]{1,64}(?![A-Za-z0-9_-])"
 )
@@ -86,6 +89,9 @@ _KNOWLEDGE_ID_PATTERN: Final = re.compile(
 )
 _MODEL_ID_PATTERN: Final = re.compile(
     r"(?<![A-Za-z0-9_-])mdl_[A-Za-z0-9_-]{1,64}(?![A-Za-z0-9_-])"
+)
+_POINT_ID_PATTERN: Final = re.compile(
+    r"(?<![A-Za-z0-9_-])pt_[A-Za-z0-9_-]{1,64}(?![A-Za-z0-9_-])"
 )
 _ASSET_ARGUMENT_TOOL_NAMES: Final = frozenset(
     {
@@ -97,22 +103,16 @@ _ASSET_ARGUMENT_TOOL_NAMES: Final = frozenset(
         "get_data_quality",
     }
 )
-
-
-def _contains_typed_id(
-    texts: Sequence[str],
-    *,
-    pattern: re.Pattern[str],
-    adapter: TypeAdapter[str],
-) -> bool:
-    for text in texts:
-        for candidate in pattern.findall(text):
-            try:
-                adapter.validate_python(candidate, strict=True)
-            except ValidationError:
-                continue
-            return True
-    return False
+_POINT_ARGUMENT_TOOL_NAMES: Final = frozenset(
+    {"get_baseline", "get_rms_series", "get_spectrum", "get_data_quality"}
+)
+_ANALYSIS_ARGUMENT_TOOL_NAMES: Final = frozenset(
+    {
+        "get_analysis",
+        "propose_reprocess_analysis",
+        "propose_request_specialist_analysis",
+    }
+)
 
 
 def _typed_ids(
@@ -131,27 +131,206 @@ def _typed_ids(
     return frozenset(validated)
 
 
-def _json_strings(value: object) -> tuple[str, ...]:
-    if isinstance(value, str):
-        return (value,)
-    if isinstance(value, Mapping):
-        return tuple(
-            text
-            for nested in value.values()
-            for text in _json_strings(nested)
+@dataclass(frozen=True)
+class _PlannerAuthorizedTargets:
+    analysis_ids: frozenset[str]
+    knowledge_document_ids: frozenset[str]
+    model_ids: frozenset[str]
+    point_ids: frozenset[str]
+
+
+def _validated_id(value: object, adapter: TypeAdapter[str]) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return adapter.validate_python(value, strict=True)
+    except ValidationError:
+        return None
+
+
+def _ids_from_rows(
+    value: object,
+    field_name: str,
+    adapter: TypeAdapter[str],
+) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    validated: set[str] = set()
+    for row in value:
+        if not isinstance(row, Mapping):
+            continue
+        candidate = _validated_id(row.get(field_name), adapter)
+        if candidate is not None:
+            validated.add(candidate)
+    return validated
+
+
+def _structured_observation_ids(
+    call: PersistedToolCall,
+    observation: ToolObservation,
+) -> _PlannerAuthorizedTargets:
+    content = (
+        observation.content.to_python()
+        if observation.content is not None
+        else None
+    )
+    if not isinstance(content, Mapping):
+        return _PlannerAuthorizedTargets(
+            analysis_ids=frozenset(),
+            knowledge_document_ids=frozenset(),
+            model_ids=frozenset(),
+            point_ids=frozenset(),
         )
-    if isinstance(value, list):
-        return tuple(text for nested in value for text in _json_strings(nested))
-    return ()
+
+    analysis_ids: set[str] = set()
+    knowledge_document_ids: set[str] = set()
+    model_ids: set[str] = set()
+    point_ids: set[str] = set()
+    if call.name == "get_asset":
+        point_ids.update(
+            _ids_from_rows(content.get("points"), "id", _POINT_ID_ADAPTER)
+        )
+    elif call.name == "list_asset_analyses":
+        analyses = content.get("analyses")
+        analysis_ids.update(_ids_from_rows(analyses, "id", _ANALYSIS_ID_ADAPTER))
+        point_ids.update(_ids_from_rows(analyses, "point_id", _POINT_ID_ADAPTER))
+    elif call.name == "get_analysis":
+        analysis_id = _validated_id(content.get("id"), _ANALYSIS_ID_ADAPTER)
+        point_id = _validated_id(content.get("point_id"), _POINT_ID_ADAPTER)
+        if analysis_id is not None:
+            analysis_ids.add(analysis_id)
+        if point_id is not None:
+            point_ids.add(point_id)
+    elif call.name == "search_knowledge":
+        knowledge_document_ids.update(
+            _ids_from_rows(
+                content.get("results"),
+                "id",
+                _KNOWLEDGE_ID_ADAPTER,
+            )
+        )
+    elif call.name == "get_knowledge_document":
+        document = content.get("document")
+        source = document if isinstance(document, Mapping) else content
+        document_id = _validated_id(source.get("id"), _KNOWLEDGE_ID_ADAPTER)
+        if document_id is not None:
+            knowledge_document_ids.add(document_id)
+    elif call.name == "get_model":
+        model = content.get("model")
+        source = model if isinstance(model, Mapping) else content
+        model_id = _validated_id(source.get("id"), _MODEL_ID_ADAPTER)
+        if model_id is not None:
+            model_ids.add(model_id)
+    elif call.name in _ASSET_ARGUMENT_TOOL_NAMES:
+        point_id = _validated_id(content.get("point_id"), _POINT_ID_ADAPTER)
+        if point_id is None and isinstance(content.get("partial_data"), Mapping):
+            point_id = _validated_id(
+                content["partial_data"].get("point_id"),
+                _POINT_ID_ADAPTER,
+            )
+        if point_id is not None:
+            point_ids.add(point_id)
+    return _PlannerAuthorizedTargets(
+        analysis_ids=frozenset(analysis_ids),
+        knowledge_document_ids=frozenset(knowledge_document_ids),
+        model_ids=frozenset(model_ids),
+        point_ids=frozenset(point_ids),
+    )
 
 
-def _current_request_observation_texts(state: AgentState) -> tuple[str, ...]:
+def _authorized_targets(
+    request_message: str,
+    interactions: Sequence[tuple[PersistedToolCall, ToolObservation]],
+) -> _PlannerAuthorizedTargets:
+    analysis_ids = set(
+        _typed_ids(
+            (request_message,),
+            pattern=_ANALYSIS_ID_PATTERN,
+            adapter=_ANALYSIS_ID_ADAPTER,
+        )
+    )
+    knowledge_document_ids = set(
+        _typed_ids(
+            (request_message,),
+            pattern=_KNOWLEDGE_ID_PATTERN,
+            adapter=_KNOWLEDGE_ID_ADAPTER,
+        )
+    )
+    model_ids = set(
+        _typed_ids(
+            (request_message,),
+            pattern=_MODEL_ID_PATTERN,
+            adapter=_MODEL_ID_ADAPTER,
+        )
+    )
+    point_ids = set(
+        _typed_ids(
+            (request_message,),
+            pattern=_POINT_ID_PATTERN,
+            adapter=_POINT_ID_ADAPTER,
+        )
+    )
+    for call, observation in interactions:
+        observed = _structured_observation_ids(call, observation)
+        analysis_ids.update(observed.analysis_ids)
+        knowledge_document_ids.update(observed.knowledge_document_ids)
+        model_ids.update(observed.model_ids)
+        point_ids.update(observed.point_ids)
+    return _PlannerAuthorizedTargets(
+        analysis_ids=frozenset(analysis_ids),
+        knowledge_document_ids=frozenset(knowledge_document_ids),
+        model_ids=frozenset(model_ids),
+        point_ids=frozenset(point_ids),
+    )
+
+
+def _selected_targets_are_authorized(
+    *,
+    tool_name: str,
+    arguments: Mapping[str, object],
+    request: SupportRequest | PersistedSupportRequest,
+    authorized: _PlannerAuthorizedTargets,
+) -> bool:
+    if tool_name in _ANALYSIS_ARGUMENT_TOOL_NAMES:
+        if arguments.get("analysis_id") not in authorized.analysis_ids:
+            return False
+    if tool_name == "get_knowledge_document":
+        if arguments.get("document_id") not in authorized.knowledge_document_ids:
+            return False
+    if tool_name in _ASSET_ARGUMENT_TOOL_NAMES:
+        if (
+            request.asset_id is None
+            or arguments.get("asset_id") != request.asset_id
+        ):
+            return False
+    if tool_name in _POINT_ARGUMENT_TOOL_NAMES:
+        point_id = arguments.get("point_id")
+        if point_id is not None and point_id not in authorized.point_ids:
+            return False
+    return True
+
+
+def _interaction_scope_matches_request(
+    call: PersistedToolCall,
+    request: SupportRequest | PersistedSupportRequest,
+) -> bool:
+    if call.name not in _ASSET_ARGUMENT_TOOL_NAMES:
+        return True
+    return (
+        request.asset_id is not None
+        and call.arguments.to_python().get("asset_id") == request.asset_id
+    )
+
+
+def _current_request_interactions(
+    state: AgentState,
+) -> tuple[tuple[PersistedToolCall, ToolObservation], ...]:
     calls_by_id = {
         call.call_id: call
         for call in state.tool_calls
         if call.request_id == state.request_id
     }
-    texts: list[str] = []
+    interactions: list[tuple[PersistedToolCall, ToolObservation]] = []
     for observation in state.tool_observations:
         call = calls_by_id.get(observation.call_id)
         if (
@@ -160,10 +339,11 @@ def _current_request_observation_texts(state: AgentState) -> tuple[str, ...]:
             or observation.content is None
             or observation.artifact.tool_name != call.name
             or observation.artifact.arguments != call.arguments
+            or not _interaction_scope_matches_request(call, state.request)
         ):
             continue
-        texts.extend(_json_strings(observation.content.to_python()))
-    return tuple(texts)
+        interactions.append((call, observation))
+    return tuple(interactions)
 
 
 def select_planner_tools(
@@ -185,19 +365,9 @@ def select_planner_tools(
     )
     if not runtime_scope_matches:
         raise PlannerProtocolError(PlannerErrorCode.RUNTIME_SCOPE_MISMATCH)
-    observable_texts = (
+    authorized = _authorized_targets(
         state.request.message,
-        *_current_request_observation_texts(state),
-    )
-    has_analysis_id = _contains_typed_id(
-        observable_texts,
-        pattern=_ANALYSIS_ID_PATTERN,
-        adapter=_ANALYSIS_ID_ADAPTER,
-    )
-    has_knowledge_id = _contains_typed_id(
-        observable_texts,
-        pattern=_KNOWLEDGE_ID_PATTERN,
-        adapter=_KNOWLEDGE_ID_ADAPTER,
+        _current_request_interactions(state),
     )
     has_scoped_asset = (
         state.request.asset_id is not None
@@ -209,26 +379,24 @@ def select_planner_tools(
             tool
             for tool in READ_TOOLS
             if (tool.name not in _ASSET_ARGUMENT_TOOL_NAMES or has_scoped_asset)
-            and (tool.name != "get_analysis" or has_analysis_id)
-            and (tool.name != "get_knowledge_document" or has_knowledge_id)
+            and (tool.name != "get_analysis" or authorized.analysis_ids)
+            and (
+                tool.name != "get_knowledge_document"
+                or authorized.knowledge_document_ids
+            )
         )
     if not isinstance(runtime, WriteToolRuntime):
         return offered_reads
 
-    observed_model_ids = _typed_ids(
-        observable_texts,
-        pattern=_MODEL_ID_PATTERN,
-        adapter=_MODEL_ID_ADAPTER,
-    )
     has_scoped_case = state.request.case_id == runtime.current_case_id
     proposal_requirements = {
         "propose_reprocess_analysis": (
             "action_low",
-            has_analysis_id,
+            bool(authorized.analysis_ids),
         ),
         "propose_request_specialist_analysis": (
             "action_low",
-            has_analysis_id,
+            bool(authorized.analysis_ids),
         ),
         "propose_update_asset_criticality": (
             "action_high",
@@ -236,7 +404,7 @@ def select_planner_tools(
         ),
         "propose_request_model_retraining": (
             "action_high",
-            runtime.configured_model_id in observed_model_ids,
+            runtime.configured_model_id in authorized.model_ids,
         ),
         "propose_escalate_case": (
             "escalate",
@@ -272,7 +440,7 @@ class PlannerToolTurn(StrictModel):
 
     kind: Literal["tool_call"] = "tool_call"
     tool_call: PersistedToolCall
-    usage: PlannerUsage | None = None
+    usage: PlannerUsage
     context: PlannerContextStats | None = None
 
 
@@ -340,10 +508,12 @@ def _context_character_count(
 def _build_planner_context(
     request_content: str,
     interactions: Sequence[tuple[AIMessage, ToolMessage, bool]],
-    tools: Sequence[BaseTool],
+    schemas: Sequence[BaseTool | type[StrictModel]],
+    *,
+    usage: PlannerUsage,
 ) -> tuple[list[BaseMessage], PlannerContextStats]:
     interaction_count = len(interactions)
-    tool_wire = tuple(convert_to_openai_tool(tool) for tool in tools)
+    tool_wire = tuple(convert_to_openai_tool(schema) for schema in schemas)
     for omitted in range(interaction_count + 1):
         if any(interaction[2] for interaction in interactions[:omitted]):
             break
@@ -367,7 +537,10 @@ def _build_planner_context(
                 characters=characters,
                 omitted_interactions=omitted,
             )
-    raise PlannerProtocolError(PlannerErrorCode.CONTEXT_LIMIT_EXCEEDED)
+    raise PlannerProtocolError(
+        PlannerErrorCode.CONTEXT_LIMIT_EXCEEDED,
+        usage=usage,
+    )
 
 
 class PlannerTerminalDecision(StrictModel):
@@ -419,7 +592,7 @@ class PlannerDecisionTurn(StrictModel):
 
     kind: Literal["decision"] = "decision"
     decision: PlannerTerminalDecision
-    usage: PlannerUsage | None = None
+    usage: PlannerUsage
     context: PlannerContextStats | None = None
 
 
@@ -434,36 +607,48 @@ class Planner:
         request: SupportRequest | PersistedSupportRequest,
         *,
         offered_tools: Sequence[BaseTool],
-        request_id: str | None = None,
-        usage: PlannerUsage | None = None,
+        request_id: str,
+        usage: PlannerUsage,
         tool_calls: Sequence[PersistedToolCall] = (),
         tool_observations: Sequence[ToolObservation] = (),
     ) -> PlannerToolTurn | PlannerDecisionTurn:
         active_usage = usage
-        if active_usage is not None and active_usage.request_id != request_id:
-            raise PlannerProtocolError(PlannerErrorCode.INVALID_USAGE)
         if (
-            active_usage is not None
-            and (
-                active_usage.selection_count > PLANNER_LIMITS.selections
-                or active_usage.finalization_count > PLANNER_LIMITS.finalizations
+            not isinstance(request_id, str)
+            or not request_id
+            or not isinstance(active_usage, PlannerUsage)
+        ):
+            raise PlannerProtocolError(PlannerErrorCode.INVALID_USAGE)
+        if active_usage.request_id != request_id:
+            raise PlannerProtocolError(
+                PlannerErrorCode.INVALID_USAGE,
+                usage=active_usage,
             )
-        ):
-            raise PlannerProtocolError(PlannerErrorCode.INVALID_USAGE)
         if (
-            active_usage is not None
-            and active_usage.finalization_count == PLANNER_LIMITS.finalizations
+            active_usage.selection_count > PLANNER_LIMITS.selections
+            or active_usage.finalization_count > PLANNER_LIMITS.finalizations
         ):
-            raise PlannerProtocolError(PlannerErrorCode.FINALIZATION_LIMIT_EXCEEDED)
-        if (
-            active_usage is not None
-            and active_usage.selection_count == PLANNER_LIMITS.selections
-        ):
-            raise PlannerProtocolError(PlannerErrorCode.SELECTION_LIMIT_EXCEEDED)
+            raise PlannerProtocolError(
+                PlannerErrorCode.INVALID_USAGE,
+                usage=active_usage,
+            )
+        if active_usage.finalization_count == PLANNER_LIMITS.finalizations:
+            raise PlannerProtocolError(
+                PlannerErrorCode.FINALIZATION_LIMIT_EXCEEDED,
+                usage=active_usage,
+            )
+        if active_usage.selection_count == PLANNER_LIMITS.selections:
+            raise PlannerProtocolError(
+                PlannerErrorCode.SELECTION_LIMIT_EXCEEDED,
+                usage=active_usage,
+            )
         tools = tuple(offered_tools)
         tool_names = tuple(tool.name for tool in tools)
         if len(tool_names) != len(set(tool_names)):
-            raise PlannerProtocolError(PlannerErrorCode.DUPLICATE_TOOL_NAME)
+            raise PlannerProtocolError(
+                PlannerErrorCode.DUPLICATE_TOOL_NAME,
+                usage=active_usage,
+            )
         tools_by_name = {tool.name: tool for tool in tools}
         request_content = json.dumps(
             {
@@ -486,19 +671,34 @@ class Planner:
             if observation.request_id == request_id
         )
         if len(calls) != len(observations):
-            raise PlannerProtocolError(PlannerErrorCode.INVALID_HISTORY)
+            raise PlannerProtocolError(
+                PlannerErrorCode.INVALID_HISTORY,
+                usage=active_usage,
+            )
         call_ids = tuple(call.call_id for call in calls)
         observation_ids = tuple(observation.call_id for observation in observations)
         if (
             len(call_ids) != len(set(call_ids))
             or len(observation_ids) != len(set(observation_ids))
         ):
-            raise PlannerProtocolError(PlannerErrorCode.INVALID_HISTORY)
+            raise PlannerProtocolError(
+                PlannerErrorCode.INVALID_HISTORY,
+                usage=active_usage,
+            )
         if len(calls) > PLANNER_LIMITS.tool_calls:
-            raise PlannerProtocolError(PlannerErrorCode.INVALID_HISTORY)
+            raise PlannerProtocolError(
+                PlannerErrorCode.INVALID_HISTORY,
+                usage=active_usage,
+            )
         if len(calls) == PLANNER_LIMITS.tool_calls:
-            raise PlannerProtocolError(PlannerErrorCode.TOOL_CALL_LIMIT_EXCEEDED)
+            raise PlannerProtocolError(
+                PlannerErrorCode.TOOL_CALL_LIMIT_EXCEEDED,
+                usage=active_usage,
+            )
         interactions: list[tuple[AIMessage, ToolMessage, bool]] = []
+        authorized_interactions: list[
+            tuple[PersistedToolCall, ToolObservation]
+        ] = []
         for index, (call, observation) in enumerate(
             zip(calls, observations, strict=True)
         ):
@@ -508,7 +708,12 @@ class Planner:
                 or observation.artifact.tool_name != call.name
                 or observation.artifact.arguments != call.arguments
             ):
-                raise PlannerProtocolError(PlannerErrorCode.INVALID_HISTORY)
+                raise PlannerProtocolError(
+                    PlannerErrorCode.INVALID_HISTORY,
+                    usage=active_usage,
+                )
+            if _interaction_scope_matches_request(call, request):
+                authorized_interactions.append((call, observation))
             interactions.append(
                 (
                     AIMessage(
@@ -537,20 +742,21 @@ class Planner:
                     ),
                 )
             )
+        authorized_targets = _authorized_targets(
+            request.message,
+            authorized_interactions,
+        )
         messages, context_stats = _build_planner_context(
             request_content,
             interactions,
             tools,
+            usage=active_usage,
         )
         selection = await self._model.bind_tools(tools).ainvoke(messages)
-        selection_usage = (
-            None
-            if active_usage is None
-            else PlannerUsage(
-                request_id=active_usage.request_id,
-                selection_count=active_usage.selection_count + 1,
-                finalization_count=active_usage.finalization_count,
-            )
+        selection_usage = PlannerUsage(
+            request_id=active_usage.request_id,
+            selection_count=active_usage.selection_count + 1,
+            finalization_count=active_usage.finalization_count,
         )
         if not isinstance(selection, AIMessage):
             raise PlannerProtocolError(
@@ -563,21 +769,23 @@ class Planner:
                 usage=selection_usage,
             )
         if not selection.tool_calls:
-            final_usage = (
-                None
-                if selection_usage is None
-                else PlannerUsage(
-                    request_id=selection_usage.request_id,
-                    selection_count=selection_usage.selection_count,
-                    finalization_count=selection_usage.finalization_count + 1,
-                )
+            terminal_messages, terminal_context_stats = _build_planner_context(
+                request_content,
+                interactions,
+                (PlannerTerminalDecision,),
+                usage=selection_usage,
+            )
+            final_usage = PlannerUsage(
+                request_id=selection_usage.request_id,
+                selection_count=selection_usage.selection_count,
+                finalization_count=selection_usage.finalization_count + 1,
             )
             terminal_decision: PlannerTerminalDecision | None = None
             try:
                 terminal_output = await self._model.with_structured_output(
                     PlannerTerminalDecision,
                     include_raw=False,
-                ).ainvoke(messages)
+                ).ainvoke(terminal_messages)
                 terminal_decision = PlannerTerminalDecision.model_validate(
                     terminal_output
                 )
@@ -591,7 +799,7 @@ class Planner:
             return PlannerDecisionTurn(
                 decision=terminal_decision,
                 usage=final_usage,
-                context=context_stats,
+                context=terminal_context_stats,
             )
         if len(selection.tool_calls) != 1:
             raise PlannerProtocolError(
@@ -615,16 +823,23 @@ class Planner:
             validated_arguments = selected_tool.tool_call_schema.model_validate(
                 selected_call["args"]
             )
-            tool_turn = PlannerToolTurn(
-                tool_call=PersistedToolCall(
-                    request_id=request_id,
-                    call_id=selected_call["id"],
-                    name=selected_call["name"],
-                    arguments=validated_arguments.model_dump(mode="json"),
-                ),
-                usage=selection_usage,
-                context=context_stats,
-            )
+            arguments = validated_arguments.model_dump(mode="json")
+            if _selected_targets_are_authorized(
+                tool_name=selected_call["name"],
+                arguments=arguments,
+                request=request,
+                authorized=authorized_targets,
+            ):
+                tool_turn = PlannerToolTurn(
+                    tool_call=PersistedToolCall(
+                        request_id=request_id,
+                        call_id=selected_call["id"],
+                        name=selected_call["name"],
+                        arguments=arguments,
+                    ),
+                    usage=selection_usage,
+                    context=context_stats,
+                )
         except (TypeError, ValueError, ValidationError):
             pass
         if tool_turn is None:
