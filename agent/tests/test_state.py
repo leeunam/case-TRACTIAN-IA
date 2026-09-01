@@ -698,6 +698,68 @@ def test_agent_state_round_trips_real_json_with_receipt_error_and_offset():
     assert restored.intents[0].expires_at.utcoffset() == timedelta(hours=-3)
 
 
+def test_tool_observation_round_trips_json_safe_next_turn_content():
+    observation = ToolObservation(
+        call_id="call_01",
+        content={
+            "analysis_id": "an_9906",
+            "status": "current",
+            "limitations": ["Sinal disponível somente até 10:00."],
+        },
+        artifact=ToolArtifact(
+            tool_name="get_analysis",
+            arguments={"analysis_id": "an_9906"},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/analyses/an_9906",
+            ),
+            outcome=ToolOutcome(partial_data={"status": "current"}),
+        ),
+    )
+
+    restored = ToolObservation.model_validate_json(observation.model_dump_json())
+
+    assert restored == observation
+    assert restored.content is not None
+    assert restored.content.to_python() == {
+        "analysis_id": "an_9906",
+        "limitations": ["Sinal disponível somente até 10:00."],
+        "status": "current",
+    }
+
+    api_error = ApiError(
+        category=ApiErrorCategory.TIMEOUT,
+        code="READ_TIMEOUT",
+        message="A consulta excedeu o tempo limite.",
+    )
+    failed_observation = ToolObservation(
+        call_id="call_timeout",
+        content={"error": api_error.model_dump(mode="json")},
+        artifact=ToolArtifact(
+            tool_name="get_analysis",
+            arguments={"analysis_id": "an_9906"},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/analyses/an_9906",
+            ),
+            outcome=ToolOutcome(error=api_error),
+        ),
+    )
+    restored_failure = ToolObservation.model_validate_json(
+        failed_observation.model_dump_json()
+    )
+
+    assert restored_failure == failed_observation
+    assert isinstance(restored_failure.artifact.outcome.error, PersistedApiError)
+
+    with pytest.raises(ValidationError):
+        ToolObservation(
+            call_id="call_unsafe",
+            content={"raw_http_response": {"token": "must-not-persist"}},
+            artifact=observation.artifact,
+        )
+
+
 @pytest.mark.parametrize(
     "forbidden_name",
     [

@@ -246,6 +246,12 @@ class JsonSnapshot(FrozenStateModel):
 def _snapshot_domain_value(value: object, validation_mode: str) -> object:
     if isinstance(value, JsonSnapshot):
         return value.to_python()
+    if (
+        isinstance(value, Mapping)
+        and set(value) == {"encoded"}
+        and isinstance(value["encoded"], str)
+    ):
+        return JsonSnapshot.model_validate(value).to_python()
     if validation_mode == "json":
         return JsonSnapshot.model_validate(value).to_python()
     return value
@@ -400,7 +406,24 @@ class PersistedMessage(FrozenStateModel):
 
 class ToolObservation(FrozenStateModel):
     call_id: str = Field(min_length=1, pattern=r"^\S+$")
+    content: JsonSnapshot | None = None
     artifact: PersistedToolArtifact
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _snapshot_next_turn_content(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> JsonSnapshot | None:
+        if value is None:
+            return None
+        return JsonSnapshot.capture(
+            _snapshot_domain_value(value, info.mode),
+            forbidden_names=_TECHNICAL_FORBIDDEN_NAMES,
+            forbidden_segments=_TECHNICAL_FORBIDDEN_SEGMENTS,
+            forbidden_segment_patterns=_TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS,
+        )
 
 
 class StateEvidence(FrozenStateModel):

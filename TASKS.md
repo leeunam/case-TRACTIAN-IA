@@ -619,6 +619,20 @@ terminal aceita somente `guide`, `request_information` ou
 curta quando aplicável. `act`, `escalate` e `request_confirmation` continuam
 exclusivos da política determinística após uma proposal tool.
 
+**Decisões implementadas nesta fatia:** o prompt `planner-v1` e a classe
+`Planner` permanecem isolados do grafo. A seleção usa somente `bind_tools` com
+o catálogo recebido pelo chamador, valida no máximo uma chamada pelo schema
+público da tool e falha fechada para nome, argumentos ou forma inválidos. A
+ausência de chamada descarta o texto do seletor e inicia outra requisição no
+modelo original com `with_structured_output(PlannerTerminalDecision)`. A
+decisão terminal não contém resposta do writer; seu motivo é coerente com a
+decisão e `missing_information` é limitado a 300 caracteres e existe somente
+para `request_information`. `ToolObservation.content` guarda o JSON entregue
+ao próximo turno sem expor o artifact técnico, e o wire de `JsonSnapshot` é
+restaurável após fechar e reabrir o checkpointer SQLite. Nenhum `BaseChatModel`,
+`AIMessage`, runtime, segredo, resposta HTTP bruta ou texto livre do seletor
+entra no estado.
+
 **Arquivos:** criar `agent/src/tractian_agent/planner.py` e testes focados;
 evoluir `state.py` e seus testes somente para persistir valores observáveis e
 JSON-safe necessários ao ciclo.
