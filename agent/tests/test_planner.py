@@ -1327,6 +1327,195 @@ def test_planner_rejects_untrusted_point_or_model_in_current_history(
     assert sentinel not in "".join(traceback.format_exception(error))
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("unknown_tool", {}),
+        ("search_knowledge", {"query": "x"}),
+        (
+            "search_knowledge",
+            {
+                "query": "rolamento",
+                "unexpected": "INVALID_HISTORY_EXTRA_FIELD",
+            },
+        ),
+    ],
+    ids=["unknown-tool", "short-query", "extra-field"],
+)
+def test_planner_rejects_history_outside_static_catalog_contract_before_model(
+    tool_name,
+    arguments,
+):
+    sentinel = f"INVALID_HISTORY_PAYLOAD_{tool_name.upper()}"
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_invalid_catalog_{tool_name}_{len(arguments)}",
+        name=tool_name,
+        arguments=arguments,
+    )
+    observation = ToolObservation(
+        request_id="req_planner_01",
+        call_id=call.call_id,
+        content={"detail": sentinel},
+        artifact=ToolArtifact(
+            tool_name=call.name,
+            arguments=arguments,
+            source=ToolSource(kind="industrial_api", resource="/invalid-history"),
+            outcome=ToolOutcome(partial_data={"detail": sentinel}),
+        ),
+    )
+    usage = PlannerUsage(
+        request_id="req_planner_01",
+        selection_count=1,
+    )
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(search_knowledge,),
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            )
+        )
+
+    error = exc_info.value
+    assert error.code is PlannerErrorCode.INVALID_HISTORY
+    assert error.usage == usage
+    assert model._events == []
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    accessible_text = "".join(
+        (
+            str(error),
+            repr(error),
+            repr(error.args),
+            "".join(traceback.format_exception(error)),
+        )
+    )
+    assert sentinel not in accessible_text
+    extra_field_sentinel = arguments.get("unexpected")
+    if extra_field_sentinel is not None:
+        assert extra_field_sentinel not in accessible_text
+
+
+def test_planner_sends_validated_canonical_history_arguments_to_model():
+    query = "rolamento do transportador"
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_optional_omitted",
+        name="search_knowledge",
+        arguments={"query": query},
+    )
+    observation = ToolObservation(
+        request_id="req_planner_01",
+        call_id=call.call_id,
+        content={"results": []},
+        artifact=ToolArtifact(
+            tool_name=call.name,
+            arguments={"query": query},
+            source=ToolSource(kind="industrial_api", resource="/knowledge/search"),
+            outcome=ToolOutcome(partial_data={"results": []}),
+        ),
+    )
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "list_asset_analyses",
+                    "args": {"asset_id": "asset_G501"},
+                    "id": "call_after_canonical_history",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+
+    result = asyncio.run(
+        Planner(model).ainvoke(
+            _request(),
+            request_id="req_planner_01",
+            usage=PlannerUsage(
+                request_id="req_planner_01",
+                selection_count=1,
+            ),
+            offered_tools=(list_asset_analyses,),
+            tool_calls=(call,),
+            tool_observations=(observation,),
+        )
+    )
+
+    assert isinstance(result, PlannerToolTurn)
+    historical_call = next(
+        message.tool_calls[0]
+        for message in model._selection_messages
+        if isinstance(message, AIMessage) and message.tool_calls
+    )
+    assert historical_call["args"] == {
+        "query": query,
+        "document_type": None,
+    }
+
+
+def test_planner_treats_optional_default_forms_as_duplicate_history():
+    query = "rolamento do transportador"
+    argument_forms = (
+        {"query": query},
+        {"query": query, "document_type": None},
+    )
+    calls = tuple(
+        PersistedToolCall(
+            request_id="req_planner_01",
+            call_id=f"call_optional_form_{index}",
+            name="search_knowledge",
+            arguments=arguments,
+        )
+        for index, arguments in enumerate(argument_forms)
+    )
+    observations = tuple(
+        ToolObservation(
+            request_id="req_planner_01",
+            call_id=call.call_id,
+            content={"results": []},
+            artifact=ToolArtifact(
+                tool_name=call.name,
+                arguments=arguments,
+                source=ToolSource(
+                    kind="industrial_api",
+                    resource="/knowledge/search",
+                ),
+                outcome=ToolOutcome(partial_data={"results": []}),
+            ),
+        )
+        for call, arguments in zip(calls, argument_forms, strict=True)
+    )
+    usage = PlannerUsage(
+        request_id="req_planner_01",
+        selection_count=2,
+    )
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(search_knowledge,),
+                tool_calls=calls,
+                tool_observations=observations,
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.usage == usage
+    assert model._events == []
+
+
 def test_planner_rejects_duplicate_call_ids_in_current_history_before_model():
     calls, observations = _planner_history(2)
     duplicate_calls = (

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 import json
 import re
+from types import MappingProxyType
 from typing import Final, Literal
 
 from langchain_core.language_models import BaseChatModel
@@ -113,6 +114,44 @@ _ANALYSIS_ARGUMENT_TOOL_NAMES: Final = frozenset(
         "propose_request_specialist_analysis",
     }
 )
+_PLANNER_CATALOG: Final = (*READ_TOOLS, *WRITE_PROPOSAL_TOOLS)
+_PLANNER_TOOLS_BY_NAME: Final[Mapping[str, BaseTool]] = MappingProxyType(
+    {tool.name: tool for tool in _PLANNER_CATALOG}
+)
+if len(_PLANNER_TOOLS_BY_NAME) != len(_PLANNER_CATALOG):
+    raise RuntimeError("Os catálogos do planner contêm nomes de tool duplicados.")
+
+
+def _canonical_catalog_arguments(
+    tool_name: str,
+    arguments: object,
+) -> dict[str, object] | None:
+    tool = _PLANNER_TOOLS_BY_NAME.get(tool_name)
+    if tool is None or not isinstance(arguments, Mapping):
+        return None
+    try:
+        validated = tool.tool_call_schema.model_validate(arguments)
+        explicit_wire = validated.model_dump(mode="json", exclude_unset=True)
+        canonical_wire = validated.model_dump(mode="json")
+        persisted_wire = json.dumps(
+            arguments,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        validated_wire = json.dumps(
+            explicit_wire,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError, ValidationError):
+        return None
+    if persisted_wire != validated_wire:
+        return None
+    return canonical_wire
 
 
 def _typed_ids(
@@ -682,6 +721,36 @@ class Planner:
                 PlannerErrorCode.INVALID_HISTORY,
                 usage=active_usage,
             )
+        canonical_calls: list[PersistedToolCall] = []
+        for call, observation in zip(calls, observations, strict=True):
+            call_arguments = _canonical_catalog_arguments(
+                call.name,
+                call.arguments.to_python(),
+            )
+            artifact_arguments = _canonical_catalog_arguments(
+                call.name,
+                observation.artifact.arguments.to_python(),
+            )
+            if (
+                observation.call_id != call.call_id
+                or observation.content is None
+                or observation.artifact.tool_name != call.name
+                or call_arguments is None
+                or artifact_arguments != call_arguments
+            ):
+                raise PlannerProtocolError(
+                    PlannerErrorCode.INVALID_HISTORY,
+                    usage=active_usage,
+                )
+            canonical_calls.append(
+                PersistedToolCall(
+                    request_id=call.request_id,
+                    call_id=call.call_id,
+                    name=call.name,
+                    arguments=call_arguments,
+                )
+            )
+        calls = tuple(canonical_calls)
         call_fingerprints = tuple(_tool_call_fingerprint(call) for call in calls)
         if len(call_fingerprints) != len(set(call_fingerprints)):
             raise PlannerProtocolError(
@@ -705,16 +774,6 @@ class Planner:
         for index, (call, observation) in enumerate(
             zip(calls, observations, strict=True)
         ):
-            if (
-                observation.call_id != call.call_id
-                or observation.content is None
-                or observation.artifact.tool_name != call.name
-                or observation.artifact.arguments != call.arguments
-            ):
-                raise PlannerProtocolError(
-                    PlannerErrorCode.INVALID_HISTORY,
-                    usage=active_usage,
-                )
             historical_arguments = call.arguments.to_python()
             historical_authorized = _authorized_targets(
                 request.message,

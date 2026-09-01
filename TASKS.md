@@ -678,6 +678,9 @@ do modelo consomem e devolvem o uso atualizado no erro de protocolo. O
 fingerprint canônico usa somente tool e argumentos, sem o `call_id` do provider.
 O preflight também rejeita como histórico inválido dois fingerprints canônicos
 já persistidos na solicitação atual, antes de expor qualquer payload ao modelo.
+Cada call atual precisa pertencer aos catálogos estáticos e ter argumentos
+equivalentes ao wire validado pelo schema público; o dump canônico validado é
+usado no fingerprint, na validação de alvo e no contexto.
 O orçamento de contexto mede o wire OpenAI-compatible de mensagens e schemas
 das tools, remove apenas pares completos antigos com marcador explícito e não
 remove a observação mais recente nem erros/modos degradados; se o conjunto
