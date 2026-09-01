@@ -199,31 +199,40 @@ def _planner_history(
     calls: list[PersistedToolCall] = []
     observations: list[ToolObservation] = []
     for index in range(count):
-        asset_id = (
-            "asset_G501"
-            if request_id == "req_planner_01"
-            else f"asset_G{500 + index}"
-        )
+        if request_id == "req_planner_01":
+            tool_name = "search_knowledge"
+            arguments = {
+                "query": f"historico autorizado {index}",
+                "document_type": None,
+            }
+            content = {"results": [], "query_index": index}
+            resource = "/knowledge/search"
+        else:
+            asset_id = f"asset_G{500 + index}"
+            tool_name = "get_asset"
+            arguments = {"asset_id": asset_id}
+            content = {"id": asset_id, "mode": "complete"}
+            resource = f"/assets/{asset_id}"
         call = PersistedToolCall(
             request_id=request_id,
             call_id=f"call_{request_id}_{index}",
-            name="get_asset",
-            arguments={"asset_id": asset_id},
+            name=tool_name,
+            arguments=arguments,
         )
         calls.append(call)
         observations.append(
             ToolObservation(
                 request_id=request_id,
                 call_id=call.call_id,
-                content={"id": asset_id, "mode": "complete"},
+                content=content,
                 artifact=ToolArtifact(
                     tool_name=call.name,
-                    arguments={"asset_id": asset_id},
+                    arguments=arguments,
                     source=ToolSource(
                         kind="industrial_api",
-                        resource=f"/assets/{asset_id}",
+                        resource=resource,
                     ),
-                    outcome=ToolOutcome(partial_data={"id": asset_id}),
+                    outcome=ToolOutcome(partial_data=content),
                 ),
             )
         )
@@ -1346,6 +1355,68 @@ def test_planner_rejects_duplicate_call_ids_in_current_history_before_model():
     assert model._events == []
 
 
+def test_planner_rejects_duplicate_fingerprints_in_current_history_before_model():
+    sentinel = "DUPLICATE_HISTORY_PAYLOAD_MUST_NOT_LEAK"
+    calls = tuple(
+        PersistedToolCall(
+            request_id="req_planner_01",
+            call_id=f"call_same_intent_{index}",
+            name="get_asset",
+            arguments={"asset_id": "asset_G501"},
+        )
+        for index in range(2)
+    )
+    observations = tuple(
+        ToolObservation(
+            request_id="req_planner_01",
+            call_id=call.call_id,
+            content={"id": "asset_G501", "detail": sentinel},
+            artifact=ToolArtifact(
+                tool_name=call.name,
+                arguments={"asset_id": "asset_G501"},
+                source=ToolSource(
+                    kind="industrial_api",
+                    resource="/assets/asset_G501",
+                ),
+                outcome=ToolOutcome(partial_data={"detail": sentinel}),
+            ),
+        )
+        for call in calls
+    )
+    usage = PlannerUsage(
+        request_id="req_planner_01",
+        selection_count=2,
+    )
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(get_asset,),
+                tool_calls=calls,
+                tool_observations=observations,
+            )
+        )
+
+    error = exc_info.value
+    assert error.code is PlannerErrorCode.INVALID_HISTORY
+    assert error.usage == usage
+    assert model._events == []
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert sentinel not in "".join(
+        (
+            str(error),
+            repr(error),
+            repr(error.args),
+            "".join(traceback.format_exception(error)),
+        )
+    )
+
+
 def test_planner_refuses_second_finalization_before_structured_model_call():
     model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
 
@@ -2115,3 +2186,110 @@ def test_legacy_and_two_request_planner_state_survives_sqlite_reopen(
         "id": "asset_G501",
         "sensor_status": "online",
     }
+
+
+def test_planner_rejects_duplicate_fingerprint_restored_from_sqlite(
+    tmp_path: Path,
+):
+    checkpoint_path = tmp_path / "planner-duplicate-history.sqlite3"
+    sentinel = "RESTORED_DUPLICATE_PAYLOAD_MUST_NOT_LEAK"
+    calls = tuple(
+        PersistedToolCall(
+            request_id="req_planner_01",
+            call_id=f"call_restored_duplicate_{index}",
+            name="get_asset",
+            arguments={"asset_id": "asset_G501"},
+        )
+        for index in range(2)
+    )
+    observations = tuple(
+        ToolObservation(
+            request_id="req_planner_01",
+            call_id=call.call_id,
+            content={"id": "asset_G501", "detail": sentinel},
+            artifact=ToolArtifact(
+                tool_name=call.name,
+                arguments={"asset_id": "asset_G501"},
+                source=ToolSource(
+                    kind="industrial_api",
+                    resource="/assets/asset_G501",
+                ),
+                outcome=ToolOutcome(partial_data={"detail": sentinel}),
+            ),
+        )
+        for call in calls
+    )
+    usage = PlannerUsage(
+        request_id="req_planner_01",
+        selection_count=2,
+    )
+    state = AgentState.model_validate(
+        {
+            **_state(
+                tool_calls=calls,
+                tool_observations=observations,
+            ).model_dump(mode="python"),
+            "planner_usage": usage,
+        }
+    )
+    serialized_state = state.model_dump(mode="json")
+    config = {
+        "configurable": {
+            "thread_id": state.thread_id,
+            "checkpoint_ns": "",
+        }
+    }
+    checkpoint = {
+        "v": LATEST_VERSION,
+        "id": "00000000-0000-6000-8000-000000000011",
+        "ts": "2026-09-01T12:01:00+00:00",
+        "channel_values": {"agent_state": serialized_state},
+        "channel_versions": {"agent_state": "planner-v1"},
+        "versions_seen": {},
+        "pending_sends": [],
+        "updated_channels": ["agent_state"],
+    }
+
+    async def close_and_reopen():
+        async with open_checkpointer(checkpoint_path) as saver:
+            await saver.aput(
+                config,
+                checkpoint,
+                {"source": "update", "step": 0, "parents": {}},
+                {"agent_state": "planner-v1"},
+            )
+        async with open_checkpointer(checkpoint_path) as reopened_saver:
+            return await reopened_saver.aget(config)
+
+    restored_checkpoint = asyncio.run(close_and_reopen())
+
+    assert restored_checkpoint is not None
+    restored_state = AgentState.model_validate(
+        restored_checkpoint["channel_values"]["agent_state"]
+    )
+    assert tuple(call.call_id for call in restored_state.tool_calls) == (
+        "call_restored_duplicate_0",
+        "call_restored_duplicate_1",
+    )
+    assert restored_state.planner_usage == usage
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                restored_state.request,
+                request_id=restored_state.request_id,
+                usage=restored_state.planner_usage,
+                offered_tools=(get_asset,),
+                tool_calls=restored_state.tool_calls,
+                tool_observations=restored_state.tool_observations,
+            )
+        )
+
+    error = exc_info.value
+    assert error.code is PlannerErrorCode.INVALID_HISTORY
+    assert error.usage == usage
+    assert model._events == []
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert sentinel not in "".join(traceback.format_exception(error))

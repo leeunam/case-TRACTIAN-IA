@@ -682,6 +682,12 @@ class Planner:
                 PlannerErrorCode.INVALID_HISTORY,
                 usage=active_usage,
             )
+        call_fingerprints = tuple(_tool_call_fingerprint(call) for call in calls)
+        if len(call_fingerprints) != len(set(call_fingerprints)):
+            raise PlannerProtocolError(
+                PlannerErrorCode.INVALID_HISTORY,
+                usage=active_usage,
+            )
         if len(calls) > PLANNER_LIMITS.tool_calls:
             raise PlannerProtocolError(
                 PlannerErrorCode.INVALID_HISTORY,
