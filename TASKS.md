@@ -665,7 +665,9 @@ runtime e IDs tipados presentes no pedido ou em campos estruturais específicos
 das tools que realmente os produzem, sempre na mesma `request_id`; notas,
 erros, snippets e texto livre incidental não concedem acesso. A chamada
 selecionada é validada novamente contra esses conjuntos, o ativo central e os
-pontos explícitos ou observados. Chamadas, observações e `PlannerUsage` ficam
+pontos explícitos ou observados; pares atuais que contradizem esses alvos são
+histórico inválido e falham antes do modelo. Chamadas, observações e
+`PlannerUsage` ficam
 vinculados à solicitação; histórico legado sem `request_id` permanece
 auditável como não atribuído e não entra no contexto, fingerprint ou orçamento
 atuais, enquanto uma nova solicitação zera somente os contadores transitórios.

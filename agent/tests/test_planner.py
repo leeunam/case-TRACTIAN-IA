@@ -199,7 +199,11 @@ def _planner_history(
     calls: list[PersistedToolCall] = []
     observations: list[ToolObservation] = []
     for index in range(count):
-        asset_id = f"asset_G{500 + index}"
+        asset_id = (
+            "asset_G501"
+            if request_id == "req_planner_01"
+            else f"asset_G{500 + index}"
+        )
         call = PersistedToolCall(
             request_id=request_id,
             call_id=f"call_{request_id}_{index}",
@@ -1194,6 +1198,124 @@ def test_planner_filters_interleaved_history_as_current_request_pairs():
     assert "req_old" not in sent_context
     assert current_calls[0].call_id in sent_context
     assert current_calls[1].call_id in sent_context
+
+
+def test_planner_rejects_current_history_from_another_asset_before_model():
+    sentinel = "WRONG_ASSET_SENTINEL"
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_wrong_asset_history",
+        name="get_asset",
+        arguments={"asset_id": "asset_G999"},
+    )
+    observation = ToolObservation(
+        request_id="req_planner_01",
+        call_id=call.call_id,
+        content={"id": "asset_G999", "detail": sentinel},
+        artifact=ToolArtifact(
+            tool_name=call.name,
+            arguments={"asset_id": "asset_G999"},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G999",
+            ),
+            outcome=ToolOutcome(partial_data={"detail": sentinel}),
+        ),
+    )
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "asset_G501"},
+                    "id": "call_after_wrong_asset",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+    usage = PlannerUsage(
+        request_id="req_planner_01",
+        selection_count=2,
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(get_asset,),
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            )
+        )
+
+    error = exc_info.value
+    assert error.code is PlannerErrorCode.INVALID_HISTORY
+    assert error.usage == usage
+    assert model._events == []
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert sentinel not in "".join(traceback.format_exception(error))
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        (
+            "get_baseline",
+            {"asset_id": "asset_G501", "point_id": "pt_nao_autorizado"},
+        ),
+        ("get_model", {"model_id": "mdl_target_oculto"}),
+    ],
+    ids=["point", "hidden-model"],
+)
+def test_planner_rejects_untrusted_point_or_model_in_current_history(
+    tool_name,
+    arguments,
+):
+    sentinel = f"UNTRUSTED_HISTORY_{tool_name.upper()}"
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_untrusted_{tool_name}",
+        name=tool_name,
+        arguments=arguments,
+    )
+    observation = ToolObservation(
+        request_id="req_planner_01",
+        call_id=call.call_id,
+        content={"detail": sentinel},
+        artifact=ToolArtifact(
+            tool_name=tool_name,
+            arguments=arguments,
+            source=ToolSource(kind="industrial_api", resource="/trusted-boundary"),
+            outcome=ToolOutcome(partial_data={"detail": sentinel}),
+        ),
+    )
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+    usage = PlannerUsage(request_id="req_planner_01", selection_count=1)
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(get_asset,),
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            )
+        )
+
+    error = exc_info.value
+    assert error.code is PlannerErrorCode.INVALID_HISTORY
+    assert error.usage == usage
+    assert model._events == []
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert sentinel not in "".join(traceback.format_exception(error))
 
 
 def test_planner_rejects_duplicate_call_ids_in_current_history_before_model():

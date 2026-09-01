@@ -291,6 +291,8 @@ def _selected_targets_are_authorized(
     request: SupportRequest | PersistedSupportRequest,
     authorized: _PlannerAuthorizedTargets,
 ) -> bool:
+    if "model_id" in arguments or "configured_model_id" in arguments:
+        return False
     if tool_name in _ANALYSIS_ARGUMENT_TOOL_NAMES:
         if arguments.get("analysis_id") not in authorized.analysis_ids:
             return False
@@ -310,18 +312,6 @@ def _selected_targets_are_authorized(
     return True
 
 
-def _interaction_scope_matches_request(
-    call: PersistedToolCall,
-    request: SupportRequest | PersistedSupportRequest,
-) -> bool:
-    if call.name not in _ASSET_ARGUMENT_TOOL_NAMES:
-        return True
-    return (
-        request.asset_id is not None
-        and call.arguments.to_python().get("asset_id") == request.asset_id
-    )
-
-
 def _current_request_interactions(
     state: AgentState,
 ) -> tuple[tuple[PersistedToolCall, ToolObservation], ...]:
@@ -339,7 +329,14 @@ def _current_request_interactions(
             or observation.content is None
             or observation.artifact.tool_name != call.name
             or observation.artifact.arguments != call.arguments
-            or not _interaction_scope_matches_request(call, state.request)
+        ):
+            continue
+        authorized = _authorized_targets(state.request.message, interactions)
+        if not _selected_targets_are_authorized(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            request=state.request,
+            authorized=authorized,
         ):
             continue
         interactions.append((call, observation))
@@ -712,8 +709,22 @@ class Planner:
                     PlannerErrorCode.INVALID_HISTORY,
                     usage=active_usage,
                 )
-            if _interaction_scope_matches_request(call, request):
-                authorized_interactions.append((call, observation))
+            historical_arguments = call.arguments.to_python()
+            historical_authorized = _authorized_targets(
+                request.message,
+                authorized_interactions,
+            )
+            if not _selected_targets_are_authorized(
+                tool_name=call.name,
+                arguments=historical_arguments,
+                request=request,
+                authorized=historical_authorized,
+            ):
+                raise PlannerProtocolError(
+                    PlannerErrorCode.INVALID_HISTORY,
+                    usage=active_usage,
+                )
+            authorized_interactions.append((call, observation))
             interactions.append(
                 (
                     AIMessage(
