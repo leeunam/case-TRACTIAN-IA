@@ -690,6 +690,17 @@ só concedem IDs presentes nos campos tipados que a tool realmente projeta.
 Artifacts persistidos conservam essa projeção especializada de forma JSON-safe
 e a revalidam pelo modelo exato após reabertura do checkpoint, sem guardar HTTP
 bruto ou objetos de runtime.
+Para RMS e espectro truncados, o artifact especializado conserva ainda uma
+projeção limitada e tipada idêntica ao conteúdo do modelo (no máximo 100
+amostras ou 20 picos). O preflight compara todo o conteúdo contra essa forma
+autoritativa após JSON/SQLite, além de conferir os índices compartilhados com
+a projeção técnica principal; artifacts truncados antigos sem prova suficiente
+falham fechados. A validação semântica também reaplica as restrições reais dos
+wires normalizados de ativo, análise/lista, baseline, RMS, espectro, qualidade
+e documento. Em respostas degradadas, `point_id: null` significa somente
+ausência de evidência para cadastro de ativo, lista genérica de análises e
+detalhe de análise; não autoriza ponto e continua inválido nas quatro tools
+técnicas.
 O orçamento de contexto mede o wire OpenAI-compatible de mensagens e schemas
 das tools, remove apenas pares completos antigos com marcador explícito e não
 remove a observação mais recente nem erros/modos degradados; se o conjunto
@@ -723,6 +734,11 @@ No quinto ciclo corretivo, os **395 testes** de planner e estado passaram
 (393 no sandbox e os dois casos SQLite em execução externa), incluindo a
 matriz dos dez artifacts, erros sanitizados, modos degradados e round-trip JSON;
 os locks offline de API e agente e `git diff --check` também passaram.
+No sexto ciclo corretivo, a suíte focada completa passou externamente com
+**752 testes**, incluindo a reabertura SQLite das projeções técnicas; dois
+casos adicionais de adulteração exatamente nos cortes passaram localmente,
+assim como **751 testes sem SQLite**. Os locks offline continuaram resolvendo
+49 pacotes no agente e 55 na API.
 
 ### Task 12 — integrar o planner ao LangGraph e preservar as escritas
 

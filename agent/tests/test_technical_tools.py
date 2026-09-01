@@ -137,6 +137,8 @@ def test_get_rms_series_normalizes_chronology_and_declares_two_projections():
     assert result.content.samples[-1].value == 1000.0
     assert len(result.artifact.outcome.rms.samples) == 1000
     assert result.artifact.outcome.rms.samples[-1].value == 1000.0
+    assert result.artifact.model_content == result.content
+    assert "model_content" not in result.content.model_dump()
     assert result.artifact.truncated is True
     assert result.artifact.omitted_items == 2
 
@@ -185,6 +187,8 @@ def test_get_spectrum_stably_orders_projects_peaks_and_preserves_missing_bands()
     assert result.content.peaks[0].freq_hz == 1.0
     assert result.content.peaks[-1].freq_hz == 201.0
     assert len(result.artifact.outcome.spectrum.peaks) == 200
+    assert result.artifact.model_content == result.content
+    assert "model_content" not in result.content.model_dump()
     assert result.artifact.truncated is True
     assert result.artifact.omitted_items == 1
 

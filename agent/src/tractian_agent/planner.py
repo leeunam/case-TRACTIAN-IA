@@ -273,6 +273,191 @@ def _edge_preserving_projection(
     ]
 
 
+def _edge_projection_source_indices(total: int, limit: int) -> list[int]:
+    if total <= limit:
+        return list(range(total))
+    return [
+        (index * (total - 1)) // (limit - 1)
+        for index in range(limit)
+    ]
+
+
+def _shared_projection_items_match(
+    first: Sequence[object],
+    first_indices: Sequence[int],
+    second: Sequence[object],
+    second_indices: Sequence[int],
+) -> bool:
+    first_by_source = dict(zip(first_indices, first, strict=True))
+    second_by_source = dict(zip(second_indices, second, strict=True))
+    return all(
+        first_by_source[source_index] == second_by_source[source_index]
+        for source_index in first_by_source.keys() & second_by_source.keys()
+    )
+
+
+def _nonblank(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and bool(value.strip())
+
+
+def _finite_number(value: object, *, minimum: float | None = None) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and (minimum is None or value >= minimum)
+    )
+
+
+def _asset_artifact_is_concrete(artifact: AssetToolArtifact) -> bool:
+    asset = artifact.outcome.asset
+    if asset is None:
+        return False
+    technical = asset.technical_configuration
+    bearing = technical.bearing_specs
+    optional_frequencies = (
+        bearing.bpfo_hz,
+        bearing.bpfi_hz,
+        bearing.bsf_hz,
+        bearing.ftf_hz,
+        technical.line_frequency_hz,
+    )
+    return (
+        _nonblank(asset.name)
+        and _nonblank(asset.hierarchy.plant)
+        and _nonblank(asset.hierarchy.line)
+        and _nonblank(technical.machine_type)
+        and _finite_number(technical.rotation_rpm, minimum=0)
+        and _nonblank(asset.sensor_status)
+        and all(
+            value is None or _finite_number(value)
+            for value in optional_frequencies
+        )
+        and all(
+            _validated_id(point.id, _POINT_ID_ADAPTER) is not None
+            and _nonblank(point.location)
+            and _nonblank(point.sensor_status)
+            for point in asset.points
+        )
+    )
+
+
+def _analysis_artifact_is_concrete(analysis: AnalysisArtifact) -> bool:
+    return (
+        _validated_id(analysis.id, _ANALYSIS_ID_ADAPTER) is not None
+        and _finite_number(analysis.confidence, minimum=0)
+        and analysis.confidence <= 1
+        and _nonblank(analysis.model_version)
+        and _aware_timestamp(analysis.created_at)
+        and all(
+            _nonblank(item.metric)
+            and _finite_number(item.value)
+            and (item.reference is None or _finite_number(item.reference))
+            and _nonblank(item.note)
+            for item in analysis.evidence
+        )
+    )
+
+
+def _baseline_artifact_is_concrete(baseline: BaselineArtifact) -> bool:
+    if (
+        re.fullmatch(r"bs_[A-Za-z0-9_-]{1,64}", baseline.id) is None
+        or (
+            baseline.established_at is not None
+            and not _aware_timestamp(baseline.established_at)
+        )
+        or (
+            baseline.invalidated_at is not None
+            and not _aware_timestamp(baseline.invalidated_at)
+        )
+        or not all(
+            _nonblank(feature.feature)
+            and _finite_number(feature.reference, minimum=0)
+            and _finite_number(feature.tolerance, minimum=0)
+            for feature in baseline.features
+        )
+    ):
+        return False
+    rms_feature = next(
+        (
+            feature
+            for feature in baseline.features
+            if feature.feature == "rms_mm_s"
+        ),
+        None,
+    )
+    expected_threshold: float | None = None
+    if rms_feature is not None:
+        total = rms_feature.reference + rms_feature.tolerance
+        if not math.isfinite(total):
+            return False
+        expected_threshold = round(total, 3)
+    if expected_threshold is None:
+        return baseline.alarm_threshold is None
+    return (
+        _finite_number(baseline.alarm_threshold, minimum=0)
+        and baseline.alarm_threshold == expected_threshold
+    )
+
+
+def _rms_artifact_is_concrete(artifact: RmsToolArtifact) -> bool:
+    rms = artifact.outcome.rms
+    if rms is None:
+        return False
+    sample_groups = [rms.samples]
+    if artifact.model_content is not None:
+        sample_groups.append(artifact.model_content.samples)
+    return (
+        _validated_id(rms.point_id, _POINT_ID_ADAPTER) is not None
+        and (
+            rms.baseline_reference is None
+            or _finite_number(rms.baseline_reference, minimum=0)
+        )
+        and (
+            rms.alarm_threshold is None
+            or _finite_number(rms.alarm_threshold, minimum=0)
+        )
+        and all(
+            all(
+                _aware_timestamp(sample.ts)
+                and _finite_number(sample.value, minimum=0)
+                for sample in samples
+            )
+            and all(
+                datetime.fromisoformat(left.ts.replace("Z", "+00:00"))
+                <= datetime.fromisoformat(right.ts.replace("Z", "+00:00"))
+                for left, right in zip(samples, samples[1:])
+            )
+            for samples in sample_groups
+        )
+    )
+
+
+def _spectrum_artifact_is_concrete(artifact: SpectrumToolArtifact) -> bool:
+    spectrum = artifact.outcome.spectrum
+    if spectrum is None:
+        return False
+    peak_groups = [spectrum.peaks]
+    if artifact.model_content is not None:
+        peak_groups.append(artifact.model_content.peaks)
+    return (
+        _validated_id(spectrum.point_id, _POINT_ID_ADAPTER) is not None
+        and _aware_timestamp(spectrum.collected_at)
+        and all(
+            all(
+                _finite_number(peak.freq_hz, minimum=0)
+                and _finite_number(peak.amplitude_mm_s, minimum=0)
+                for peak in peaks
+            )
+            and all(
+                left.freq_hz <= right.freq_hz
+                for left, right in zip(peaks, peaks[1:])
+            )
+            for peaks in peak_groups
+        )
+    )
+
+
 def _complete_content_matches_artifact(
     tool_name: str,
     content: object,
@@ -281,7 +466,7 @@ def _complete_content_matches_artifact(
     outcome = artifact.outcome
     if tool_name == "get_asset" and isinstance(artifact, AssetToolArtifact):
         asset = artifact.outcome.asset
-        if asset is None:
+        if asset is None or not _asset_artifact_is_concrete(artifact):
             return False
         expected = AssetModelContent(
             id=asset.id,
@@ -304,7 +489,16 @@ def _complete_content_matches_artifact(
             item_wire = _exact_model_wire(AnalysisArtifact, item)
             if item_wire is None:
                 return False
-            typed_analyses.append(AnalysisArtifact.model_validate(item_wire))
+            typed_item = AnalysisArtifact.model_validate(item_wire)
+            if not _analysis_artifact_is_concrete(typed_item):
+                return False
+            typed_analyses.append(typed_item)
+        if any(
+            datetime.fromisoformat(left.created_at.replace("Z", "+00:00"))
+            < datetime.fromisoformat(right.created_at.replace("Z", "+00:00"))
+            for left, right in zip(typed_analyses, typed_analyses[1:])
+        ):
+            return False
         total = artifact.outcome.total_analyses
         if total is None:
             return False
@@ -320,26 +514,48 @@ def _complete_content_matches_artifact(
         artifact, AnalysisDetailToolArtifact
     ):
         analysis = artifact.outcome.analysis
-        return analysis is not None and _exact_model_wire(
-            AnalysisArtifact,
-            content,
-        ) == analysis.model_dump(mode="json")
+        return (
+            analysis is not None
+            and _analysis_artifact_is_concrete(analysis)
+            and _exact_model_wire(
+                AnalysisArtifact,
+                content,
+            )
+            == analysis.model_dump(mode="json")
+        )
     if tool_name == "get_baseline" and isinstance(
         artifact, BaselineToolArtifact
     ):
         baseline = artifact.outcome.baseline
-        return baseline is not None and _exact_model_wire(
-            BaselineArtifact,
-            content,
-        ) == baseline.model_dump(mode="json")
+        return (
+            baseline is not None
+            and _baseline_artifact_is_concrete(baseline)
+            and _exact_model_wire(
+                BaselineArtifact,
+                content,
+            )
+            == baseline.model_dump(mode="json")
+        )
     if tool_name == "get_data_quality" and isinstance(
         artifact, DataQualityToolArtifact
     ):
         data_quality = artifact.outcome.data_quality
-        return data_quality is not None and _exact_model_wire(
-            DataQualityArtifact,
-            content,
-        ) == data_quality.model_dump(mode="json")
+        return (
+            data_quality is not None
+            and _validated_id(data_quality.point_id, _POINT_ID_ADAPTER) is not None
+            and _finite_number(data_quality.completeness, minimum=0)
+            and data_quality.completeness <= 1
+            and not isinstance(data_quality.freshness_minutes, bool)
+            and isinstance(data_quality.freshness_minutes, int)
+            and data_quality.freshness_minutes >= 0
+            and _finite_number(data_quality.snr_db)
+            and isinstance(data_quality.staleness_flag, bool)
+            and _exact_model_wire(
+                DataQualityArtifact,
+                content,
+            )
+            == data_quality.model_dump(mode="json")
+        )
     if tool_name == "get_model" and isinstance(artifact, ModelToolArtifact):
         model = artifact.outcome.model
         model_wire = _exact_model_wire(ModelArtifact, model)
@@ -381,8 +597,18 @@ def _complete_content_matches_artifact(
             + document.omitted_body_characters
         )
         if (
-            document.returned_body_characters != len(document.body)
-            or len(document.body) != min(total, 32_000)
+            not _nonblank(document.title)
+            or any(
+                not isinstance(tag, str) or not tag.strip()
+                for tag in document.tags
+            )
+            or total < 1
+            or document.returned_body_characters != len(document.body)
+            or not 0 < document.returned_body_characters <= 32_000
+            or (
+                document.omitted_body_characters > 0
+                and document.returned_body_characters != 32_000
+            )
             or document.truncated != (document.omitted_body_characters > 0)
         ):
             return False
@@ -401,24 +627,25 @@ def _complete_content_matches_artifact(
     if tool_name == "get_rms_series" and isinstance(artifact, RmsToolArtifact):
         rms = artifact.outcome.rms
         wire = _exact_model_wire(RmsModelContent, content)
-        if rms is None or wire is None:
+        if rms is None or wire is None or not _rms_artifact_is_concrete(artifact):
             return False
         expected_content_count = min(rms.total_samples, 100)
         if len(wire["samples"]) != expected_content_count:
             return False
         samples_wire = [sample.model_dump(mode="json") for sample in rms.samples]
-        if rms.total_samples <= 1_000:
+        persisted_content_wire = (
+            artifact.model_content.model_dump(mode="json")
+            if artifact.model_content is not None
+            else None
+        )
+        if persisted_content_wire is not None:
+            if wire != persisted_content_wire:
+                return False
+        elif rms.total_samples <= 1_000:
             expected_samples = _edge_preserving_projection(samples_wire, 100)
             if wire["samples"] != expected_samples:
                 return False
-        elif (
-            wire["samples"]
-            and samples_wire
-            and (
-                wire["samples"][0] != samples_wire[0]
-                or wire["samples"][-1] != samples_wire[-1]
-            )
-        ):
+        else:
             return False
         return all(
             wire[field] == getattr(rms, field)
@@ -437,17 +664,29 @@ def _complete_content_matches_artifact(
     ):
         spectrum = artifact.outcome.spectrum
         wire = _exact_model_wire(SpectrumModelContent, content)
-        if spectrum is None or wire is None:
+        if (
+            spectrum is None
+            or wire is None
+            or not _spectrum_artifact_is_concrete(artifact)
+        ):
             return False
         expected_content_count = min(spectrum.total_peaks, 20)
         if len(wire["peaks"]) != expected_content_count:
             return False
         peaks_wire = [peak.model_dump(mode="json") for peak in spectrum.peaks]
-        if spectrum.total_peaks <= 200:
+        persisted_content_wire = (
+            artifact.model_content.model_dump(mode="json")
+            if artifact.model_content is not None
+            else None
+        )
+        if persisted_content_wire is not None:
+            if wire != persisted_content_wire:
+                return False
+        elif spectrum.total_peaks <= 200:
             expected_peaks = _edge_preserving_projection(peaks_wire, 20)
             if wire["peaks"] != expected_peaks:
                 return False
-        elif wire["peaks"] and peaks_wire and wire["peaks"][0] != peaks_wire[0]:
+        else:
             return False
         if any(
             left["freq_hz"] > right["freq_hz"]
@@ -482,6 +721,7 @@ def _recursive_scope_matches(
     asset_id: str | None,
     point_id: str | None,
     company_id: str | None = None,
+    allow_null_point: bool = False,
 ) -> bool:
     pending = [value]
     while pending:
@@ -493,6 +733,8 @@ def _recursive_scope_matches(
                 ):
                     return False
                 if key == "point_id":
+                    if nested is None and allow_null_point:
+                        continue
                     validated_point = _validated_id(nested, _POINT_ID_ADAPTER)
                     if validated_point is None or (
                         point_id is not None and validated_point != point_id
@@ -963,32 +1205,68 @@ def _artifact_projection_metadata_matches(
         )
     if tool_name == "get_rms_series" and isinstance(artifact, RmsToolArtifact):
         rms = outcome.rms
-        return rms is not None and (
-            len(rms.samples) == min(rms.total_samples, 1_000)
-            and rms.total_samples >= len(rms.samples)
-            and all(
-                datetime.fromisoformat(left.ts.replace("Z", "+00:00"))
-                <= datetime.fromisoformat(right.ts.replace("Z", "+00:00"))
-                for left, right in zip(rms.samples, rms.samples[1:])
+        if rms is None:
+            return False
+        total = rms.total_samples
+        artifact_indices = _edge_projection_source_indices(total, 1_000)
+        if (
+            len(rms.samples) != min(total, 1_000)
+            or artifact.omitted_items != total - len(rms.samples)
+            or artifact.truncated != (total > len(rms.samples))
+        ):
+            return False
+        model_content = artifact.model_content
+        if model_content is None:
+            return total <= 1_000
+        prompt_indices = _edge_projection_source_indices(total, 100)
+        return (
+            model_content.total_samples == total
+            and len(model_content.samples) == min(total, 100)
+            and model_content.omitted_samples == total - len(model_content.samples)
+            and _shared_projection_items_match(
+                rms.samples,
+                artifact_indices,
+                model_content.samples,
+                prompt_indices,
             )
-            and
-            artifact.omitted_items == rms.total_samples - len(rms.samples)
-            and artifact.truncated == (rms.total_samples > len(rms.samples))
+            and (
+                total > 1_000
+                or model_content.samples
+                == _edge_preserving_projection(rms.samples, 100)
+            )
         )
     if tool_name == "get_spectrum" and isinstance(
         artifact, SpectrumToolArtifact
     ):
         spectrum = outcome.spectrum
-        return spectrum is not None and (
-            len(spectrum.peaks) == min(spectrum.total_peaks, 200)
-            and spectrum.total_peaks >= len(spectrum.peaks)
-            and all(
-                left.freq_hz <= right.freq_hz
-                for left, right in zip(spectrum.peaks, spectrum.peaks[1:])
+        if spectrum is None:
+            return False
+        total = spectrum.total_peaks
+        if (
+            len(spectrum.peaks) != min(total, 200)
+            or artifact.omitted_items != total - len(spectrum.peaks)
+            or artifact.truncated != (total > len(spectrum.peaks))
+        ):
+            return False
+        model_content = artifact.model_content
+        if model_content is None:
+            return total <= 200
+        prompt_indices = _edge_projection_source_indices(total, 20)
+        return (
+            model_content.total_peaks == total
+            and len(model_content.peaks) == min(total, 20)
+            and model_content.omitted_peaks == total - len(model_content.peaks)
+            and _shared_projection_items_match(
+                spectrum.peaks,
+                range(len(spectrum.peaks)),
+                model_content.peaks,
+                prompt_indices,
             )
-            and
-            artifact.omitted_items == spectrum.total_peaks - len(spectrum.peaks)
-            and artifact.truncated == (spectrum.total_peaks > len(spectrum.peaks))
+            and (
+                total > 200
+                or model_content.peaks
+                == _edge_preserving_projection(spectrum.peaks, 20)
+            )
         )
     return not artifact.truncated and artifact.omitted_items == 0
 
@@ -1000,6 +1278,13 @@ def _generic_degraded_content(artifact: ToolArtifact) -> dict[str, object]:
         "notes": outcome.notes,
         "partial_data": outcome.partial_data,
     }
+
+
+def _bounded_model_content_is_empty(artifact: ToolArtifact) -> bool:
+    return not isinstance(
+        artifact,
+        (RmsToolArtifact, SpectrumToolArtifact),
+    ) or artifact.model_content is None
 
 
 def _degraded_content_matches_artifact(
@@ -1148,6 +1433,7 @@ def _read_observation_is_semantically_valid(
                 and outcome.notes is None
                 and outcome.partial_data is None
                 and _specialized_outcome_is_empty(artifact)
+                and _bounded_model_content_is_empty(artifact)
                 and not artifact.truncated
                 and artifact.omitted_items == 0
                 and _canonical_json(content)
@@ -1177,6 +1463,8 @@ def _read_observation_is_semantically_valid(
                 and _artifact_projection_metadata_matches(call.name, artifact)
             )
         if outcome.mode is None:
+            return False
+        if not _bounded_model_content_is_empty(artifact):
             return False
         if not _degraded_content_matches_artifact(
             call.name,
@@ -1214,6 +1502,7 @@ def _read_observation_is_semantically_valid(
                     asset_id=request.asset_id,
                     point_id=arguments.get("point_id"),
                     company_id=request.identity.company_id,
+                    allow_null_point=call.name in {"get_asset", "get_analysis"},
                 )
             )
         if call.name == "list_asset_analyses" and isinstance(
@@ -1231,6 +1520,7 @@ def _read_observation_is_semantically_valid(
                     asset_id=request.asset_id,
                     point_id=None,
                     company_id=request.identity.company_id,
+                    allow_null_point=True,
                 )
             )
         return _artifact_scope_matches(

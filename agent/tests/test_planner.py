@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import traceback
@@ -46,10 +47,22 @@ from tractian_agent.tools.analyses import (
     AnalysisListToolArtifact,
     AnalysisListToolOutcome,
     DegradedAnalysisListModelContent,
+    execute_get_analysis,
+    execute_list_asset_analyses,
     get_analysis,
     list_asset_analyses,
 )
-from tractian_agent.tools.assets import get_asset
+from tractian_agent.tools.assets import (
+    AssetArtifact,
+    AssetHierarchy,
+    AssetModelContent,
+    AssetToolArtifact,
+    AssetToolOutcome,
+    BearingSpecifications,
+    TechnicalConfiguration,
+    execute_get_asset,
+    get_asset,
+)
 from tractian_agent.tools.knowledge import (
     DegradedKnowledgeDocumentContent,
     DegradedKnowledgeSearchModelContent,
@@ -63,6 +76,7 @@ from tractian_agent.tools.knowledge import (
     KnowledgeSearchToolOutcome,
     ModelToolArtifact,
     ModelToolOutcome,
+    execute_get_knowledge_document,
     get_knowledge_document,
     search_knowledge,
 )
@@ -72,7 +86,17 @@ from tractian_agent.tools.technical import (
     BaselineArtifact,
     BaselineToolArtifact,
     BaselineToolOutcome,
+    DataQualityArtifact,
+    DataQualityToolArtifact,
+    DataQualityToolOutcome,
+    execute_get_baseline,
+    execute_get_data_quality,
+    execute_get_rms_series,
+    execute_get_spectrum,
     get_baseline,
+    get_data_quality,
+    get_rms_series,
+    get_spectrum,
 )
 from tractian_agent.tools.runtime import (
     ReadToolRuntime,
@@ -374,6 +398,341 @@ def _successful_search_observation(call: PersistedToolCall) -> ToolObservation:
     )
 
 
+def _real_technical_observation(
+    tool_name: str,
+    total_items: int,
+) -> tuple[PersistedToolCall, ToolObservation]:
+    origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if tool_name == "get_rms_series":
+            data = {
+                "asset_id": "asset_G501",
+                "point_id": "pt_G501_de",
+                "unit": "mm/s",
+                "baseline_reference": 2.5,
+                "baseline_state": "established",
+                "alarm_threshold": 2.9,
+                "samples": [
+                    {
+                        "ts": (origin + timedelta(minutes=index)).isoformat(),
+                        "value": float(index),
+                    }
+                    for index in range(total_items)
+                ],
+            }
+        else:
+            data = {
+                "asset_id": "asset_G501",
+                "point_id": "pt_G501_de",
+                "peaks": [
+                    {
+                        "freq_hz": float(index + 1),
+                        "amplitude_mm_s": float(index + 1) / 10,
+                        "note": None,
+                    }
+                    for index in range(total_items)
+                ],
+                "bands_missing": [],
+                "collected_at": "2026-01-03T00:00:00+00:00",
+            }
+        return httpx.Response(
+            200,
+            json={"mode": "complete", "notes": None, "data": data},
+        )
+
+    async def invoke():
+        runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read"}),
+            central_asset_id="asset_G501",
+            client=IndustrialApiClient(
+                "https://industrial.test",
+                transport=httpx.MockTransport(handler),
+            ),
+        )
+        try:
+            if tool_name == "get_rms_series":
+                return await execute_get_rms_series(
+                    "asset_G501",
+                    "pt_G501_de",
+                    runtime,
+                )
+            return await execute_get_spectrum(
+                "asset_G501",
+                "pt_G501_de",
+                runtime,
+            )
+        finally:
+            await runtime.client.aclose()
+
+    result = asyncio.run(invoke())
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_{tool_name}_{total_items}",
+        name=tool_name,
+        arguments={"asset_id": "asset_G501", "point_id": "pt_G501_de"},
+    )
+    return call, ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=result.content.model_dump(mode="json"),
+        artifact=result.artifact,
+    )
+
+
+def _real_complete_observation(
+    tool_name: str,
+) -> tuple[PersistedToolCall, ToolObservation, str]:
+    analysis = {
+        "id": "an_valid_output",
+        "asset_id": "asset_G501",
+        "point_id": "pt_G501_de",
+        "type": "bearing_fault",
+        "detection_mode": "baseline",
+        "severity": "high",
+        "confidence": 0.78,
+        "baseline_state_at_detection": "established",
+        "evidence": [
+            {
+                "metric": "bpfo_amplitude",
+                "value": 1.4,
+                "reference": 0.6,
+                "note": "BPFO acima do baseline",
+            }
+        ],
+        "limitations": [],
+        "model_version": "3.2.1",
+        "created_at": "2026-01-02T03:04:05+00:00",
+        "status": "current",
+    }
+    payloads = {
+        "get_asset": {
+            "id": "asset_G501",
+            "name": "Motor principal",
+            "company_id": "comp_mineracao_andes",
+            "criticality": "critical",
+            "plant": "Planta 1",
+            "line": "Britagem",
+            "parent_asset_id": None,
+            "machine_type": "motor_induction",
+            "rotation_rpm": 1780.0,
+            "bearing_pn": "NU 310",
+            "bpfo_hz": -1.0,
+            "bpfi_hz": 218.1,
+            "bsf_hz": 58.7,
+            "ftf_hz": 11.9,
+            "line_frequency_hz": 60.0,
+            "sensor_status": "online",
+            "points": [
+                {
+                    "id": "pt_G501_de",
+                    "asset_id": "asset_G501",
+                    "location": "DE",
+                    "sensor_status": "online",
+                }
+            ],
+        },
+        "list_asset_analyses": {"analyses": [analysis]},
+        "get_analysis": analysis,
+        "get_baseline": {
+            "id": "bs_G501_de",
+            "asset_id": "asset_G501",
+            "point_id": "pt_G501_de",
+            "state": "established",
+            "detection_mode": "baseline",
+            "learnable": True,
+            "established_at": "2026-01-01T00:00:00+00:00",
+            "invalidated_at": None,
+            "invalidation_reason": "",
+            "features": [
+                {
+                    "feature": "rms_mm_s",
+                    "reference": 2.5,
+                    "tolerance": 0.4,
+                }
+            ],
+        },
+        "get_data_quality": {
+            "asset_id": "asset_G501",
+            "point_id": "pt_G501_de",
+            "completeness": 0.82,
+            "freshness_minutes": 12,
+            "snr_db": -3.5,
+            "staleness_flag": False,
+        },
+        "get_knowledge_document": {
+            "id": "kb_valid_output",
+            "type": "guidance",
+            "title": "Orientação de rolamento",
+            "body": " ",
+            "tags": [],
+        },
+    }
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "complete",
+                "notes": None,
+                "data": payloads[tool_name],
+            },
+        )
+
+    async def invoke():
+        runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read"}),
+            central_asset_id="asset_G501",
+            client=IndustrialApiClient(
+                "https://industrial.test",
+                transport=httpx.MockTransport(handler),
+            ),
+        )
+        try:
+            if tool_name == "get_asset":
+                return await execute_get_asset("asset_G501", runtime)
+            if tool_name == "list_asset_analyses":
+                return await execute_list_asset_analyses(
+                    "asset_G501", None, runtime
+                )
+            if tool_name == "get_analysis":
+                return await execute_get_analysis("an_valid_output", runtime)
+            if tool_name == "get_baseline":
+                return await execute_get_baseline(
+                    "asset_G501", "pt_G501_de", runtime
+                )
+            if tool_name == "get_data_quality":
+                return await execute_get_data_quality(
+                    "asset_G501", "pt_G501_de", runtime
+                )
+            return await execute_get_knowledge_document(
+                "kb_valid_output", runtime
+            )
+        finally:
+            await runtime.client.aclose()
+
+    result = asyncio.run(invoke())
+    arguments = {
+        "get_asset": {"asset_id": "asset_G501"},
+        "list_asset_analyses": {"asset_id": "asset_G501"},
+        "get_analysis": {"analysis_id": "an_valid_output"},
+        "get_baseline": {
+            "asset_id": "asset_G501",
+            "point_id": "pt_G501_de",
+        },
+        "get_data_quality": {
+            "asset_id": "asset_G501",
+            "point_id": "pt_G501_de",
+        },
+        "get_knowledge_document": {"document_id": "kb_valid_output"},
+    }[tool_name]
+    messages = {
+        "get_analysis": "Detalhe a análise an_valid_output.",
+        "get_knowledge_document": "Abra o documento kb_valid_output.",
+        "get_baseline": "Consulte o ponto pt_G501_de deste ativo.",
+        "get_data_quality": "Consulte o ponto pt_G501_de deste ativo.",
+    }
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_real_{tool_name}",
+        name=tool_name,
+        arguments=arguments,
+    )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=result.content.model_dump(mode="json"),
+        artifact=result.artifact,
+    )
+    return call, observation, messages.get(
+        tool_name,
+        "Consulte os dados completos deste ativo.",
+    )
+
+
+def _real_nullable_point_observation(
+    tool_name: str,
+) -> tuple[PersistedToolCall, ToolObservation, str]:
+    partial_data_by_tool = {
+        "get_asset": {"id": "asset_G501", "point_id": None},
+        "list_asset_analyses": {
+            "asset_id": "asset_G501",
+            "point_id": None,
+        },
+        "get_analysis": {
+            "id": "an_nullable_point",
+            "asset_id": "asset_G501",
+            "point_id": None,
+        },
+    }
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "partial",
+                "notes": "Ponto ausente no recorte parcial.",
+                "data": partial_data_by_tool[tool_name],
+            },
+        )
+
+    async def invoke():
+        runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read"}),
+            central_asset_id="asset_G501",
+            client=IndustrialApiClient(
+                "https://industrial.test",
+                transport=httpx.MockTransport(handler),
+            ),
+        )
+        try:
+            if tool_name == "get_asset":
+                return await execute_get_asset("asset_G501", runtime)
+            if tool_name == "list_asset_analyses":
+                return await execute_list_asset_analyses(
+                    "asset_G501", None, runtime
+                )
+            return await execute_get_analysis("an_nullable_point", runtime)
+        finally:
+            await runtime.client.aclose()
+
+    result = asyncio.run(invoke())
+    arguments = {
+        "get_asset": {"asset_id": "asset_G501"},
+        "list_asset_analyses": {"asset_id": "asset_G501"},
+        "get_analysis": {"analysis_id": "an_nullable_point"},
+    }[tool_name]
+    messages = {
+        "get_asset": "Consulte o cadastro técnico deste ativo.",
+        "list_asset_analyses": "Liste as análises deste ativo.",
+        "get_analysis": "Detalhe a análise an_nullable_point.",
+    }
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_real_{tool_name}_nullable_point",
+        name=tool_name,
+        arguments=arguments,
+    )
+    outcome = result.artifact.outcome
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content={
+            "mode": outcome.mode.value,
+            "notes": outcome.notes,
+            "partial_data": outcome.partial_data,
+        },
+        artifact=result.artifact,
+    )
+    return call, observation, messages[tool_name]
+
+
 def test_select_planner_tools_reuses_read_catalog_only_with_read_permission():
     offered = select_planner_tools(_state(), _read_runtime())
 
@@ -383,6 +742,38 @@ def test_select_planner_tools_reuses_read_catalog_only_with_read_permission():
         _state(permissions=frozenset()),
         _read_runtime(permissions=frozenset()),
     ) == ()
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "get_asset",
+        "list_asset_analyses",
+        "get_analysis",
+        "get_baseline",
+        "get_data_quality",
+        "get_knowledge_document",
+    ],
+)
+def test_select_planner_tools_accepts_real_complete_outputs_after_json_round_trip(
+    tool_name,
+):
+    call, observation, request_message = _real_complete_observation(tool_name)
+    restored = ToolObservation.model_validate_json(observation.model_dump_json())
+    request = _request().model_copy(update={"message": request_message})
+
+    offered = select_planner_tools(
+        _state(
+            request=request,
+            tool_calls=(call,),
+            tool_observations=(restored,),
+        ),
+        _read_runtime(),
+    )
+
+    assert offered
+    assert restored.artifact.validated_read_artifact() is not None
+    assert restored.content == observation.content
 
 
 def test_select_planner_tools_requires_typed_analysis_and_knowledge_ids():
@@ -898,6 +1289,224 @@ def test_planner_rejects_divergent_asset_resource_before_model():
     assert model._events == []
 
 
+def test_select_planner_tools_rejects_forged_rms_prompt_projection_after_cut():
+    call, observation = _real_technical_observation("get_rms_series", 1_001)
+    forged_content = observation.content.to_python()
+    forged_content["samples"][50]["value"] = 999_999.0
+    restored = ToolObservation.model_validate_json(
+        ToolObservation(
+            request_id=call.request_id,
+            call_id=call.call_id,
+            content=forged_content,
+            artifact=observation.artifact,
+        ).model_dump_json()
+    )
+    request = _request().model_copy(
+        update={"message": "Consulte o ponto pt_G501_de deste ativo."}
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(
+            _state(
+                request=request,
+                tool_calls=(call,),
+                tool_observations=(restored,),
+            ),
+            _read_runtime(),
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_planner_rejects_forged_spectrum_prompt_projection_after_cut():
+    call, observation = _real_technical_observation("get_spectrum", 201)
+    forged_content = observation.content.to_python()
+    forged_content["peaks"][10]["amplitude_mm_s"] = 999_999.0
+    forged_content["peaks"][10]["note"] = "FORGED_SPECTRUM_SENTINEL"
+    restored = ToolObservation.model_validate_json(
+        ToolObservation(
+            request_id=call.request_id,
+            call_id=call.call_id,
+            content=forged_content,
+            artifact=observation.artifact,
+        ).model_dump_json()
+    )
+    request = _request().model_copy(
+        update={"message": "Consulte o ponto pt_G501_de deste ativo."}
+    )
+    usage = PlannerUsage(request_id="req_planner_01", selection_count=1)
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                request,
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(get_spectrum,),
+                tool_calls=(call,),
+                tool_observations=(restored,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.usage == usage
+    assert "FORGED_SPECTRUM_SENTINEL" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert model._events == []
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "total_items"),
+    [
+        ("get_rms_series", 1_000),
+        ("get_rms_series", 1_001),
+        ("get_spectrum", 200),
+        ("get_spectrum", 201),
+    ],
+)
+def test_select_planner_tools_accepts_real_bounded_projection_at_cut_boundaries(
+    tool_name,
+    total_items,
+):
+    call, observation = _real_technical_observation(tool_name, total_items)
+    restored = ToolObservation.model_validate_json(observation.model_dump_json())
+    request = _request().model_copy(
+        update={"message": "Consulte o ponto pt_G501_de deste ativo."}
+    )
+
+    offered = select_planner_tools(
+        _state(
+            request=request,
+            tool_calls=(call,),
+            tool_observations=(restored,),
+        ),
+        _read_runtime(),
+    )
+
+    typed_artifact = restored.artifact.validated_read_artifact()
+    assert offered
+    assert typed_artifact is not None
+    assert typed_artifact.model_content is not None
+    assert typed_artifact.model_content.model_dump(mode="json") == (
+        restored.content.to_python()
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "offered_tool", "total_items", "collection_name"),
+    [
+        ("get_rms_series", get_rms_series, 1_001, "samples"),
+        ("get_spectrum", get_spectrum, 201, "peaks"),
+    ],
+)
+def test_planner_rejects_forged_tail_of_bounded_projection_before_model(
+    tool_name,
+    offered_tool,
+    total_items,
+    collection_name,
+):
+    call, observation = _real_technical_observation(tool_name, total_items)
+    forged_content = observation.content.to_python()
+    tail = forged_content[collection_name][-1]
+    if tool_name == "get_rms_series":
+        tail["value"] = 999_999.0
+    else:
+        tail["amplitude_mm_s"] = 999_999.0
+        tail["note"] = "FORGED_TAIL_MUST_NOT_LEAK"
+    restored = ToolObservation.model_validate_json(
+        ToolObservation(
+            request_id=call.request_id,
+            call_id=call.call_id,
+            content=forged_content,
+            artifact=observation.artifact,
+        ).model_dump_json()
+    )
+    request = _request().model_copy(
+        update={"message": "Consulte o ponto pt_G501_de deste ativo."}
+    )
+    usage = PlannerUsage(request_id="req_planner_01", selection_count=1)
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                request,
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(offered_tool,),
+                tool_calls=(call,),
+                tool_observations=(restored,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.usage == usage
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert "FORGED_TAIL_MUST_NOT_LEAK" not in str(exc_info.value)
+    assert model._events == []
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "offered_tool", "total_items", "collection_name"),
+    [
+        ("get_rms_series", get_rms_series, 1_000, "samples"),
+        ("get_spectrum", get_spectrum, 200, "peaks"),
+    ],
+)
+def test_planner_rejects_forged_interior_at_artifact_cut_before_model(
+    tool_name,
+    offered_tool,
+    total_items,
+    collection_name,
+):
+    call, observation = _real_technical_observation(tool_name, total_items)
+    forged_content = observation.content.to_python()
+    interior = forged_content[collection_name][10]
+    if tool_name == "get_rms_series":
+        interior["value"] = 999_999.0
+    else:
+        interior["amplitude_mm_s"] = 999_999.0
+        interior["note"] = "FORGED_INTERIOR_MUST_NOT_LEAK"
+    restored = ToolObservation.model_validate_json(
+        ToolObservation(
+            request_id=call.request_id,
+            call_id=call.call_id,
+            content=forged_content,
+            artifact=observation.artifact,
+        ).model_dump_json()
+    )
+    usage = PlannerUsage(request_id="req_planner_01", selection_count=1)
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request().model_copy(
+                    update={
+                        "message": "Consulte o ponto pt_G501_de deste ativo."
+                    }
+                ),
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(offered_tool,),
+                tool_calls=(call,),
+                tool_observations=(restored,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.usage == usage
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert "FORGED_INTERIOR_MUST_NOT_LEAK" not in str(exc_info.value)
+    assert model._events == []
+
+
 def test_select_planner_tools_does_not_authorize_id_from_degraded_notes():
     call = PersistedToolCall(
         request_id="req_planner_01",
@@ -923,6 +1532,647 @@ def test_select_planner_tools_does_not_authorize_id_from_degraded_notes():
     }
 
     assert "get_analysis" not in offered_names
+
+
+def test_select_planner_tools_accepts_nullable_partial_point_without_authorizing_it():
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_partial_nullable_point",
+        name="get_asset",
+        arguments={"asset_id": "asset_G501"},
+    )
+    partial_data = {"id": "asset_G501", "point_id": None}
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content={
+            "mode": "partial",
+            "notes": "Ponto ainda não informado.",
+            "partial_data": partial_data,
+        },
+        artifact=ToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501",
+            ),
+            outcome=ToolOutcome(
+                mode=ResponseMode.PARTIAL,
+                notes="Ponto ainda não informado.",
+                partial_data=partial_data,
+            ),
+        ),
+    )
+
+    offered_names = {
+        tool.name
+        for tool in select_planner_tools(
+            _state(
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            ),
+            _read_runtime(),
+        )
+    }
+
+    assert "get_baseline" in offered_names
+    assert "pt_G501_de" not in str(offered_names)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "offered_tool"),
+    [
+        ("get_asset", get_asset),
+        ("list_asset_analyses", list_asset_analyses),
+        ("get_analysis", get_analysis),
+    ],
+)
+def test_select_planner_tools_accepts_nullable_point_only_in_permitted_degraded_reads(
+    tool_name,
+    offered_tool,
+):
+    call, observation, request_message = _real_nullable_point_observation(
+        tool_name
+    )
+    observation = ToolObservation.model_validate_json(
+        observation.model_dump_json()
+    )
+    request = _request().model_copy(update={"message": request_message})
+
+    offered = select_planner_tools(
+        _state(
+            request=request,
+            tool_calls=(call,),
+            tool_observations=(observation,),
+        ),
+        _read_runtime(),
+    )
+
+    assert offered
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(content=""),
+        terminal_response=PlannerTerminalDecision(
+            decision=PlannerDecisionKind.GUIDE,
+            stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+        ),
+    )
+
+    result = asyncio.run(
+        Planner(model).ainvoke(
+            request,
+            request_id="req_planner_01",
+            usage=PlannerUsage(
+                request_id="req_planner_01",
+                selection_count=1,
+            ),
+            offered_tools=(offered_tool,),
+            tool_calls=(call,),
+            tool_observations=(observation,),
+        )
+    )
+
+    assert isinstance(result, PlannerDecisionTurn)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "offered_tool", "resource"),
+    [
+        ("get_baseline", get_baseline, "/assets/asset_G501/baseline"),
+        ("get_rms_series", get_rms_series, "/assets/asset_G501/rms"),
+        ("get_spectrum", get_spectrum, "/assets/asset_G501/spectrum"),
+        (
+            "get_data_quality",
+            get_data_quality,
+            "/assets/asset_G501/data-quality",
+        ),
+    ],
+)
+def test_planner_rejects_nullable_point_in_degraded_technical_history_before_model(
+    tool_name,
+    offered_tool,
+    resource,
+):
+    arguments = {"asset_id": "asset_G501"}
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_{tool_name}_nullable_point",
+        name=tool_name,
+        arguments=arguments,
+    )
+    partial_data = {"nested": {"point_id": None}}
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content={
+            "mode": "partial",
+            "notes": "Ponto ausente no recorte parcial.",
+            "partial_data": partial_data,
+        },
+        artifact=ToolArtifact(
+            tool_name=tool_name,
+            arguments=arguments,
+            source=ToolSource(kind="industrial_api", resource=resource),
+            outcome=ToolOutcome(
+                mode=ResponseMode.PARTIAL,
+                notes="Ponto ausente no recorte parcial.",
+                partial_data=partial_data,
+            ),
+        ),
+    )
+    usage = PlannerUsage(request_id="req_planner_01", selection_count=1)
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(offered_tool,),
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.usage == usage
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert model._events == []
+
+
+def test_nullable_partial_point_never_authorizes_a_future_point_target():
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_asset_nullable_target",
+        name="get_asset",
+        arguments={"asset_id": "asset_G501"},
+    )
+    partial_data = {"point_id": None}
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content={
+            "mode": "partial",
+            "notes": None,
+            "partial_data": partial_data,
+        },
+        artifact=ToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501",
+            ),
+            outcome=ToolOutcome(
+                mode=ResponseMode.PARTIAL,
+                partial_data=partial_data,
+            ),
+        ),
+    )
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_baseline",
+                    "args": {
+                        "asset_id": "asset_G501",
+                        "point_id": "pt_not_observed",
+                    },
+                    "id": "call_unobserved_nullable_target",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(
+                    request_id="req_planner_01",
+                    selection_count=1,
+                ),
+                offered_tools=(get_baseline,),
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_TOOL_ARGUMENTS
+
+
+def test_planner_rejects_complete_asset_impossible_for_the_executor():
+    impossible_asset = AssetArtifact(
+        id="asset_G501",
+        name=" ",
+        company_id="comp_mineracao_andes",
+        criticality="high",
+        hierarchy=AssetHierarchy(
+            plant=" ",
+            line="Linha A",
+            parent_asset_id=None,
+        ),
+        points=[],
+        technical_configuration=TechnicalConfiguration(
+            machine_type=" ",
+            rotation_rpm=-1.0,
+            bearing_specs=BearingSpecifications(
+                part_number=None,
+                bpfo_hz=None,
+                bpfi_hz=None,
+                bsf_hz=None,
+                ftf_hz=None,
+            ),
+            line_frequency_hz=None,
+        ),
+        sensor_status=" ",
+    )
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_impossible_asset",
+        name="get_asset",
+        arguments={"asset_id": "asset_G501"},
+    )
+    content = AssetModelContent(
+        id=impossible_asset.id,
+        name=impossible_asset.name,
+        criticality=impossible_asset.criticality,
+        machine_type=impossible_asset.technical_configuration.machine_type,
+        rotation_rpm=impossible_asset.technical_configuration.rotation_rpm,
+        sensor_status=impossible_asset.sensor_status,
+        points=impossible_asset.points,
+    )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=content.model_dump(mode="json"),
+        artifact=AssetToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501",
+            ),
+            outcome=AssetToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                asset=impossible_asset,
+            ),
+        ),
+    )
+    usage = PlannerUsage(request_id="req_planner_01", selection_count=1)
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(get_asset,),
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.usage == usage
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert model._events == []
+
+
+def test_select_planner_tools_rejects_complete_analysis_impossible_for_executor():
+    impossible_analysis = AnalysisArtifact(
+        id="an_impossible",
+        asset_id="asset_G501",
+        point_id="pt_G501_de",
+        type="bearing_fault",
+        detection_mode="symptom",
+        severity="high",
+        confidence=2.0,
+        baseline_state_at_detection="established",
+        evidence=[],
+        limitations=[],
+        model_version=" ",
+        created_at="not-a-timestamp",
+        status="current",
+    )
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_impossible_analysis",
+        name="get_analysis",
+        arguments={"analysis_id": "an_impossible"},
+    )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=impossible_analysis.model_dump(mode="json"),
+        artifact=AnalysisDetailToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/analyses/an_impossible",
+            ),
+            outcome=AnalysisDetailToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                analysis=impossible_analysis,
+            ),
+        ),
+    )
+    request = _request().model_copy(
+        update={"message": "Detalhe a análise an_impossible."}
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(
+            _state(
+                request=request,
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            ),
+            _read_runtime(),
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_select_planner_tools_rejects_impossible_analysis_inside_complete_list():
+    call, observation, _ = _real_complete_observation("list_asset_analyses")
+    artifact = observation.artifact.validated_read_artifact()
+    assert isinstance(artifact, AnalysisListToolArtifact)
+    impossible_analysis = AnalysisArtifact.model_validate(
+        artifact.outcome.analyses[0]
+    ).model_copy(
+        update={"confidence": 2.0}
+    )
+    impossible_artifact = artifact.model_copy(
+        update={
+            "outcome": artifact.outcome.model_copy(
+                update={"analyses": [impossible_analysis]}
+            )
+        }
+    )
+    content = observation.content.to_python()
+    content["analyses"][0]["confidence"] = 2.0
+    impossible_observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=content,
+        artifact=impossible_artifact,
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(
+            _state(
+                tool_calls=(call,),
+                tool_observations=(impossible_observation,),
+            ),
+            _read_runtime(),
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+
+
+def test_select_planner_tools_rejects_complete_baseline_impossible_for_executor():
+    impossible_baseline = BaselineArtifact(
+        id="invalid-baseline-id",
+        asset_id="asset_G501",
+        point_id="pt_G501_de",
+        state="established",
+        detection_mode="baseline",
+        learnable=True,
+        established_at="not-a-timestamp",
+        invalidated_at=None,
+        invalidation_reason=None,
+        features=[
+            {"feature": "rms_mm_s", "reference": -2.0, "tolerance": -1.0}
+        ],
+        alarm_threshold=-3.0,
+    )
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_impossible_baseline",
+        name="get_baseline",
+        arguments={"asset_id": "asset_G501", "point_id": "pt_G501_de"},
+    )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=impossible_baseline.model_dump(mode="json"),
+        artifact=BaselineToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/baseline",
+            ),
+            outcome=BaselineToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                baseline=impossible_baseline,
+            ),
+        ),
+    )
+    request = _request().model_copy(
+        update={"message": "Consulte o ponto pt_G501_de deste ativo."}
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(
+            _state(
+                request=request,
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            ),
+            _read_runtime(),
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+
+
+def test_select_planner_tools_rejects_complete_rms_impossible_for_executor():
+    call, observation = _real_technical_observation("get_rms_series", 10)
+    artifact = observation.artifact.validated_read_artifact()
+    assert artifact is not None
+    impossible_rms = artifact.outcome.rms.model_copy(
+        update={"baseline_reference": -1.0}
+    )
+    impossible_artifact = artifact.model_copy(
+        update={
+            "outcome": artifact.outcome.model_copy(
+                update={"rms": impossible_rms}
+            )
+        }
+    )
+    content = observation.content.to_python()
+    content["baseline_reference"] = -1.0
+    impossible_observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=content,
+        artifact=impossible_artifact,
+    )
+    request = _request().model_copy(
+        update={"message": "Consulte o ponto pt_G501_de deste ativo."}
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(
+            _state(
+                request=request,
+                tool_calls=(call,),
+                tool_observations=(impossible_observation,),
+            ),
+            _read_runtime(),
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+
+
+def test_select_planner_tools_rejects_complete_spectrum_impossible_for_executor():
+    call, observation = _real_technical_observation("get_spectrum", 10)
+    artifact = observation.artifact.validated_read_artifact()
+    assert artifact is not None
+    impossible_spectrum = artifact.outcome.spectrum.model_copy(
+        update={"collected_at": "not-a-timestamp"}
+    )
+    impossible_artifact = artifact.model_copy(
+        update={
+            "outcome": artifact.outcome.model_copy(
+                update={"spectrum": impossible_spectrum}
+            )
+        }
+    )
+    content = observation.content.to_python()
+    content["collected_at"] = "not-a-timestamp"
+    impossible_observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=content,
+        artifact=impossible_artifact,
+    )
+    request = _request().model_copy(
+        update={"message": "Consulte o ponto pt_G501_de deste ativo."}
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(
+            _state(
+                request=request,
+                tool_calls=(call,),
+                tool_observations=(impossible_observation,),
+            ),
+            _read_runtime(),
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+
+
+def test_select_planner_tools_rejects_complete_quality_impossible_for_executor():
+    impossible_quality = DataQualityArtifact(
+        asset_id="asset_G501",
+        point_id="pt_G501_de",
+        completeness=2.0,
+        freshness_minutes=-1,
+        snr_db=-10.0,
+        staleness_flag=False,
+    )
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_impossible_quality",
+        name="get_data_quality",
+        arguments={"asset_id": "asset_G501", "point_id": "pt_G501_de"},
+    )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=impossible_quality.model_dump(mode="json"),
+        artifact=DataQualityToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=impossible_quality,
+            ),
+        ),
+    )
+    request = _request().model_copy(
+        update={"message": "Consulte o ponto pt_G501_de deste ativo."}
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(
+            _state(
+                request=request,
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            ),
+            _read_runtime(),
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+
+
+def test_select_planner_tools_rejects_complete_document_impossible_for_executor():
+    impossible_document = KnowledgeDocumentContent(
+        id="kb_impossible",
+        type="guidance",
+        title=" ",
+        body="",
+        tags=[""],
+        returned_body_characters=0,
+        omitted_body_characters=0,
+        truncated=False,
+    )
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_impossible_document",
+        name="get_knowledge_document",
+        arguments={"document_id": "kb_impossible"},
+    )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=impossible_document.model_dump(mode="json"),
+        artifact=KnowledgeDocumentToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/knowledge/kb_impossible",
+            ),
+            outcome=KnowledgeDocumentToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                document=impossible_document,
+            ),
+        ),
+    )
+    request = _request().model_copy(
+        update={"message": "Abra o documento kb_impossible."}
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(
+            _state(
+                request=request,
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            ),
+            _read_runtime(),
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
 
 
 def test_planner_rejects_analysis_id_not_authorized_by_typed_request():
@@ -3239,3 +4489,74 @@ def test_planner_rejects_duplicate_fingerprint_restored_from_sqlite(
     assert error.__cause__ is None
     assert error.__context__ is None
     assert sentinel not in "".join(traceback.format_exception(error))
+
+
+def test_bounded_technical_projections_survive_sqlite_reopen(
+    tmp_path: Path,
+):
+    checkpoint_path = tmp_path / "planner-bounded-projections.sqlite3"
+    rms_call, rms_observation = _real_technical_observation(
+        "get_rms_series", 1_001
+    )
+    spectrum_call, spectrum_observation = _real_technical_observation(
+        "get_spectrum", 201
+    )
+    request = _request().model_copy(
+        update={"message": "Consulte o ponto pt_G501_de deste ativo."}
+    )
+    state = _state(
+        request=request,
+        tool_calls=(rms_call, spectrum_call),
+        tool_observations=(rms_observation, spectrum_observation),
+    ).model_copy(
+        update={
+            "planner_usage": PlannerUsage(
+                request_id="req_planner_01",
+                selection_count=2,
+            )
+        }
+    )
+    serialized_state = state.model_dump(mode="json")
+    json.dumps(serialized_state, allow_nan=False)
+    config = {
+        "configurable": {
+            "thread_id": state.thread_id,
+            "checkpoint_ns": "",
+        }
+    }
+    checkpoint = {
+        "v": LATEST_VERSION,
+        "id": "00000000-0000-6000-8000-000000000012",
+        "ts": "2026-09-01T12:02:00+00:00",
+        "channel_values": {"agent_state": serialized_state},
+        "channel_versions": {"agent_state": "planner-v1"},
+        "versions_seen": {},
+        "pending_sends": [],
+        "updated_channels": ["agent_state"],
+    }
+
+    async def close_and_reopen():
+        async with open_checkpointer(checkpoint_path) as saver:
+            await saver.aput(
+                config,
+                checkpoint,
+                {"source": "update", "step": 0, "parents": {}},
+                {"agent_state": "planner-v1"},
+            )
+        async with open_checkpointer(checkpoint_path) as reopened_saver:
+            return await reopened_saver.aget(config)
+
+    restored_checkpoint = asyncio.run(close_and_reopen())
+
+    assert restored_checkpoint is not None
+    restored_state = AgentState.model_validate(
+        restored_checkpoint["channel_values"]["agent_state"]
+    )
+    for observation in restored_state.tool_observations:
+        artifact = observation.artifact.validated_read_artifact()
+        assert artifact is not None
+        assert artifact.model_content is not None
+        assert artifact.model_content.model_dump(mode="json") == (
+            observation.content.to_python()
+        )
+    assert select_planner_tools(restored_state, _read_runtime())
