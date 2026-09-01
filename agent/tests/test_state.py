@@ -31,7 +31,32 @@ from tractian_agent.tools.observations import (
     ToolOutcome,
     ToolSource,
 )
+from tractian_agent.tools.analyses import (
+    AnalysisDetailToolArtifact,
+    AnalysisDetailToolOutcome,
+    AnalysisListToolArtifact,
+    AnalysisListToolOutcome,
+)
+from tractian_agent.tools.assets import AssetToolArtifact, AssetToolOutcome
+from tractian_agent.tools.knowledge import (
+    KnowledgeDocumentToolArtifact,
+    KnowledgeDocumentToolOutcome,
+    KnowledgeSearchToolArtifact,
+    KnowledgeSearchToolOutcome,
+    ModelToolArtifact,
+    ModelToolOutcome,
+)
 from tractian_agent.tools.runtime import TrustedIdentity
+from tractian_agent.tools.technical import (
+    BaselineToolArtifact,
+    BaselineToolOutcome,
+    DataQualityToolArtifact,
+    DataQualityToolOutcome,
+    RmsToolArtifact,
+    RmsToolOutcome,
+    SpectrumToolArtifact,
+    SpectrumToolOutcome,
+)
 from tractian_agent.write_contracts import (
     IntentStatus,
     PersistedActionReceipt,
@@ -758,6 +783,116 @@ def test_tool_observation_round_trips_json_safe_next_turn_content():
             content={"raw_http_response": {"token": "must-not-persist"}},
             artifact=observation.artifact,
         )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "artifact_type", "outcome_type", "arguments", "resource"),
+    [
+        (
+            "get_asset",
+            AssetToolArtifact,
+            AssetToolOutcome,
+            {"asset_id": "asset_G501"},
+            "/assets/asset_G501",
+        ),
+        (
+            "list_asset_analyses",
+            AnalysisListToolArtifact,
+            AnalysisListToolOutcome,
+            {"asset_id": "asset_G501"},
+            "/assets/asset_G501/analyses",
+        ),
+        (
+            "get_analysis",
+            AnalysisDetailToolArtifact,
+            AnalysisDetailToolOutcome,
+            {"analysis_id": "an_9906"},
+            "/analyses/an_9906",
+        ),
+        (
+            "get_baseline",
+            BaselineToolArtifact,
+            BaselineToolOutcome,
+            {"asset_id": "asset_G501", "point_id": None},
+            "/assets/asset_G501/baseline",
+        ),
+        (
+            "get_rms_series",
+            RmsToolArtifact,
+            RmsToolOutcome,
+            {"asset_id": "asset_G501", "point_id": None},
+            "/assets/asset_G501/rms",
+        ),
+        (
+            "get_spectrum",
+            SpectrumToolArtifact,
+            SpectrumToolOutcome,
+            {"asset_id": "asset_G501", "point_id": None},
+            "/assets/asset_G501/spectrum",
+        ),
+        (
+            "get_data_quality",
+            DataQualityToolArtifact,
+            DataQualityToolOutcome,
+            {"asset_id": "asset_G501", "point_id": None},
+            "/assets/asset_G501/data-quality",
+        ),
+        (
+            "get_model",
+            ModelToolArtifact,
+            ModelToolOutcome,
+            {},
+            "/models/mdl_vib_v3",
+        ),
+        (
+            "search_knowledge",
+            KnowledgeSearchToolArtifact,
+            KnowledgeSearchToolOutcome,
+            {"query": "rolamento"},
+            "/knowledge/search",
+        ),
+        (
+            "get_knowledge_document",
+            KnowledgeDocumentToolArtifact,
+            KnowledgeDocumentToolOutcome,
+            {"document_id": "kb_bearing_guidance"},
+            "/knowledge/kb_bearing_guidance",
+        ),
+    ],
+)
+def test_tool_observation_rehydrates_exact_read_artifact_after_json_round_trip(
+    tool_name,
+    artifact_type,
+    outcome_type,
+    arguments,
+    resource,
+):
+    error = ApiError(
+        category=ApiErrorCategory.TIMEOUT,
+        code="READ_TIMEOUT",
+        message="A consulta excedeu o tempo limite.",
+    )
+    artifact = artifact_type(
+        tool_name=tool_name,
+        arguments=arguments,
+        source=ToolSource(kind="industrial_api", resource=resource),
+        outcome=outcome_type(error=error),
+    )
+    observation = ToolObservation(
+        request_id="req_01",
+        call_id=f"call_{tool_name}",
+        content={"error": error.model_dump(mode="json")},
+        artifact=artifact,
+    )
+
+    restored = ToolObservation.model_validate_json(observation.model_dump_json())
+    restored_artifact = restored.artifact.validated_read_artifact()
+
+    assert type(restored_artifact) is artifact_type
+    assert type(restored_artifact.outcome) is outcome_type
+    assert restored_artifact.model_dump(mode="json") == artifact.model_dump(
+        mode="json"
+    )
 
 
 @pytest.mark.parametrize(

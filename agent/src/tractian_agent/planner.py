@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 import json
+import math
 import re
 from types import MappingProxyType
 from typing import Final, Literal
@@ -30,7 +32,7 @@ from pydantic import (
     model_validator,
 )
 
-from tractian_agent.contracts import StrictModel, SupportRequest
+from tractian_agent.contracts import ResponseMode, StrictModel, SupportRequest
 from tractian_agent.state import (
     AgentState,
     PlannerUsage,
@@ -39,6 +41,15 @@ from tractian_agent.state import (
     ToolObservation,
 )
 from tractian_agent.tools import READ_TOOLS, WRITE_PROPOSAL_TOOLS
+from tractian_agent.tools.analyses import (
+    AnalysisArtifact,
+    AnalysisDetailToolArtifact,
+    AnalysisListModelContent,
+    AnalysisListToolArtifact,
+    AnalysisSummary,
+    DegradedAnalysisListModelContent,
+)
+from tractian_agent.tools.assets import AssetModelContent, AssetToolArtifact
 from tractian_agent.tools.identifiers import (
     AnalysisId,
     KnowledgeDocumentId,
@@ -46,6 +57,28 @@ from tractian_agent.tools.identifiers import (
     PointId,
 )
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
+from tractian_agent.tools.knowledge import (
+    DegradedKnowledgeDocumentContent,
+    DegradedKnowledgeSearchModelContent,
+    DegradedModelContent,
+    KnowledgeDocumentContent,
+    KnowledgeDocumentToolArtifact,
+    KnowledgeSearchItem,
+    KnowledgeSearchModelContent,
+    KnowledgeSearchToolArtifact,
+    ModelArtifact,
+    ModelToolArtifact,
+)
+from tractian_agent.tools.technical import (
+    BaselineArtifact,
+    BaselineToolArtifact,
+    DataQualityArtifact,
+    DataQualityToolArtifact,
+    RmsModelContent,
+    RmsToolArtifact,
+    SpectrumModelContent,
+    SpectrumToolArtifact,
+)
 
 
 PLANNER_SYSTEM_PROMPT_VERSION: Final = "planner-v1"
@@ -154,6 +187,1062 @@ def _canonical_catalog_arguments(
     return canonical_wire
 
 
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _exact_model_wire(
+    schema: type[StrictModel],
+    value: object,
+) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        validated = schema.model_validate(value)
+        canonical = validated.model_dump(mode="json")
+        if _canonical_json(value) != _canonical_json(canonical):
+            return None
+    except (TypeError, ValueError, ValidationError):
+        return None
+    return canonical
+
+
+def _expected_read_resource(
+    tool_name: str,
+    arguments: Mapping[str, object],
+    actual_resource: str,
+    *,
+    configured_model_id: str | None,
+) -> str | None:
+    asset_id = arguments.get("asset_id")
+    analysis_id = arguments.get("analysis_id")
+    document_id = arguments.get("document_id")
+    resources = {
+        "get_asset": f"/assets/{asset_id}",
+        "list_asset_analyses": f"/assets/{asset_id}/analyses",
+        "get_analysis": f"/analyses/{analysis_id}",
+        "get_baseline": f"/assets/{asset_id}/baseline",
+        "get_rms_series": f"/assets/{asset_id}/rms",
+        "get_spectrum": f"/assets/{asset_id}/spectrum",
+        "get_data_quality": f"/assets/{asset_id}/data-quality",
+        "search_knowledge": "/knowledge/search",
+        "get_knowledge_document": f"/knowledge/{document_id}",
+    }
+    if tool_name != "get_model":
+        return resources.get(tool_name)
+    if configured_model_id is not None:
+        model_id = _validated_id(configured_model_id, _MODEL_ID_ADAPTER)
+        return f"/models/{model_id}" if model_id is not None else None
+    prefix = "/models/"
+    if not actual_resource.startswith(prefix):
+        return None
+    model_id = _validated_id(actual_resource.removeprefix(prefix), _MODEL_ID_ADAPTER)
+    return f"/models/{model_id}" if model_id is not None else None
+
+
+def _analysis_summary(analysis: AnalysisArtifact) -> AnalysisSummary:
+    return AnalysisSummary(
+        id=analysis.id,
+        asset_id=analysis.asset_id,
+        point_id=analysis.point_id,
+        type=analysis.type,
+        severity=analysis.severity,
+        confidence=analysis.confidence,
+        status=analysis.status,
+        created_at=analysis.created_at,
+        limitations=analysis.limitations,
+    )
+
+
+def _edge_preserving_projection(
+    items: Sequence[object],
+    limit: int,
+) -> list[object]:
+    """Replica a projeção pública usada pelas tools técnicas."""
+    if len(items) <= limit:
+        return list(items)
+    return [
+        items[(index * (len(items) - 1)) // (limit - 1)]
+        for index in range(limit)
+    ]
+
+
+def _complete_content_matches_artifact(
+    tool_name: str,
+    content: object,
+    artifact: ToolArtifact,
+) -> bool:
+    outcome = artifact.outcome
+    if tool_name == "get_asset" and isinstance(artifact, AssetToolArtifact):
+        asset = artifact.outcome.asset
+        if asset is None:
+            return False
+        expected = AssetModelContent(
+            id=asset.id,
+            name=asset.name,
+            criticality=asset.criticality,
+            machine_type=asset.technical_configuration.machine_type,
+            rotation_rpm=asset.technical_configuration.rotation_rpm,
+            sensor_status=asset.sensor_status,
+            points=asset.points,
+        ).model_dump(mode="json")
+        return _exact_model_wire(AssetModelContent, content) == expected
+    if tool_name == "list_asset_analyses" and isinstance(
+        artifact, AnalysisListToolArtifact
+    ):
+        analyses = artifact.outcome.analyses
+        if analyses is None:
+            return False
+        typed_analyses: list[AnalysisArtifact] = []
+        for item in analyses:
+            item_wire = _exact_model_wire(AnalysisArtifact, item)
+            if item_wire is None:
+                return False
+            typed_analyses.append(AnalysisArtifact.model_validate(item_wire))
+        total = artifact.outcome.total_analyses
+        if total is None:
+            return False
+        expected = AnalysisListModelContent(
+            analyses=[_analysis_summary(item) for item in typed_analyses[:20]],
+            total_analyses=total,
+            returned_analyses=min(total, 20),
+            omitted_analyses=max(total - 20, 0),
+            truncated=total > 20,
+        ).model_dump(mode="json")
+        return _exact_model_wire(AnalysisListModelContent, content) == expected
+    if tool_name == "get_analysis" and isinstance(
+        artifact, AnalysisDetailToolArtifact
+    ):
+        analysis = artifact.outcome.analysis
+        return analysis is not None and _exact_model_wire(
+            AnalysisArtifact,
+            content,
+        ) == analysis.model_dump(mode="json")
+    if tool_name == "get_baseline" and isinstance(
+        artifact, BaselineToolArtifact
+    ):
+        baseline = artifact.outcome.baseline
+        return baseline is not None and _exact_model_wire(
+            BaselineArtifact,
+            content,
+        ) == baseline.model_dump(mode="json")
+    if tool_name == "get_data_quality" and isinstance(
+        artifact, DataQualityToolArtifact
+    ):
+        data_quality = artifact.outcome.data_quality
+        return data_quality is not None and _exact_model_wire(
+            DataQualityArtifact,
+            content,
+        ) == data_quality.model_dump(mode="json")
+    if tool_name == "get_model" and isinstance(artifact, ModelToolArtifact):
+        model = artifact.outcome.model
+        model_wire = _exact_model_wire(ModelArtifact, model)
+        return model_wire is not None and _exact_model_wire(
+            ModelArtifact,
+            content,
+        ) == model_wire
+    if tool_name == "search_knowledge" and isinstance(
+        artifact, KnowledgeSearchToolArtifact
+    ):
+        results = artifact.outcome.results
+        total = artifact.outcome.total_results
+        if results is None or total is None:
+            return False
+        typed_results: list[KnowledgeSearchItem] = []
+        for item in results:
+            item_wire = _exact_model_wire(KnowledgeSearchItem, item)
+            if item_wire is None:
+                return False
+            typed_results.append(KnowledgeSearchItem.model_validate(item_wire))
+        expected = KnowledgeSearchModelContent(
+            results=typed_results,
+            total_results=total,
+            returned_results=len(results),
+            omitted_results=max(total - len(results), 0),
+            truncated=total > len(results),
+        ).model_dump(mode="json")
+        return _exact_model_wire(KnowledgeSearchModelContent, content) == expected
+    if tool_name == "get_knowledge_document" and isinstance(
+        artifact, KnowledgeDocumentToolArtifact
+    ):
+        document = artifact.outcome.document
+        document_wire = _exact_model_wire(KnowledgeDocumentContent, document)
+        if document_wire is None:
+            return False
+        document = KnowledgeDocumentContent.model_validate(document_wire)
+        total = (
+            document.returned_body_characters
+            + document.omitted_body_characters
+        )
+        if (
+            document.returned_body_characters != len(document.body)
+            or len(document.body) != min(total, 32_000)
+            or document.truncated != (document.omitted_body_characters > 0)
+        ):
+            return False
+        body = document.body[:8_000]
+        expected = KnowledgeDocumentContent(
+            id=document.id,
+            type=document.type,
+            title=document.title,
+            body=body,
+            tags=document.tags,
+            returned_body_characters=len(body),
+            omitted_body_characters=total - len(body),
+            truncated=total > len(body),
+        ).model_dump(mode="json")
+        return _exact_model_wire(KnowledgeDocumentContent, content) == expected
+    if tool_name == "get_rms_series" and isinstance(artifact, RmsToolArtifact):
+        rms = artifact.outcome.rms
+        wire = _exact_model_wire(RmsModelContent, content)
+        if rms is None or wire is None:
+            return False
+        expected_content_count = min(rms.total_samples, 100)
+        if len(wire["samples"]) != expected_content_count:
+            return False
+        samples_wire = [sample.model_dump(mode="json") for sample in rms.samples]
+        if rms.total_samples <= 1_000:
+            expected_samples = _edge_preserving_projection(samples_wire, 100)
+            if wire["samples"] != expected_samples:
+                return False
+        elif (
+            wire["samples"]
+            and samples_wire
+            and (
+                wire["samples"][0] != samples_wire[0]
+                or wire["samples"][-1] != samples_wire[-1]
+            )
+        ):
+            return False
+        return all(
+            wire[field] == getattr(rms, field)
+            for field in (
+                "asset_id",
+                "point_id",
+                "unit",
+                "baseline_reference",
+                "baseline_state",
+                "alarm_threshold",
+                "total_samples",
+            )
+        ) and wire["omitted_samples"] == rms.total_samples - expected_content_count
+    if tool_name == "get_spectrum" and isinstance(
+        artifact, SpectrumToolArtifact
+    ):
+        spectrum = artifact.outcome.spectrum
+        wire = _exact_model_wire(SpectrumModelContent, content)
+        if spectrum is None or wire is None:
+            return False
+        expected_content_count = min(spectrum.total_peaks, 20)
+        if len(wire["peaks"]) != expected_content_count:
+            return False
+        peaks_wire = [peak.model_dump(mode="json") for peak in spectrum.peaks]
+        if spectrum.total_peaks <= 200:
+            expected_peaks = _edge_preserving_projection(peaks_wire, 20)
+            if wire["peaks"] != expected_peaks:
+                return False
+        elif wire["peaks"] and peaks_wire and wire["peaks"][0] != peaks_wire[0]:
+            return False
+        if any(
+            left["freq_hz"] > right["freq_hz"]
+            for left, right in zip(wire["peaks"], wire["peaks"][1:])
+        ):
+            return False
+        return all(
+            wire[field] == getattr(spectrum, field)
+            for field in (
+                "asset_id",
+                "point_id",
+                "bands_missing",
+                "collected_at",
+                "total_peaks",
+            )
+        ) and wire["omitted_peaks"] == spectrum.total_peaks - expected_content_count
+    return False
+
+
+def _specialized_outcome_is_empty(artifact: ToolArtifact) -> bool:
+    base_fields = set(type(artifact.outcome).__mro__[1].model_fields)
+    specialized_fields = set(type(artifact.outcome).model_fields) - base_fields
+    return all(
+        getattr(artifact.outcome, field_name) is None
+        for field_name in specialized_fields
+    )
+
+
+def _recursive_scope_matches(
+    value: object,
+    *,
+    asset_id: str | None,
+    point_id: str | None,
+    company_id: str | None = None,
+) -> bool:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, Mapping):
+            for key, nested in current.items():
+                if key == "asset_id" and (
+                    not isinstance(nested, str) or nested != asset_id
+                ):
+                    return False
+                if key == "point_id":
+                    validated_point = _validated_id(nested, _POINT_ID_ADAPTER)
+                    if validated_point is None or (
+                        point_id is not None and validated_point != point_id
+                    ):
+                        return False
+                if key == "company_id" and (
+                    not isinstance(nested, str) or nested != company_id
+                ):
+                    return False
+                pending.append(nested)
+        elif isinstance(current, list):
+            pending.extend(current)
+    return True
+
+
+def _degraded_flags_are_valid(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) <= {"conflict", "inconclusive"}
+        and all(isinstance(item, bool) for item in value.values())
+    )
+
+
+def _aware_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _degraded_analysis_rows_are_concrete(rows: object) -> bool:
+    if not isinstance(rows, list):
+        return False
+    allowed = {
+        "id",
+        "asset_id",
+        "point_id",
+        "type",
+        "severity",
+        "confidence",
+        "status",
+        "created_at",
+        "limitations",
+    }
+    analysis_types = {
+        "none",
+        "imbalance",
+        "misalignment",
+        "bearing_fault",
+        "electrical_fault",
+        "looseness",
+        "lubrication",
+    }
+    severities = {"none", "low", "medium", "high", "critical"}
+    statuses = {"current", "stale", "pending", "inconclusive"}
+    dated: list[datetime] = []
+    saw_undated = False
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) - allowed:
+            return False
+        if "confidence" in row:
+            confidence = row["confidence"]
+            if (
+                isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not math.isfinite(confidence)
+                or not 0 <= confidence <= 1
+            ):
+                return False
+        if "type" in row and row["type"] not in analysis_types:
+            return False
+        if "severity" in row and row["severity"] not in severities:
+            return False
+        if "status" in row and row["status"] not in statuses:
+            return False
+        if "limitations" in row:
+            limitations = row["limitations"]
+            if not isinstance(limitations, list) or not all(
+                isinstance(item, str) for item in limitations
+            ):
+                return False
+        if "created_at" in row:
+            if saw_undated or not _aware_timestamp(row["created_at"]):
+                return False
+            dated.append(
+                datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+            )
+        else:
+            saw_undated = True
+    return all(left >= right for left, right in zip(dated, dated[1:]))
+
+
+def _degraded_search_rows_are_concrete(rows: object) -> bool:
+    if not isinstance(rows, list):
+        return False
+    allowed = {"id", "type", "title", "tags", "snippet"}
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) - allowed:
+            return False
+        if "type" in row and row["type"] not in {
+            "procedure",
+            "glossary",
+            "guidance",
+        }:
+            return False
+        if "title" in row:
+            title = row["title"]
+            if not isinstance(title, str) or not title.strip():
+                return False
+        if "tags" in row:
+            tags = row["tags"]
+            if not isinstance(tags, list) or not all(
+                isinstance(tag, str) and tag.strip() for tag in tags
+            ):
+                return False
+        if "snippet" in row:
+            snippet = row["snippet"]
+            if (
+                not isinstance(snippet, str)
+                or len(snippet) > 240
+                or re.sub(r"\s+", " ", snippet).strip() != snippet
+            ):
+                return False
+    return True
+
+
+def _degraded_model_is_concrete(model: object) -> bool:
+    if not isinstance(model, Mapping) or set(model) - {
+        "id",
+        "version",
+        "coverage",
+        "requirements",
+        "processing_state",
+        "last_run_at",
+    }:
+        return False
+    if "version" in model:
+        version = model["version"]
+        if not isinstance(version, str) or not version.strip():
+            return False
+    if "processing_state" in model and model["processing_state"] not in {
+        "idle",
+        "running",
+        "pending",
+        "delayed",
+        "failed",
+    }:
+        return False
+    if "last_run_at" in model and model["last_run_at"] is not None and not (
+        _aware_timestamp(model["last_run_at"])
+    ):
+        return False
+    if "coverage" in model:
+        coverage = model["coverage"]
+        if not isinstance(coverage, list):
+            return False
+        seen_machine_types: set[str] = set()
+        for item in coverage:
+            if not isinstance(item, Mapping) or set(item) - {
+                "machine_type",
+                "supported",
+                "can_learn_baseline",
+                "note",
+            }:
+                return False
+            machine_type = item.get("machine_type")
+            if machine_type is not None:
+                if (
+                    not isinstance(machine_type, str)
+                    or not machine_type.strip()
+                    or machine_type in seen_machine_types
+                ):
+                    return False
+                seen_machine_types.add(machine_type)
+            for flag in ("supported", "can_learn_baseline"):
+                if flag in item and not isinstance(item[flag], bool):
+                    return False
+            note = item.get("note")
+            if note is not None and (
+                not isinstance(note, str) or not note.strip()
+            ):
+                return False
+    if "requirements" in model:
+        requirements = model["requirements"]
+        if not isinstance(requirements, Mapping) or set(requirements) - {
+            "min_completeness",
+            "min_snr_db",
+            "min_rotation_rpm",
+        }:
+            return False
+        for key, maximum in (
+            ("min_completeness", 1.0),
+            ("min_snr_db", None),
+            ("min_rotation_rpm", None),
+        ):
+            if key not in requirements:
+                continue
+            value = requirements[key]
+            if value is None and key == "min_rotation_rpm":
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+                or (maximum is not None and value > maximum)
+            ):
+                return False
+    return True
+
+
+def _degraded_document_is_concrete(document: object) -> bool:
+    if not isinstance(document, Mapping) or set(document) - {
+        "id",
+        "type",
+        "title",
+        "body",
+        "tags",
+        "returned_body_characters",
+        "omitted_body_characters",
+        "truncated",
+    }:
+        return False
+    if "type" in document and document["type"] not in {
+        "procedure",
+        "glossary",
+        "guidance",
+    }:
+        return False
+    if "title" in document:
+        title = document["title"]
+        if not isinstance(title, str) or not title.strip():
+            return False
+    if "tags" in document:
+        tags = document["tags"]
+        if not isinstance(tags, list) or not all(
+            isinstance(tag, str) and tag.strip() for tag in tags
+        ):
+            return False
+    body_fields = {
+        "returned_body_characters",
+        "omitted_body_characters",
+        "truncated",
+    }
+    if "body" not in document:
+        return body_fields.isdisjoint(document)
+    body = document["body"]
+    returned = document.get("returned_body_characters")
+    omitted = document.get("omitted_body_characters")
+    truncated = document.get("truncated")
+    if (
+        not isinstance(body, str)
+        or not isinstance(returned, int)
+        or isinstance(returned, bool)
+        or not isinstance(omitted, int)
+        or isinstance(omitted, bool)
+        or omitted < 0
+        or not isinstance(truncated, bool)
+    ):
+        return False
+    total = returned + omitted
+    return (
+        returned == len(body) == min(total, 32_000)
+        and truncated == (omitted > 0)
+    )
+
+
+def _artifact_scope_matches(
+    call: PersistedToolCall,
+    artifact: ToolArtifact,
+    request: SupportRequest | PersistedSupportRequest,
+    *,
+    configured_model_id: str | None,
+) -> bool:
+    arguments = call.arguments.to_python()
+    if not isinstance(arguments, Mapping):
+        return False
+    requested_asset = arguments.get("asset_id")
+    requested_point = arguments.get("point_id")
+    if call.name == "get_asset" and isinstance(artifact, AssetToolArtifact):
+        asset = artifact.outcome.asset
+        return (
+            asset is not None
+            and asset.id == requested_asset == request.asset_id
+            and asset.company_id == request.identity.company_id
+            and all(
+                _validated_id(point.id, _POINT_ID_ADAPTER) is not None
+                for point in asset.points
+            )
+        )
+    if call.name == "list_asset_analyses" and isinstance(
+        artifact, AnalysisListToolArtifact
+    ):
+        analyses = artifact.outcome.analyses
+        complete = artifact.outcome.mode is ResponseMode.COMPLETE
+        if analyses is None or (
+            not complete and not _degraded_analysis_rows_are_concrete(analyses)
+        ):
+            return False
+        seen_ids: set[str] = set()
+        for item in analyses:
+            if complete:
+                complete_item_wire = _exact_model_wire(AnalysisArtifact, item)
+                if complete_item_wire is None:
+                    return False
+                item_wire = complete_item_wire
+            elif isinstance(item, Mapping):
+                item_wire = item
+            else:
+                return False
+            item_id = item_wire.get("id")
+            if item_id is not None:
+                validated_id = _validated_id(item_id, _ANALYSIS_ID_ADAPTER)
+                if validated_id is None or validated_id in seen_ids:
+                    return False
+                seen_ids.add(validated_id)
+            if (
+                item_wire.get("asset_id", requested_asset) != requested_asset
+                or item_wire.get("asset_id", request.asset_id) != request.asset_id
+            ):
+                return False
+            if "point_id" in item_wire and _validated_id(
+                item_wire["point_id"],
+                _POINT_ID_ADAPTER,
+            ) is None:
+                return False
+            status = arguments.get("status")
+            if status is not None and item_wire.get("status") != status:
+                return False
+        return requested_asset == request.asset_id
+    if call.name == "get_analysis" and isinstance(
+        artifact, AnalysisDetailToolArtifact
+    ):
+        analysis = artifact.outcome.analysis
+        return (
+            analysis is not None
+            and analysis.id == arguments.get("analysis_id")
+            and analysis.asset_id == request.asset_id
+            and _validated_id(analysis.point_id, _POINT_ID_ADAPTER) is not None
+        )
+    if call.name in {
+        "get_baseline",
+        "get_rms_series",
+        "get_spectrum",
+        "get_data_quality",
+    }:
+        field_name = {
+            "get_baseline": "baseline",
+            "get_rms_series": "rms",
+            "get_spectrum": "spectrum",
+            "get_data_quality": "data_quality",
+        }[call.name]
+        result = getattr(artifact.outcome, field_name, None)
+        return (
+            result is not None
+            and result.asset_id == requested_asset == request.asset_id
+            and _validated_id(result.point_id, _POINT_ID_ADAPTER) is not None
+            and (requested_point is None or result.point_id == requested_point)
+        )
+    if call.name == "get_model" and isinstance(artifact, ModelToolArtifact):
+        model = artifact.outcome.model
+        expected_model_id = configured_model_id
+        if expected_model_id is None:
+            expected_model_id = artifact.source.resource.removeprefix("/models/")
+        if isinstance(model, ModelArtifact):
+            return model.id == expected_model_id
+        if not _degraded_model_is_concrete(model):
+            return False
+        returned_id = model.get("id")
+        return returned_id is None or (
+            _validated_id(returned_id, _MODEL_ID_ADAPTER) == expected_model_id
+        )
+    if call.name == "search_knowledge" and isinstance(
+        artifact, KnowledgeSearchToolArtifact
+    ):
+        results = artifact.outcome.results
+        if results is None or not _degraded_search_rows_are_concrete(results):
+            return False
+        seen_ids: set[str] = set()
+        requested_type = arguments.get("document_type")
+        for item in results:
+            item_wire = (
+                item.model_dump(mode="json")
+                if isinstance(item, KnowledgeSearchItem)
+                else item
+            )
+            if not isinstance(item_wire, Mapping) or set(item_wire) - {
+                "id",
+                "type",
+                "title",
+                "tags",
+                "snippet",
+            }:
+                return False
+            item_id = item_wire.get("id")
+            if item_id is not None:
+                validated_id = _validated_id(item_id, _KNOWLEDGE_ID_ADAPTER)
+                if validated_id is None or validated_id in seen_ids:
+                    return False
+                seen_ids.add(validated_id)
+            if requested_type is not None and item_wire.get("type") != requested_type:
+                return False
+        return True
+    if call.name == "get_knowledge_document" and isinstance(
+        artifact, KnowledgeDocumentToolArtifact
+    ):
+        document = artifact.outcome.document
+        if isinstance(document, KnowledgeDocumentContent):
+            document_id = document.id
+        elif isinstance(document, Mapping):
+            document_id = document.get("id")
+        else:
+            return False
+        return (
+            _degraded_document_is_concrete(document)
+            and document_id in {None, arguments.get("document_id")}
+        )
+    return False
+
+
+def _artifact_projection_metadata_matches(
+    tool_name: str,
+    artifact: ToolArtifact,
+) -> bool:
+    outcome = artifact.outcome
+    if tool_name == "list_asset_analyses" and isinstance(
+        artifact, AnalysisListToolArtifact
+    ):
+        items = outcome.analyses
+        total = outcome.total_analyses
+        return (
+            items is not None
+            and total is not None
+            and len(items) == min(total, 200)
+            and outcome.returned_analyses == len(items)
+            and outcome.omitted_analyses == total - len(items)
+            and artifact.omitted_items == total - len(items)
+            and artifact.truncated == (total > len(items))
+        )
+    if tool_name == "search_knowledge" and isinstance(
+        artifact, KnowledgeSearchToolArtifact
+    ):
+        items = outcome.results
+        total = outcome.total_results
+        return (
+            items is not None
+            and total is not None
+            and len(items) == min(total, 10)
+            and outcome.returned_results == len(items)
+            and outcome.omitted_results == total - len(items)
+            and artifact.omitted_items == total - len(items)
+            and artifact.truncated == (total > len(items))
+        )
+    if tool_name == "get_knowledge_document" and isinstance(
+        artifact,
+        KnowledgeDocumentToolArtifact,
+    ):
+        document = artifact.outcome.document
+        return artifact.omitted_items == 0 and (
+            not isinstance(document, Mapping)
+            or artifact.truncated == bool(document.get("truncated", False))
+        ) and (
+            not isinstance(document, KnowledgeDocumentContent)
+            or artifact.truncated == document.truncated
+        )
+    if tool_name == "get_rms_series" and isinstance(artifact, RmsToolArtifact):
+        rms = outcome.rms
+        return rms is not None and (
+            len(rms.samples) == min(rms.total_samples, 1_000)
+            and rms.total_samples >= len(rms.samples)
+            and all(
+                datetime.fromisoformat(left.ts.replace("Z", "+00:00"))
+                <= datetime.fromisoformat(right.ts.replace("Z", "+00:00"))
+                for left, right in zip(rms.samples, rms.samples[1:])
+            )
+            and
+            artifact.omitted_items == rms.total_samples - len(rms.samples)
+            and artifact.truncated == (rms.total_samples > len(rms.samples))
+        )
+    if tool_name == "get_spectrum" and isinstance(
+        artifact, SpectrumToolArtifact
+    ):
+        spectrum = outcome.spectrum
+        return spectrum is not None and (
+            len(spectrum.peaks) == min(spectrum.total_peaks, 200)
+            and spectrum.total_peaks >= len(spectrum.peaks)
+            and all(
+                left.freq_hz <= right.freq_hz
+                for left, right in zip(spectrum.peaks, spectrum.peaks[1:])
+            )
+            and
+            artifact.omitted_items == spectrum.total_peaks - len(spectrum.peaks)
+            and artifact.truncated == (spectrum.total_peaks > len(spectrum.peaks))
+        )
+    return not artifact.truncated and artifact.omitted_items == 0
+
+
+def _generic_degraded_content(artifact: ToolArtifact) -> dict[str, object]:
+    outcome = artifact.outcome
+    return {
+        "mode": outcome.mode.value if outcome.mode is not None else None,
+        "notes": outcome.notes,
+        "partial_data": outcome.partial_data,
+    }
+
+
+def _degraded_content_matches_artifact(
+    tool_name: str,
+    content: object,
+    artifact: ToolArtifact,
+) -> bool:
+    outcome = artifact.outcome
+    if tool_name in {
+        "get_asset",
+        "get_analysis",
+        "get_baseline",
+        "get_rms_series",
+        "get_spectrum",
+        "get_data_quality",
+    }:
+        return (
+            _specialized_outcome_is_empty(artifact)
+            and _canonical_json(content)
+            == _canonical_json(_generic_degraded_content(artifact))
+        )
+    if tool_name == "list_asset_analyses" and isinstance(
+        artifact, AnalysisListToolArtifact
+    ):
+        analyses = outcome.analyses
+        if analyses is None:
+            return _canonical_json(content) == _canonical_json(
+                _generic_degraded_content(artifact)
+            )
+        total = outcome.total_analyses
+        if total is None:
+            return False
+        if not _degraded_flags_are_valid(outcome.partial_data):
+            return False
+        expected = DegradedAnalysisListModelContent(
+            mode=outcome.mode,
+            notes=outcome.notes,
+            analyses=analyses[:20],
+            total_analyses=total,
+            returned_analyses=min(total, 20),
+            omitted_analyses=max(total - 20, 0),
+            truncated=total > 20,
+            partial_data=outcome.partial_data,
+        ).model_dump(mode="json")
+        return _exact_model_wire(DegradedAnalysisListModelContent, content) == expected
+    if tool_name == "get_model" and isinstance(artifact, ModelToolArtifact):
+        model = outcome.model
+        if (
+            not _degraded_model_is_concrete(model)
+            or not _degraded_flags_are_valid(outcome.partial_data)
+        ):
+            return False
+        expected = DegradedModelContent(
+            mode=outcome.mode,
+            notes=outcome.notes,
+            model=model,
+            partial_data=outcome.partial_data,
+        ).model_dump(mode="json")
+        return _exact_model_wire(DegradedModelContent, content) == expected
+    if tool_name == "search_knowledge" and isinstance(
+        artifact, KnowledgeSearchToolArtifact
+    ):
+        results = outcome.results
+        total = outcome.total_results
+        if results is None or total is None:
+            return False
+        if (
+            not _degraded_search_rows_are_concrete(results)
+            or not _degraded_flags_are_valid(outcome.partial_data)
+        ):
+            return False
+        expected = DegradedKnowledgeSearchModelContent(
+            mode=outcome.mode,
+            notes=outcome.notes,
+            results=results,
+            total_results=total,
+            returned_results=len(results),
+            omitted_results=max(total - len(results), 0),
+            truncated=total > len(results),
+            partial_data=outcome.partial_data,
+        ).model_dump(mode="json")
+        return _exact_model_wire(
+            DegradedKnowledgeSearchModelContent,
+            content,
+        ) == expected
+    if tool_name == "get_knowledge_document" and isinstance(
+        artifact, KnowledgeDocumentToolArtifact
+    ):
+        document = outcome.document
+        if (
+            not _degraded_document_is_concrete(document)
+            or not _degraded_flags_are_valid(outcome.partial_data)
+        ):
+            return False
+        content_document = dict(document)
+        body = content_document.get("body")
+        if isinstance(body, str):
+            total = len(body) + int(
+                content_document.get("omitted_body_characters", 0)
+            )
+            trimmed = body[:8_000]
+            content_document.update(
+                body=trimmed,
+                returned_body_characters=len(trimmed),
+                omitted_body_characters=total - len(trimmed),
+                truncated=total > len(trimmed),
+            )
+        expected = DegradedKnowledgeDocumentContent(
+            mode=outcome.mode,
+            notes=outcome.notes,
+            document=content_document,
+            partial_data=outcome.partial_data,
+        ).model_dump(mode="json")
+        return _exact_model_wire(
+            DegradedKnowledgeDocumentContent,
+            content,
+        ) == expected
+    return False
+
+
+def _read_observation_is_semantically_valid(
+    call: PersistedToolCall,
+    observation: ToolObservation,
+    request: SupportRequest | PersistedSupportRequest,
+    *,
+    configured_model_id: str | None,
+) -> bool:
+    try:
+        artifact = observation.artifact.validated_read_artifact()
+        arguments = call.arguments.to_python()
+        content = observation.content.to_python() if observation.content else None
+        if artifact is None or not isinstance(arguments, Mapping):
+            return False
+        expected_resource = _expected_read_resource(
+            call.name,
+            arguments,
+            artifact.source.resource,
+            configured_model_id=configured_model_id,
+        )
+        if artifact.source.resource != expected_resource:
+            return False
+        outcome = artifact.outcome
+        if outcome.error is not None:
+            return (
+                outcome.mode is None
+                and outcome.notes is None
+                and outcome.partial_data is None
+                and _specialized_outcome_is_empty(artifact)
+                and not artifact.truncated
+                and artifact.omitted_items == 0
+                and _canonical_json(content)
+                == _canonical_json(
+                    {"error": outcome.error.model_dump(mode="json")}
+                )
+            )
+        if outcome.mode is ResponseMode.COMPLETE:
+            complete_partial_data_is_valid = outcome.partial_data is None
+            if call.name == "search_knowledge":
+                complete_partial_data_is_valid = _degraded_flags_are_valid(
+                    outcome.partial_data
+                )
+            return (
+                complete_partial_data_is_valid
+                and _complete_content_matches_artifact(
+                    call.name,
+                    content,
+                    artifact,
+                )
+                and _artifact_scope_matches(
+                    call,
+                    artifact,
+                    request,
+                    configured_model_id=configured_model_id,
+                )
+                and _artifact_projection_metadata_matches(call.name, artifact)
+            )
+        if outcome.mode is None:
+            return False
+        if not _degraded_content_matches_artifact(
+            call.name,
+            content,
+            artifact,
+        ):
+            return False
+        if call.name in {
+            "get_asset",
+            "get_analysis",
+            "get_baseline",
+            "get_rms_series",
+            "get_spectrum",
+            "get_data_quality",
+        }:
+            if call.name == "get_analysis" and isinstance(
+                outcome.partial_data,
+                Mapping,
+            ):
+                expected_analysis_id = arguments.get("analysis_id")
+                for field_name in ("id", "analysis_id"):
+                    if field_name in outcome.partial_data and (
+                        _validated_id(
+                            outcome.partial_data[field_name],
+                            _ANALYSIS_ID_ADAPTER,
+                        )
+                        != expected_analysis_id
+                    ):
+                        return False
+            return (
+                not artifact.truncated
+                and artifact.omitted_items == 0
+                and _recursive_scope_matches(
+                    outcome.partial_data,
+                    asset_id=request.asset_id,
+                    point_id=arguments.get("point_id"),
+                    company_id=request.identity.company_id,
+                )
+            )
+        if call.name == "list_asset_analyses" and isinstance(
+            artifact,
+            AnalysisListToolArtifact,
+        ) and artifact.outcome.analyses is None:
+            return (
+                artifact.outcome.total_analyses is None
+                and artifact.outcome.returned_analyses is None
+                and artifact.outcome.omitted_analyses is None
+                and not artifact.truncated
+                and artifact.omitted_items == 0
+                and _recursive_scope_matches(
+                    outcome.partial_data,
+                    asset_id=request.asset_id,
+                    point_id=None,
+                    company_id=request.identity.company_id,
+                )
+            )
+        return _artifact_scope_matches(
+            call,
+            artifact,
+            request,
+            configured_model_id=configured_model_id,
+        ) and _artifact_projection_metadata_matches(call.name, artifact)
+    except (AttributeError, KeyError, TypeError, ValueError, ValidationError):
+        return False
+
+
 def _typed_ids(
     texts: Sequence[str],
     *,
@@ -208,6 +1297,14 @@ def _structured_observation_ids(
     call: PersistedToolCall,
     observation: ToolObservation,
 ) -> _PlannerAuthorizedTargets:
+    artifact = observation.artifact.validated_read_artifact()
+    if artifact is None or artifact.outcome.error is not None:
+        return _PlannerAuthorizedTargets(
+            analysis_ids=frozenset(),
+            knowledge_document_ids=frozenset(),
+            model_ids=frozenset(),
+            point_ids=frozenset(),
+        )
     content = (
         observation.content.to_python()
         if observation.content is not None
@@ -351,34 +1448,78 @@ def _selected_targets_are_authorized(
     return True
 
 
-def _current_request_interactions(
-    state: AgentState,
+def _validated_current_interactions(
+    request: SupportRequest | PersistedSupportRequest,
+    request_id: str,
+    tool_calls: Sequence[PersistedToolCall],
+    tool_observations: Sequence[ToolObservation],
+    *,
+    usage: PlannerUsage | None = None,
+    configured_model_id: str | None = None,
 ) -> tuple[tuple[PersistedToolCall, ToolObservation], ...]:
-    calls_by_id = {
-        call.call_id: call
-        for call in state.tool_calls
-        if call.request_id == state.request_id
-    }
+    calls = tuple(call for call in tool_calls if call.request_id == request_id)
+    observations = tuple(
+        observation
+        for observation in tool_observations
+        if observation.request_id == request_id
+    )
+    call_ids = tuple(call.call_id for call in calls)
+    observation_ids = tuple(observation.call_id for observation in observations)
+    if (
+        len(calls) != len(observations)
+        or len(call_ids) != len(set(call_ids))
+        or len(observation_ids) != len(set(observation_ids))
+    ):
+        raise PlannerProtocolError(PlannerErrorCode.INVALID_HISTORY, usage=usage)
     interactions: list[tuple[PersistedToolCall, ToolObservation]] = []
-    for observation in state.tool_observations:
-        call = calls_by_id.get(observation.call_id)
+    for call, observation in zip(calls, observations, strict=True):
+        call_arguments = _canonical_catalog_arguments(
+            call.name,
+            call.arguments.to_python(),
+        )
+        artifact_arguments = _canonical_catalog_arguments(
+            call.name,
+            observation.artifact.arguments.to_python(),
+        )
         if (
-            call is None
-            or observation.request_id != state.request_id
+            observation.call_id != call.call_id
             or observation.content is None
             or observation.artifact.tool_name != call.name
-            or observation.artifact.arguments != call.arguments
+            or call_arguments is None
+            or artifact_arguments != call_arguments
         ):
-            continue
-        authorized = _authorized_targets(state.request.message, interactions)
+            raise PlannerProtocolError(
+                PlannerErrorCode.INVALID_HISTORY,
+                usage=usage,
+            )
+        canonical_call = PersistedToolCall(
+            request_id=call.request_id,
+            call_id=call.call_id,
+            name=call.name,
+            arguments=call_arguments,
+        )
+        if not _read_observation_is_semantically_valid(
+            canonical_call,
+            observation,
+            request,
+            configured_model_id=configured_model_id,
+        ):
+            raise PlannerProtocolError(
+                PlannerErrorCode.INVALID_HISTORY,
+                usage=usage,
+            )
+        authorized = _authorized_targets(request.message, interactions)
         if not _selected_targets_are_authorized(
-            tool_name=call.name,
-            arguments=call.arguments.to_python(),
-            request=state.request,
+            tool_name=canonical_call.name,
+            arguments=canonical_call.arguments.to_python(),
+            request=request,
             authorized=authorized,
         ):
-            continue
-        interactions.append((call, observation))
+            raise PlannerProtocolError(
+                PlannerErrorCode.INVALID_HISTORY,
+                usage=usage,
+            )
+        interactions.append((canonical_call, observation))
     return tuple(interactions)
 
 
@@ -403,7 +1544,13 @@ def select_planner_tools(
         raise PlannerProtocolError(PlannerErrorCode.RUNTIME_SCOPE_MISMATCH)
     authorized = _authorized_targets(
         state.request.message,
-        _current_request_interactions(state),
+        _validated_current_interactions(
+            state.request,
+            state.request_id,
+            state.tool_calls,
+            state.tool_observations,
+            configured_model_id=runtime.configured_model_id,
+        ),
     )
     has_scoped_asset = (
         state.request.asset_id is not None
@@ -698,59 +1845,18 @@ class Planner:
             separators=(",", ":"),
             sort_keys=True,
         )
-        calls = tuple(
-            call for call in tool_calls if call.request_id == request_id
+        validated_interactions = _validated_current_interactions(
+            request,
+            request_id,
+            tool_calls,
+            tool_observations,
+            usage=active_usage,
         )
+        calls = tuple(call for call, _ in validated_interactions)
         observations = tuple(
-            observation
-            for observation in tool_observations
-            if observation.request_id == request_id
+            observation for _, observation in validated_interactions
         )
-        if len(calls) != len(observations):
-            raise PlannerProtocolError(
-                PlannerErrorCode.INVALID_HISTORY,
-                usage=active_usage,
-            )
         call_ids = tuple(call.call_id for call in calls)
-        observation_ids = tuple(observation.call_id for observation in observations)
-        if (
-            len(call_ids) != len(set(call_ids))
-            or len(observation_ids) != len(set(observation_ids))
-        ):
-            raise PlannerProtocolError(
-                PlannerErrorCode.INVALID_HISTORY,
-                usage=active_usage,
-            )
-        canonical_calls: list[PersistedToolCall] = []
-        for call, observation in zip(calls, observations, strict=True):
-            call_arguments = _canonical_catalog_arguments(
-                call.name,
-                call.arguments.to_python(),
-            )
-            artifact_arguments = _canonical_catalog_arguments(
-                call.name,
-                observation.artifact.arguments.to_python(),
-            )
-            if (
-                observation.call_id != call.call_id
-                or observation.content is None
-                or observation.artifact.tool_name != call.name
-                or call_arguments is None
-                or artifact_arguments != call_arguments
-            ):
-                raise PlannerProtocolError(
-                    PlannerErrorCode.INVALID_HISTORY,
-                    usage=active_usage,
-                )
-            canonical_calls.append(
-                PersistedToolCall(
-                    request_id=call.request_id,
-                    call_id=call.call_id,
-                    name=call.name,
-                    arguments=call_arguments,
-                )
-            )
-        calls = tuple(canonical_calls)
         call_fingerprints = tuple(_tool_call_fingerprint(call) for call in calls)
         if len(call_fingerprints) != len(set(call_fingerprints)):
             raise PlannerProtocolError(
@@ -774,21 +1880,6 @@ class Planner:
         for index, (call, observation) in enumerate(
             zip(calls, observations, strict=True)
         ):
-            historical_arguments = call.arguments.to_python()
-            historical_authorized = _authorized_targets(
-                request.message,
-                authorized_interactions,
-            )
-            if not _selected_targets_are_authorized(
-                tool_name=call.name,
-                arguments=historical_arguments,
-                request=request,
-                authorized=historical_authorized,
-            ):
-                raise PlannerProtocolError(
-                    PlannerErrorCode.INVALID_HISTORY,
-                    usage=active_usage,
-                )
             authorized_interactions.append((call, observation))
             interactions.append(
                 (

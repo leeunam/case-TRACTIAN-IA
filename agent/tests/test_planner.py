@@ -17,7 +17,7 @@ from pydantic import PrivateAttr, ValidationError
 
 from tractian_agent.checkpoint import open_checkpointer
 from tractian_agent.client import IndustrialApiClient
-from tractian_agent.contracts import Identity, SupportRequest
+from tractian_agent.contracts import ApiError, ApiErrorCategory, Identity, ResponseMode, SupportRequest
 from tractian_agent.planner import (
     PLANNER_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT_VERSION,
@@ -39,12 +39,41 @@ from tractian_agent.state import (
     ThreadScope,
     ToolObservation,
 )
-from tractian_agent.tools.analyses import get_analysis, list_asset_analyses
+from tractian_agent.tools.analyses import (
+    AnalysisArtifact,
+    AnalysisDetailToolArtifact,
+    AnalysisDetailToolOutcome,
+    AnalysisListToolArtifact,
+    AnalysisListToolOutcome,
+    DegradedAnalysisListModelContent,
+    get_analysis,
+    list_asset_analyses,
+)
 from tractian_agent.tools.assets import get_asset
-from tractian_agent.tools.knowledge import get_knowledge_document, search_knowledge
+from tractian_agent.tools.knowledge import (
+    DegradedKnowledgeDocumentContent,
+    DegradedKnowledgeSearchModelContent,
+    DegradedModelContent,
+    KnowledgeDocumentToolArtifact,
+    KnowledgeDocumentToolOutcome,
+    KnowledgeDocumentContent,
+    KnowledgeSearchModelContent,
+    KnowledgeSearchItem,
+    KnowledgeSearchToolArtifact,
+    KnowledgeSearchToolOutcome,
+    ModelToolArtifact,
+    ModelToolOutcome,
+    get_knowledge_document,
+    search_knowledge,
+)
 from tractian_agent.tools.observations import ToolArtifact, ToolOutcome, ToolSource
 from tractian_agent.tools import READ_TOOLS, WRITE_PROPOSAL_TOOLS
-from tractian_agent.tools.technical import get_baseline
+from tractian_agent.tools.technical import (
+    BaselineArtifact,
+    BaselineToolArtifact,
+    BaselineToolOutcome,
+    get_baseline,
+)
 from tractian_agent.tools.runtime import (
     ReadToolRuntime,
     TrustedIdentity,
@@ -205,7 +234,13 @@ def _planner_history(
                 "query": f"historico autorizado {index}",
                 "document_type": None,
             }
-            content = {"results": [], "query_index": index}
+            content = KnowledgeSearchModelContent(
+                results=[],
+                total_results=0,
+                returned_results=0,
+                omitted_results=0,
+                truncated=False,
+            ).model_dump(mode="json")
             resource = "/knowledge/search"
         else:
             asset_id = f"asset_G{500 + index}"
@@ -225,18 +260,118 @@ def _planner_history(
                 request_id=request_id,
                 call_id=call.call_id,
                 content=content,
-                artifact=ToolArtifact(
-                    tool_name=call.name,
-                    arguments=arguments,
-                    source=ToolSource(
-                        kind="industrial_api",
-                        resource=resource,
-                    ),
-                    outcome=ToolOutcome(partial_data=content),
+                artifact=(
+                    KnowledgeSearchToolArtifact(
+                        tool_name=call.name,
+                        arguments=arguments,
+                        source=ToolSource(
+                            kind="industrial_api",
+                            resource=resource,
+                        ),
+                        outcome=KnowledgeSearchToolOutcome(
+                            mode=ResponseMode.COMPLETE,
+                            partial_data={},
+                            results=[],
+                            total_results=0,
+                            returned_results=0,
+                            omitted_results=0,
+                        ),
+                    )
+                    if request_id == "req_planner_01"
+                    else ToolArtifact(
+                        tool_name=call.name,
+                        arguments=arguments,
+                        source=ToolSource(
+                            kind="industrial_api",
+                            resource=resource,
+                        ),
+                        outcome=ToolOutcome(partial_data=content),
+                    )
                 ),
             )
         )
     return tuple(calls), tuple(observations)
+
+
+def _analysis_list_observation(
+    call: PersistedToolCall,
+    *,
+    analysis_ids: tuple[str, ...] = (),
+    notes: str | None = None,
+    partial_data: object = None,
+) -> ToolObservation:
+    rows = [
+        {"id": analysis_id, "asset_id": "asset_G501"}
+        for analysis_id in analysis_ids
+    ]
+    flags = {} if partial_data is None else partial_data
+    content = (
+        DegradedAnalysisListModelContent(
+            mode=ResponseMode.PARTIAL,
+            notes=notes,
+            analyses=rows,
+            total_analyses=len(rows),
+            returned_analyses=len(rows),
+            omitted_analyses=0,
+            truncated=False,
+            partial_data=flags,
+        ).model_dump(mode="json")
+        if analysis_ids
+        else {
+            "mode": ResponseMode.PARTIAL.value,
+            "notes": notes,
+            "partial_data": flags,
+        }
+    )
+    return ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=content,
+        artifact=AnalysisListToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/analyses",
+            ),
+            outcome=AnalysisListToolOutcome(
+                mode=ResponseMode.PARTIAL,
+                notes=notes,
+                partial_data=flags,
+                analyses=rows if analysis_ids else None,
+                total_analyses=len(rows) if analysis_ids else None,
+                returned_analyses=len(rows) if analysis_ids else None,
+                omitted_analyses=0 if analysis_ids else None,
+            ),
+        ),
+    )
+
+
+def _successful_search_observation(call: PersistedToolCall) -> ToolObservation:
+    return ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=KnowledgeSearchModelContent(
+            results=[],
+            total_results=0,
+            returned_results=0,
+            omitted_results=0,
+            truncated=False,
+        ).model_dump(mode="json"),
+        artifact=KnowledgeSearchToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(kind="industrial_api", resource="/knowledge/search"),
+            outcome=KnowledgeSearchToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                partial_data={},
+                results=[],
+                total_results=0,
+                returned_results=0,
+                omitted_results=0,
+            ),
+        ),
+    )
 
 
 def test_select_planner_tools_reuses_read_catalog_only_with_read_permission():
@@ -294,19 +429,9 @@ def test_select_planner_tools_uses_only_ids_observed_for_current_request():
         name="list_asset_analyses",
         arguments={"asset_id": "asset_G501"},
     )
-    old_observation = ToolObservation(
-        request_id="req_old",
-        call_id=old_call.call_id,
-        content={"analyses": [{"id": "an_old_request"}]},
-        artifact=ToolArtifact(
-            tool_name=old_call.name,
-            arguments={"asset_id": "asset_G501"},
-            source=ToolSource(
-                kind="industrial_api",
-                resource="/assets/asset_G501/analyses",
-            ),
-            outcome=ToolOutcome(partial_data={"id": "an_old_request"}),
-        ),
+    old_observation = _analysis_list_observation(
+        old_call,
+        analysis_ids=("an_old_request",),
     )
     names_with_old_only = {
         tool.name
@@ -321,11 +446,9 @@ def test_select_planner_tools_uses_only_ids_observed_for_current_request():
     current_call = old_call.model_copy(
         update={"request_id": "req_planner_01", "call_id": "call_current"}
     )
-    current_observation = ToolObservation(
-        request_id="req_planner_01",
-        call_id="call_current",
-        content={"analyses": [{"id": "an_current_request"}]},
-        artifact=old_observation.artifact,
+    current_observation = _analysis_list_observation(
+        current_call,
+        analysis_ids=("an_current_request",),
     )
     names_with_current = {
         tool.name
@@ -342,6 +465,439 @@ def test_select_planner_tools_uses_only_ids_observed_for_current_request():
     assert "get_analysis" in names_with_current
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "content", "resource"),
+    [
+        (
+            "search_knowledge",
+            {"query": "x"},
+            {"results": [{"id": "kb_from_short_query"}]},
+            "/knowledge/search",
+        ),
+        (
+            "search_knowledge",
+            {"query": "rolamento", "unexpected": "SELECTOR_EXTRA_SENTINEL"},
+            {"results": [{"id": "kb_from_extra_field"}]},
+            "/knowledge/search",
+        ),
+        (
+            "list_asset_analyses",
+            {"asset_id": "asset_G501", "unexpected": "SELECTOR_LIST_SENTINEL"},
+            {"analyses": [{"id": "an_from_invalid_list"}]},
+            "/assets/asset_G501/analyses",
+        ),
+    ],
+    ids=["short-query", "extra-field", "invalid-list-analyses"],
+)
+def test_select_planner_tools_rejects_invalid_current_producer_history(
+    tool_name,
+    arguments,
+    content,
+    resource,
+):
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_invalid_selector_{tool_name}_{len(arguments)}",
+        name=tool_name,
+        arguments=arguments,
+    )
+    observation = ToolObservation(
+        request_id="req_planner_01",
+        call_id=call.call_id,
+        content=content,
+        artifact=ToolArtifact(
+            tool_name=call.name,
+            arguments=arguments,
+            source=ToolSource(kind="industrial_api", resource=resource),
+            outcome=ToolOutcome(mode="complete"),
+        ),
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(
+            _state(
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            ),
+            _read_runtime(),
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.usage is None
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "resource", "content", "use_write_runtime"),
+    [
+        (
+            "list_asset_analyses",
+            {"asset_id": "asset_G501"},
+            "/assets/asset_G501/analyses",
+            {"analyses": [{"id": "an_FromError"}]},
+            False,
+        ),
+        (
+            "get_model",
+            {},
+            "/models/mdl_vib_v3",
+            {"id": "mdl_vib_v3"},
+            True,
+        ),
+    ],
+    ids=["analysis-error-cannot-unlock-detail", "model-error-cannot-unlock-proposal"],
+)
+def test_select_planner_tools_rejects_success_content_attached_to_error_artifact(
+    tool_name,
+    arguments,
+    resource,
+    content,
+    use_write_runtime,
+):
+    api_error = {
+        "ok": False,
+        "category": "timeout",
+        "code": "READ_TIMEOUT",
+        "message": "Falha sanitizada.",
+        "status_code": None,
+    }
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_error_{tool_name}",
+        name=tool_name,
+        arguments=arguments,
+    )
+    observation = ToolObservation(
+        request_id="req_planner_01",
+        call_id=call.call_id,
+        content=content,
+        artifact=ToolArtifact(
+            tool_name=call.name,
+            arguments=arguments,
+            source=ToolSource(kind="industrial_api", resource=resource),
+            outcome=ToolOutcome(error=api_error),
+        ),
+    )
+    permissions = (
+        frozenset({"read", "action_high"})
+        if use_write_runtime
+        else frozenset({"read"})
+    )
+    restored_state = AgentState.model_validate_json(
+        _state(
+            permissions=permissions,
+            tool_calls=(call,),
+            tool_observations=(observation,),
+        ).model_dump_json()
+    )
+    runtime = (
+        _write_runtime(permissions=permissions)
+        if use_write_runtime
+        else _read_runtime(permissions=permissions)
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(restored_state, runtime)
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.usage is None
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+_READ_ERROR_CASES = (
+    ("get_asset", {"asset_id": "asset_G501"}, "/assets/asset_G501"),
+    (
+        "list_asset_analyses",
+        {"asset_id": "asset_G501"},
+        "/assets/asset_G501/analyses",
+    ),
+    ("get_analysis", {"analysis_id": "an_9906"}, "/analyses/an_9906"),
+    (
+        "get_baseline",
+        {"asset_id": "asset_G501", "point_id": None},
+        "/assets/asset_G501/baseline",
+    ),
+    (
+        "get_rms_series",
+        {"asset_id": "asset_G501", "point_id": None},
+        "/assets/asset_G501/rms",
+    ),
+    (
+        "get_spectrum",
+        {"asset_id": "asset_G501", "point_id": None},
+        "/assets/asset_G501/spectrum",
+    ),
+    (
+        "get_data_quality",
+        {"asset_id": "asset_G501", "point_id": None},
+        "/assets/asset_G501/data-quality",
+    ),
+    ("get_model", {}, "/models/mdl_vib_v3"),
+    ("search_knowledge", {"query": "rolamento"}, "/knowledge/search"),
+    (
+        "get_knowledge_document",
+        {"document_id": "kb_bearing_guidance"},
+        "/knowledge/kb_bearing_guidance",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "resource"),
+    _READ_ERROR_CASES,
+    ids=[case[0] for case in _READ_ERROR_CASES],
+)
+def test_select_planner_tools_accepts_sanitized_error_from_each_read_tool(
+    tool_name,
+    arguments,
+    resource,
+):
+    requested_target = {
+        "get_analysis": " Consulte an_9906.",
+        "get_knowledge_document": " Consulte kb_bearing_guidance.",
+    }.get(tool_name, "")
+    request = _request().model_copy(
+        update={"message": _request().message + requested_target}
+    )
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_error_{tool_name}",
+        name=tool_name,
+        arguments=arguments,
+    )
+    error = ApiError(
+        category=ApiErrorCategory.TIMEOUT,
+        code="READ_TIMEOUT",
+        message="A consulta excedeu o tempo limite.",
+    )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content={"error": error.model_dump(mode="json")},
+        artifact=ToolArtifact(
+            tool_name=tool_name,
+            arguments=arguments,
+            source=ToolSource(kind="industrial_api", resource=resource),
+            outcome=ToolOutcome(error=error),
+        ),
+    )
+    restored = ToolObservation.model_validate_json(observation.model_dump_json())
+
+    offered = select_planner_tools(
+        _state(
+            request=request,
+            tool_calls=(call,),
+            tool_observations=(restored,),
+        ),
+        _read_runtime(),
+    )
+
+    assert offered
+    if tool_name == "list_asset_analyses":
+        assert "get_analysis" not in {tool.name for tool in offered}
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "resource"),
+    _READ_ERROR_CASES[:8],
+    ids=[case[0] for case in _READ_ERROR_CASES[:8]],
+)
+def test_select_planner_tools_accepts_generic_degraded_read_artifacts(
+    tool_name,
+    arguments,
+    resource,
+):
+    request = _request().model_copy(
+        update={"message": "Consulte an_9906 neste ativo."}
+    )
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_degraded_{tool_name}",
+        name=tool_name,
+        arguments=arguments,
+    )
+    if tool_name == "get_model":
+        content = DegradedModelContent(
+            mode=ResponseMode.PARTIAL,
+            notes="Resposta parcial validada.",
+            model={"id": "mdl_vib_v3", "version": "3.0"},
+            partial_data={},
+        ).model_dump(mode="json")
+        artifact = ModelToolArtifact(
+            tool_name=tool_name,
+            arguments=arguments,
+            source=ToolSource(kind="industrial_api", resource=resource),
+            outcome=ModelToolOutcome(
+                mode=ResponseMode.PARTIAL,
+                notes="Resposta parcial validada.",
+                model={"id": "mdl_vib_v3", "version": "3.0"},
+                partial_data={},
+            ),
+        )
+    else:
+        content = {
+            "mode": ResponseMode.PARTIAL.value,
+            "notes": "Resposta parcial validada.",
+            "partial_data": {},
+        }
+        artifact = ToolArtifact(
+            tool_name=tool_name,
+            arguments=arguments,
+            source=ToolSource(kind="industrial_api", resource=resource),
+            outcome=ToolOutcome(
+                mode=ResponseMode.PARTIAL,
+                notes="Resposta parcial validada.",
+                partial_data={},
+            ),
+        )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=content,
+        artifact=artifact,
+    )
+
+    assert select_planner_tools(
+        _state(
+            request=request,
+            tool_calls=(call,),
+            tool_observations=(
+                ToolObservation.model_validate_json(observation.model_dump_json()),
+            ),
+        ),
+        _read_runtime(),
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["search_knowledge", "get_knowledge_document"])
+def test_select_planner_tools_accepts_specialized_degraded_knowledge_artifacts(
+    tool_name,
+):
+    if tool_name == "search_knowledge":
+        arguments = {"query": "rolamento"}
+        resource = "/knowledge/search"
+        content = DegradedKnowledgeSearchModelContent(
+            mode=ResponseMode.PARTIAL,
+            notes="Busca parcial validada.",
+            results=[],
+            total_results=0,
+            returned_results=0,
+            omitted_results=0,
+            truncated=False,
+            partial_data={},
+        ).model_dump(mode="json")
+        artifact = KnowledgeSearchToolArtifact(
+            tool_name=tool_name,
+            arguments=arguments,
+            source=ToolSource(kind="industrial_api", resource=resource),
+            outcome=KnowledgeSearchToolOutcome(
+                mode=ResponseMode.PARTIAL,
+                notes="Busca parcial validada.",
+                results=[],
+                total_results=0,
+                returned_results=0,
+                omitted_results=0,
+                partial_data={},
+            ),
+        )
+    else:
+        arguments = {"document_id": "kb_bearing_guidance"}
+        resource = "/knowledge/kb_bearing_guidance"
+        document = {"id": "kb_bearing_guidance", "title": "Guia parcial"}
+        content = DegradedKnowledgeDocumentContent(
+            mode=ResponseMode.PARTIAL,
+            notes="Documento parcial validado.",
+            document=document,
+            partial_data={},
+        ).model_dump(mode="json")
+        artifact = KnowledgeDocumentToolArtifact(
+            tool_name=tool_name,
+            arguments=arguments,
+            source=ToolSource(kind="industrial_api", resource=resource),
+            outcome=KnowledgeDocumentToolOutcome(
+                mode=ResponseMode.PARTIAL,
+                notes="Documento parcial validado.",
+                document=document,
+                partial_data={},
+            ),
+        )
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_degraded_{tool_name}",
+        name=tool_name,
+        arguments=arguments,
+    )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=content,
+        artifact=artifact,
+    )
+    request = _request().model_copy(
+        update={"message": "Consulte kb_bearing_guidance neste ativo."}
+    )
+
+    assert select_planner_tools(
+        _state(
+            request=request,
+            tool_calls=(call,),
+            tool_observations=(
+                ToolObservation.model_validate_json(observation.model_dump_json()),
+            ),
+        ),
+        _read_runtime(),
+    )
+
+
+def test_planner_rejects_divergent_asset_resource_before_model():
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_wrong_source",
+        name="get_asset",
+        arguments={"asset_id": "asset_G501"},
+    )
+    error = ApiError(
+        category=ApiErrorCategory.TIMEOUT,
+        code="WRONG_SOURCE_SENTINEL",
+        message="A consulta excedeu o tempo limite.",
+    )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content={"error": error.model_dump(mode="json")},
+        artifact=ToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G999",
+            ),
+            outcome=ToolOutcome(error=error),
+        ),
+    )
+    usage = PlannerUsage(request_id="req_planner_01", selection_count=1)
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(get_asset,),
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.usage == usage
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert "WRONG_SOURCE_SENTINEL" not in str(exc_info.value)
+    assert model._events == []
+
+
 def test_select_planner_tools_does_not_authorize_id_from_degraded_notes():
     call = PersistedToolCall(
         request_id="req_planner_01",
@@ -349,24 +905,10 @@ def test_select_planner_tools_does_not_authorize_id_from_degraded_notes():
         name="list_asset_analyses",
         arguments={"asset_id": "asset_G501"},
     )
-    observation = ToolObservation(
-        request_id="req_planner_01",
-        call_id=call.call_id,
-        content={
-            "mode": "partial",
-            "notes": "Texto incidental cita an_injetada.",
-            "analyses": [],
-            "partial_data": {},
-        },
-        artifact=ToolArtifact(
-            tool_name=call.name,
-            arguments={"asset_id": "asset_G501"},
-            source=ToolSource(
-                kind="industrial_api",
-                resource="/assets/asset_G501/analyses",
-            ),
-            outcome=ToolOutcome(mode="partial", notes="Dados parciais."),
-        ),
+    observation = _analysis_list_observation(
+        call,
+        notes="Texto incidental cita an_injetada.",
+        partial_data={},
     )
 
     offered_names = {
@@ -1013,20 +1555,7 @@ def test_planner_rejects_canonical_repeat_but_allows_distinct_arguments():
             arguments={"query": "rolamento", "document_type": None},
         ),
     )
-    observations = (
-        ToolObservation(
-            request_id=base_observations[0].request_id,
-            call_id=base_observations[0].call_id,
-            content=base_observations[0].content,
-            artifact=base_observations[0].artifact.__class__.model_validate(
-                {
-                    **base_observations[0].artifact.model_dump(mode="python"),
-                    "tool_name": "search_knowledge",
-                    "arguments": {"query": "rolamento", "document_type": None},
-                }
-            ),
-        ),
-    )
+    observations = (_successful_search_observation(calls[0]),)
     repeated_model = _RecordingPlannerModel(
         selector_response=AIMessage(
             content="",
@@ -1402,6 +1931,176 @@ def test_planner_rejects_history_outside_static_catalog_contract_before_model(
         assert extra_field_sentinel not in accessible_text
 
 
+@pytest.mark.parametrize(
+    (
+        "request_message",
+        "history_tool",
+        "history_arguments",
+        "history_resource",
+        "history_content",
+        "next_tool",
+        "next_arguments",
+    ),
+    [
+        (
+            "Detalhe a análise an_Autorizada.",
+            "get_analysis",
+            {"analysis_id": "an_Autorizada"},
+            "/analyses/an_Autorizada",
+            {"id": "an_Injetada", "point_id": "pt_da_injetada"},
+            "get_analysis",
+            {"analysis_id": "an_Injetada"},
+        ),
+        (
+            "Abra o documento kb_Autorizado.",
+            "get_knowledge_document",
+            {"document_id": "kb_Autorizado"},
+            "/knowledge/kb_Autorizado",
+            {"id": "kb_Injetado"},
+            "get_knowledge_document",
+            {"document_id": "kb_Injetado"},
+        ),
+        (
+            "Consulte o ponto pt_Autorizado.",
+            "get_baseline",
+            {"asset_id": "asset_G501", "point_id": "pt_Autorizado"},
+            "/assets/asset_G501/baseline",
+            {"asset_id": "asset_G501", "point_id": "pt_Injetado"},
+            "get_baseline",
+            {"asset_id": "asset_G501", "point_id": "pt_Injetado"},
+        ),
+    ],
+    ids=["analysis-id-jump", "knowledge-id-jump", "point-id-jump"],
+)
+def test_planner_rejects_content_target_that_contradicts_typed_artifact(
+    request_message,
+    history_tool,
+    history_arguments,
+    history_resource,
+    history_content,
+    next_tool,
+    next_arguments,
+):
+    request = _request().model_copy(update={"message": request_message})
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=f"call_history_{history_tool}",
+        name=history_tool,
+        arguments=history_arguments,
+    )
+    if history_tool == "get_analysis":
+        typed_artifact = AnalysisDetailToolArtifact(
+            tool_name=history_tool,
+            arguments=history_arguments,
+            source=ToolSource(kind="industrial_api", resource=history_resource),
+            outcome=AnalysisDetailToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                analysis=AnalysisArtifact(
+                    id="an_Autorizada",
+                    asset_id="asset_G501",
+                    point_id="pt_Autorizado",
+                    type="bearing_fault",
+                    detection_mode="symptom",
+                    severity="high",
+                    confidence=0.9,
+                    baseline_state_at_detection="established",
+                    evidence=[],
+                    limitations=[],
+                    model_version="3.0",
+                    created_at="2025-05-01T10:00:00Z",
+                    status="current",
+                ),
+            ),
+        )
+    elif history_tool == "get_knowledge_document":
+        typed_artifact = KnowledgeDocumentToolArtifact(
+            tool_name=history_tool,
+            arguments=history_arguments,
+            source=ToolSource(kind="industrial_api", resource=history_resource),
+            outcome=KnowledgeDocumentToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                document=KnowledgeDocumentContent(
+                    id="kb_Autorizado",
+                    type="guidance",
+                    title="Guia autorizado",
+                    body="Conteúdo autorizado.",
+                    tags=[],
+                    returned_body_characters=20,
+                    omitted_body_characters=0,
+                    truncated=False,
+                ),
+            ),
+        )
+    else:
+        typed_artifact = BaselineToolArtifact(
+            tool_name=history_tool,
+            arguments=history_arguments,
+            source=ToolSource(kind="industrial_api", resource=history_resource),
+            outcome=BaselineToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                baseline=BaselineArtifact(
+                    id="bs_Autorizado",
+                    asset_id="asset_G501",
+                    point_id="pt_Autorizado",
+                    state="established",
+                    detection_mode="baseline",
+                    learnable=True,
+                    established_at="2025-05-01T10:00:00Z",
+                    invalidated_at=None,
+                    invalidation_reason=None,
+                    features=[],
+                    alarm_threshold=4.5,
+                ),
+            ),
+        )
+    observation = ToolObservation(
+        request_id="req_planner_01",
+        call_id=call.call_id,
+        content=history_content,
+        artifact=typed_artifact,
+    )
+    offered_tool = next(
+        tool for tool in READ_TOOLS if tool.name == next_tool
+    )
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": next_tool,
+                    "args": next_arguments,
+                    "id": f"call_after_{history_tool}",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+    usage = PlannerUsage(
+        request_id="req_planner_01",
+        selection_count=1,
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                request,
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(offered_tool,),
+                tool_calls=(call,),
+                tool_observations=(observation,),
+            )
+        )
+
+    error = exc_info.value
+    assert error.code is PlannerErrorCode.INVALID_HISTORY
+    assert error.usage == usage
+    assert model._events == []
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert not any(value in str(error) for value in next_arguments.values())
+
+
 def test_planner_sends_validated_canonical_history_arguments_to_model():
     query = "rolamento do transportador"
     call = PersistedToolCall(
@@ -1411,14 +2110,27 @@ def test_planner_sends_validated_canonical_history_arguments_to_model():
         arguments={"query": query},
     )
     observation = ToolObservation(
-        request_id="req_planner_01",
+        request_id=call.request_id,
         call_id=call.call_id,
-        content={"results": []},
-        artifact=ToolArtifact(
+        content=KnowledgeSearchModelContent(
+            results=[],
+            total_results=0,
+            returned_results=0,
+            omitted_results=0,
+            truncated=False,
+        ).model_dump(mode="json"),
+        artifact=KnowledgeSearchToolArtifact(
             tool_name=call.name,
             arguments={"query": query},
             source=ToolSource(kind="industrial_api", resource="/knowledge/search"),
-            outcome=ToolOutcome(partial_data={"results": []}),
+            outcome=KnowledgeSearchToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                partial_data={},
+                results=[],
+                total_results=0,
+                returned_results=0,
+                omitted_results=0,
+            ),
         ),
     )
     model = _RecordingPlannerModel(
@@ -1780,28 +2492,74 @@ def test_planner_context_counts_the_bound_tool_wire_before_model():
     assert model._events == []
 
 
-def test_planner_omits_old_interactions_whole_and_keeps_latest_degraded_error():
-    calls, base_observations = _planner_history(2)
+def test_planner_omits_old_interactions_whole_and_keeps_latest_error():
+    calls = (
+        PersistedToolCall(
+            request_id="req_planner_01",
+            call_id="call_old_complete",
+            name="search_knowledge",
+            arguments={"query": "histórico antigo completo"},
+        ),
+        PersistedToolCall(
+            request_id="req_planner_01",
+            call_id="call_latest_error",
+            name="list_asset_analyses",
+            arguments={"asset_id": "asset_G501", "status": "stale"},
+        ),
+    )
+    latest_error = ApiError(
+        category=ApiErrorCategory.TIMEOUT,
+        code="LATEST_TIMEOUT_SENTINEL",
+        message="tempo limite ao consultar a API industrial",
+    )
+    old_result = KnowledgeSearchItem(
+        id="kb_old_context",
+        type="guidance",
+        title="OLD_SENTINEL_" + ("x" * 60_000),
+        tags=[],
+        snippet="resultado antigo",
+    )
     observations = (
         ToolObservation(
             request_id="req_planner_01",
             call_id=calls[0].call_id,
-            content={"old_payload": "OLD_SENTINEL_" + ("x" * 30_000)},
-            artifact=base_observations[0].artifact,
+            content=KnowledgeSearchModelContent(
+                results=[old_result],
+                total_results=1,
+                returned_results=1,
+                omitted_results=0,
+                truncated=False,
+            ).model_dump(mode="json"),
+            artifact=KnowledgeSearchToolArtifact(
+                tool_name=calls[0].name,
+                arguments=calls[0].arguments.to_python(),
+                source=ToolSource(
+                    kind="industrial_api",
+                    resource="/knowledge/search",
+                ),
+                outcome=KnowledgeSearchToolOutcome(
+                    mode=ResponseMode.COMPLETE,
+                    partial_data={},
+                    results=[old_result],
+                    total_results=1,
+                    returned_results=1,
+                    omitted_results=0,
+                ),
+            ),
         ),
         ToolObservation(
             request_id="req_planner_01",
             call_id=calls[1].call_id,
-            content={
-                "mode": "partial",
-                "notes": "LATEST_DEGRADED_SENTINEL",
-                "error": {
-                    "category": "timeout",
-                    "code": "LATEST_TIMEOUT_SENTINEL",
-                },
-                "partial_data": "y" * 20_000,
-            },
-            artifact=base_observations[1].artifact,
+            content={"error": latest_error.model_dump(mode="json")},
+            artifact=AnalysisListToolArtifact(
+                tool_name=calls[1].name,
+                arguments=calls[1].arguments.to_python(),
+                source=ToolSource(
+                    kind="industrial_api",
+                    resource="/assets/asset_G501/analyses",
+                ),
+                outcome=AnalysisListToolOutcome(error=latest_error),
+            ),
         ),
     )
     model = _RecordingPlannerModel(
@@ -1809,7 +2567,7 @@ def test_planner_omits_old_interactions_whole_and_keeps_latest_degraded_error():
             content="",
             tool_calls=[
                 {
-                    "name": "list_asset_analyses",
+                    "name": "get_asset",
                     "args": {"asset_id": "asset_G501"},
                     "id": "call_after_degraded",
                     "type": "tool_call",
@@ -1826,7 +2584,7 @@ def test_planner_omits_old_interactions_whole_and_keeps_latest_degraded_error():
                 request_id="req_planner_01",
                 selection_count=2,
             ),
-            offered_tools=(list_asset_analyses,),
+            offered_tools=(get_asset,),
             tool_calls=calls,
             tool_observations=observations,
         )
@@ -1837,29 +2595,22 @@ def test_planner_omits_old_interactions_whole_and_keeps_latest_degraded_error():
     assert result.context.omitted_interactions == 1
     sent_context = str(model._selection_messages)
     assert "OLD_SENTINEL" not in sent_context
-    assert "LATEST_DEGRADED_SENTINEL" in sent_context
     assert "LATEST_TIMEOUT_SENTINEL" in sent_context
     assert '{"omitted_interactions":1}' in sent_context
     assert _request().message in sent_context
 
 
 def test_planner_never_compacts_away_the_latest_degraded_observation():
-    calls, base_observations = _planner_history(1)
-    degraded_observation = ToolObservation(
+    call = PersistedToolCall(
         request_id="req_planner_01",
-        call_id=calls[0].call_id,
-        content={
-            "mode": "partial",
-            "notes": "LATEST_DEGRADED_MUST_REMAIN",
-            "partial_data": "x" * 48_000,
-        },
-        artifact=base_observations[0].artifact.model_copy(
-            update={
-                "outcome": base_observations[0].artifact.outcome.model_copy(
-                    update={"mode": "partial", "notes": "dados incompletos"}
-                )
-            }
-        ),
+        call_id="call_latest_degraded",
+        name="list_asset_analyses",
+        arguments={"asset_id": "asset_G501"},
+    )
+    degraded_observation = _analysis_list_observation(
+        call,
+        notes="LATEST_DEGRADED_MUST_REMAIN" + ("x" * 48_000),
+        partial_data={},
     )
     model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
 
@@ -1873,7 +2624,7 @@ def test_planner_never_compacts_away_the_latest_degraded_observation():
                     selection_count=1,
                 ),
                 offered_tools=(get_asset,),
-                tool_calls=calls,
+                    tool_calls=(call,),
                 tool_observations=(degraded_observation,),
             )
         )
@@ -2218,7 +2969,11 @@ def test_planner_uses_only_persisted_next_turn_content_after_a_tool_call():
     observation = ToolObservation(
         request_id="req_planner_01",
         call_id=call.call_id,
-        content={"id": "asset_G501", "sensor_status": "online"},
+        content={
+            "mode": "partial",
+            "notes": None,
+            "partial_data": {"sensor_status": "online"},
+        },
         artifact=ToolArtifact(
             tool_name="get_asset",
             arguments={"asset_id": "asset_G501"},
@@ -2227,7 +2982,8 @@ def test_planner_uses_only_persisted_next_turn_content_after_a_tool_call():
                 resource="/assets/asset_G501",
             ),
             outcome=ToolOutcome(
-                partial_data={"technical_detail": "artifact-only"}
+                mode=ResponseMode.PARTIAL,
+                partial_data={"sensor_status": "online"},
             ),
         ),
     )
@@ -2256,9 +3012,10 @@ def test_planner_uses_only_persisted_next_turn_content_after_a_tool_call():
     assert isinstance(selection_tool_message, ToolMessage)
     assert selection_tool_message.tool_call_id == call.call_id
     assert selection_tool_message.content == (
-        '{"id":"asset_G501","sensor_status":"online"}'
+        '{"mode":"partial","notes":null,'
+        '"partial_data":{"sensor_status":"online"}}'
     )
-    assert "artifact-only" not in str(model._selection_messages)
+    assert "industrial_api" not in str(model._selection_messages)
     assert model._terminal_messages == model._selection_messages
 
 

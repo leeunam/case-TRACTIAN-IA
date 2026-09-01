@@ -681,6 +681,15 @@ já persistidos na solicitação atual, antes de expor qualquer payload ao model
 Cada call atual precisa pertencer aos catálogos estáticos e ter argumentos
 equivalentes ao wire validado pelo schema público; o dump canônico validado é
 usado no fingerprint, na validação de alvo e no contexto.
+Antes de qualquer catálogo, fingerprint ou contexto, uma única validação
+sequencial compartilhada pelo seletor e pelo planner reidrata o artifact pelo
+modelo concreto de cada uma das dez read tools, confere `source.resource`,
+escopo, metadata e a projeção exata `outcome → content`. Erros aceitam somente
+o envelope sanitizado e não concedem IDs; resultados completos ou degradados
+só concedem IDs presentes nos campos tipados que a tool realmente projeta.
+Artifacts persistidos conservam essa projeção especializada de forma JSON-safe
+e a revalidam pelo modelo exato após reabertura do checkpoint, sem guardar HTTP
+bruto ou objetos de runtime.
 O orçamento de contexto mede o wire OpenAI-compatible de mensagens e schemas
 das tools, remove apenas pares completos antigos com marcador explícito e não
 remove a observação mais recente nem erros/modos degradados; se o conjunto
@@ -710,6 +719,10 @@ estado e checkpoint passaram; `uv lock --check --offline` resolveu 49 pacotes;
 a suíte completa do agente passou com 1.184 testes; e `make test` passou com 59
 testes da API e 1.184 do agente (1.243 no total), mantendo somente o
 `PendingDeprecationWarning` conhecido de `python_multipart`.
+No quinto ciclo corretivo, os **395 testes** de planner e estado passaram
+(393 no sandbox e os dois casos SQLite em execução externa), incluindo a
+matriz dos dez artifacts, erros sanitizados, modos degradados e round-trip JSON;
+os locks offline de API e agente e `git diff --check` também passaram.
 
 ### Task 12 — integrar o planner ao LangGraph e preservar as escritas
 

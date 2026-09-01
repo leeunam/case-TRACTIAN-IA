@@ -7,7 +7,7 @@ from enum import Enum
 import json
 import math
 import re
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import (
     ConfigDict,
@@ -20,8 +20,24 @@ from pydantic import (
 )
 
 from tractian_agent.contracts import ResponseMode, StrictModel, SupportRequest, ToolCall
+from tractian_agent.tools.analyses import (
+    AnalysisDetailToolArtifact,
+    AnalysisListToolArtifact,
+)
+from tractian_agent.tools.assets import AssetToolArtifact
+from tractian_agent.tools.knowledge import (
+    KnowledgeDocumentToolArtifact,
+    KnowledgeSearchToolArtifact,
+    ModelToolArtifact,
+)
 from tractian_agent.tools.observations import ToolArtifact
 from tractian_agent.tools.runtime import Permission, TrustedIdentity
+from tractian_agent.tools.technical import (
+    BaselineToolArtifact,
+    DataQualityToolArtifact,
+    RmsToolArtifact,
+    SpectrumToolArtifact,
+)
 from tractian_agent.write_contracts import IntentStatus, PersistedApiError, WriteIntent
 from tractian_agent.write_policy import TrustedActionApproval, WriteProposal
 
@@ -182,6 +198,18 @@ def _validate_json_boundary(
 
 
 _JSON_VALUE_ADAPTER = TypeAdapter(JsonValue)
+_READ_TOOL_ARTIFACT_MODELS: Final[dict[str, type[ToolArtifact]]] = {
+    "get_asset": AssetToolArtifact,
+    "list_asset_analyses": AnalysisListToolArtifact,
+    "get_analysis": AnalysisDetailToolArtifact,
+    "get_baseline": BaselineToolArtifact,
+    "get_rms_series": RmsToolArtifact,
+    "get_spectrum": SpectrumToolArtifact,
+    "get_data_quality": DataQualityToolArtifact,
+    "get_model": ModelToolArtifact,
+    "search_knowledge": KnowledgeSearchToolArtifact,
+    "get_knowledge_document": KnowledgeDocumentToolArtifact,
+}
 
 
 class FrozenStateModel(StrictModel):
@@ -352,13 +380,68 @@ class PersistedToolArtifact(FrozenStateModel):
     outcome: PersistedToolOutcome
     truncated: bool = False
     omitted_items: int = Field(default=0, ge=0)
+    typed_artifact: JsonSnapshot | None = None
 
     @model_validator(mode="before")
     @classmethod
-    def _copy_shared_artifact(cls, value: object) -> object:
+    def _project_shared_artifact(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> object:
+        if isinstance(value, cls):
+            return value
         if isinstance(value, ToolArtifact):
-            return value.model_dump(mode="python")
-        return value
+            artifact_wire = value.model_dump(mode="python")
+        elif isinstance(value, Mapping):
+            artifact_wire = dict(value)
+        else:
+            return value
+        tool_name = artifact_wire.get("tool_name")
+        artifact_model = (
+            _READ_TOOL_ARTIFACT_MODELS.get(tool_name)
+            if isinstance(tool_name, str)
+            else None
+        )
+        if artifact_model is None:
+            return artifact_wire
+        typed_value = artifact_wire.get("typed_artifact")
+        if typed_value is None:
+            candidate = {
+                key: nested_value
+                for key, nested_value in artifact_wire.items()
+                if key != "typed_artifact"
+            }
+        else:
+            candidate = _snapshot_domain_value(typed_value, info.mode)
+        typed_artifact = artifact_model.model_validate(candidate)
+        canonical = typed_artifact.model_dump(mode="json")
+        outcome = canonical["outcome"]
+        projected_outcome = PersistedToolOutcome.model_validate(
+            {
+                field_name: outcome[field_name]
+                for field_name in PersistedToolOutcome.model_fields
+            }
+        )
+        return {
+            "tool_name": canonical["tool_name"],
+            "arguments": JsonSnapshot.capture(
+                canonical["arguments"],
+                forbidden_names=_PUBLIC_ARGUMENT_FORBIDDEN_NAMES,
+                forbidden_segments=_PUBLIC_ARGUMENT_FORBIDDEN_SEGMENTS,
+                forbidden_segment_patterns=_PUBLIC_ARGUMENT_FORBIDDEN_SEGMENT_PATTERNS,
+            ),
+            "source": canonical["source"],
+            "outcome": projected_outcome,
+            "truncated": canonical["truncated"],
+            "omitted_items": canonical["omitted_items"],
+            "typed_artifact": JsonSnapshot.capture(
+                canonical,
+                forbidden_names=_TECHNICAL_FORBIDDEN_NAMES,
+                forbidden_segments=_TECHNICAL_FORBIDDEN_SEGMENTS,
+                forbidden_segment_patterns=_TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS,
+            ),
+        }
 
     @field_validator("arguments", mode="before")
     @classmethod
@@ -368,6 +451,29 @@ class PersistedToolArtifact(FrozenStateModel):
         info: ValidationInfo,
     ) -> JsonSnapshot:
         return _capture_public_argument_object(value, info.mode)
+
+    @field_validator("typed_artifact", mode="before")
+    @classmethod
+    def _snapshot_typed_artifact(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> JsonSnapshot | None:
+        if value is None:
+            return None
+        return JsonSnapshot.capture(
+            _snapshot_domain_value(value, info.mode),
+            forbidden_names=_TECHNICAL_FORBIDDEN_NAMES,
+            forbidden_segments=_TECHNICAL_FORBIDDEN_SEGMENTS,
+            forbidden_segment_patterns=_TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS,
+        )
+
+    def validated_read_artifact(self) -> ToolArtifact | None:
+        """Reidrata o artifact pela classe concreta vinculada à read tool."""
+        artifact_model = _READ_TOOL_ARTIFACT_MODELS.get(self.tool_name)
+        if artifact_model is None or self.typed_artifact is None:
+            return None
+        return artifact_model.model_validate(self.typed_artifact.to_python())
 
 
 class MessageRole(str, Enum):
