@@ -295,6 +295,7 @@ class PersistedSupportRequest(FrozenStateModel):
 
 
 class PersistedToolCall(FrozenStateModel):
+    request_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
     call_id: str = Field(min_length=1, pattern=r"^\S+$")
     name: str = Field(min_length=1, pattern=r"^\S+$")
     arguments: JsonSnapshot
@@ -405,6 +406,7 @@ class PersistedMessage(FrozenStateModel):
 
 
 class ToolObservation(FrozenStateModel):
+    request_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
     call_id: str = Field(min_length=1, pattern=r"^\S+$")
     content: JsonSnapshot | None = None
     artifact: PersistedToolArtifact
@@ -456,6 +458,14 @@ class ReviewRecord(FrozenStateModel):
     reason: str | None = Field(default=None, min_length=1, pattern=r"\S")
 
 
+class PlannerUsage(FrozenStateModel):
+    """Contadores do planner vinculados a uma única solicitação."""
+
+    request_id: str = Field(min_length=1, pattern=r"^\S+$")
+    selection_count: int = Field(default=0, ge=0, le=8, strict=True)
+    finalization_count: int = Field(default=0, ge=0, le=1, strict=True)
+
+
 class AgentState(FrozenStateModel):
     request: PersistedSupportRequest
     identity: TrustedIdentity
@@ -476,6 +486,50 @@ class AgentState(FrozenStateModel):
     intents: tuple[WriteIntent, ...] = ()
     final_result: FinalResult | None = None
     review: ReviewRecord | None = None
+    planner_usage: PlannerUsage
+
+    @model_validator(mode="before")
+    @classmethod
+    def _restore_request_bound_planner_state(cls, value: object) -> object:
+        """Vincula o wire legado do planner à solicitação do checkpoint."""
+        if isinstance(value, Mapping) and isinstance(value.get("request_id"), str):
+            request_id = value["request_id"]
+            restored = dict(value)
+            if value.get("planner_usage") is None:
+                restored["planner_usage"] = {
+                    "request_id": request_id,
+                    "selection_count": 0,
+                    "finalization_count": 0,
+                }
+
+            def bind_legacy_items(field_name: str) -> None:
+                items = value.get(field_name)
+                if not isinstance(items, (list, tuple)):
+                    return
+                bound: list[object] = []
+                for item in items:
+                    if isinstance(item, Mapping) and item.get("request_id") is None:
+                        bound.append({**item, "request_id": request_id})
+                    elif isinstance(item, ToolCall):
+                        bound.append(
+                            {
+                                **item.model_dump(mode="python"),
+                                "request_id": request_id,
+                            }
+                        )
+                    elif (
+                        isinstance(item, (PersistedToolCall, ToolObservation))
+                        and item.request_id is None
+                    ):
+                        bound.append(item.model_copy(update={"request_id": request_id}))
+                    else:
+                        bound.append(item)
+                restored[field_name] = bound
+
+            bind_legacy_items("tool_calls")
+            bind_legacy_items("tool_observations")
+            return restored
+        return value
 
     @field_validator("pending_proposal", mode="before")
     @classmethod
@@ -546,6 +600,25 @@ class AgentState(FrozenStateModel):
             raise ValueError("cada request_id aceita no máximo uma intenção ativa")
         if self.step_count > self.step_limit:
             raise ValueError("contador de passos excede o orçamento")
+        if self.planner_usage.request_id != self.request_id:
+            raise ValueError("uso do planner pertence a outra request_id")
+        current_call_ids = tuple(
+            call.call_id
+            for call in self.tool_calls
+            if call.request_id == self.request_id
+        )
+        current_observation_ids = tuple(
+            observation.call_id
+            for observation in self.tool_observations
+            if observation.request_id == self.request_id
+        )
+        if len(current_call_ids) > 7:
+            raise ValueError("histórico do planner excede sete tool calls")
+        if (
+            len(current_call_ids) != len(set(current_call_ids))
+            or len(current_observation_ids) != len(set(current_observation_ids))
+        ):
+            raise ValueError("IDs de tool call devem ser únicos por request_id")
         return self
 
     def continue_with(
@@ -585,6 +658,7 @@ class AgentState(FrozenStateModel):
                 approval=None,
                 final_result=None,
                 review=None,
+                planner_usage=PlannerUsage(request_id=request_id),
             )
         return type(self).model_validate(data)
 

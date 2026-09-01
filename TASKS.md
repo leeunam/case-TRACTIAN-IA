@@ -659,6 +659,23 @@ planner. O orçamento em caracteres é deliberadamente independente do tokenizer
 do provider; excedê-lo corta contexto antigo de modo explícito ou encerra antes
 de nova chamada, nunca aumenta o limite silenciosamente.
 
+**Decisões implementadas nesta fatia:** `select_planner_tools` reutiliza os
+catálogos estáticos e filtra somente por escopo confiável, permissões, tipo do
+runtime e IDs tipados presentes no pedido ou no conteúdo validado de observações
+da mesma `request_id`. Chamadas, observações e `PlannerUsage` ficam vinculados à
+solicitação; checkpoints anteriores sem os novos campos são migrados para a
+solicitação que já os continha, e uma nova solicitação zera somente os
+contadores transitórios. A fronteira bloqueia antes de `bind_tools` quando já
+há sete chamadas concluídas, oito seleções ou uma finalização; saídas inválidas
+do modelo consomem e devolvem o uso atualizado no erro de protocolo. O
+fingerprint canônico usa somente tool e argumentos, sem o `call_id` do provider.
+O orçamento de contexto mede o wire OpenAI-compatible de mensagens e schemas
+das tools, remove apenas pares completos antigos com marcador explícito e não
+remove a observação mais recente nem erros/modos degradados; se o conjunto
+protegido não couber, falha antes do modelo. O limite de 20 passos permanece no
+`AgentState.step_limit` e será integrado ao caminho do planner somente na Task
+12, sem alterar grafo ou entrypoint nesta fatia.
+
 **Arquivos:** evoluir `planner.py`, contratos persistíveis estritamente
 necessários e testes; reutilizar `READ_TOOLS` e `WRITE_PROPOSAL_TOOLS` sem
 recriar catálogos paralelos.
@@ -672,6 +689,12 @@ recriar catálogos paralelos.
 - O oitavo tool call, a nona seleção, falta de espaço para o pedido atual ou contexto excedido param deterministicamente antes de LLM/HTTP.
 - Erros e modos degradados permanecem visíveis para a decisão seguinte, sem serem convertidos em sucesso.
 - Limites e fingerprints têm testes de fronteira e a tarefa termina em commit próprio.
+
+**Evidência desta fatia (01/09/2026):** os 339 testes focados de planner,
+estado e checkpoint passaram; `uv lock --check --offline` resolveu 49 pacotes;
+a suíte completa do agente passou com 1.184 testes; e `make test` passou com 59
+testes da API e 1.184 do agente (1.243 no total), mantendo somente o
+`PendingDeprecationWarning` conhecido de `python_multipart`.
 
 ### Task 12 — integrar o planner ao LangGraph e preservar as escritas
 

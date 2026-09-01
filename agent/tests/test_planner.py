@@ -11,10 +11,12 @@ from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolM
 from langchain_core.outputs import ChatResult
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool
+import httpx
 import pytest
 from pydantic import PrivateAttr, ValidationError
 
 from tractian_agent.checkpoint import open_checkpointer
+from tractian_agent.client import IndustrialApiClient
 from tractian_agent.contracts import Identity, SupportRequest
 from tractian_agent.planner import (
     PLANNER_SYSTEM_PROMPT,
@@ -23,10 +25,13 @@ from tractian_agent.planner import (
     PlannerDecisionKind,
     PlannerDecisionTurn,
     PlannerErrorCode,
+    PlannerLimits,
     PlannerProtocolError,
+    PlannerUsage,
     PlannerStopReason,
     PlannerTerminalDecision,
     PlannerToolTurn,
+    select_planner_tools,
 )
 from tractian_agent.state import (
     AgentState,
@@ -37,7 +42,12 @@ from tractian_agent.state import (
 from tractian_agent.tools.analyses import get_analysis
 from tractian_agent.tools.assets import get_asset
 from tractian_agent.tools.observations import ToolArtifact, ToolOutcome, ToolSource
-from tractian_agent.tools.runtime import TrustedIdentity
+from tractian_agent.tools import READ_TOOLS, WRITE_PROPOSAL_TOOLS
+from tractian_agent.tools.runtime import (
+    ReadToolRuntime,
+    TrustedIdentity,
+    WriteToolRuntime,
+)
 
 
 class _RecordingPlannerModel(BaseChatModel):
@@ -104,6 +114,306 @@ def _request() -> SupportRequest:
     )
 
 
+def _state(
+    *,
+    permissions: frozenset[str] = frozenset({"read"}),
+    request: SupportRequest | None = None,
+    tool_calls: tuple[PersistedToolCall, ...] = (),
+    tool_observations: tuple[ToolObservation, ...] = (),
+) -> AgentState:
+    request = _request() if request is None else request
+    return AgentState(
+        request=request,
+        identity=TrustedIdentity(
+            user_id=request.identity.user_id,
+            company_id=request.identity.company_id,
+        ),
+        permissions=permissions,
+        request_id="req_planner_01",
+        thread_id="thread_planner_01",
+        execution_id="exec_planner_01",
+        thread_scope=ThreadScope(
+            thread_id="thread_planner_01",
+            case_id=request.case_id,
+            company_id=request.identity.company_id,
+            user_id=request.identity.user_id,
+        ),
+        tool_calls=tool_calls,
+        tool_observations=tool_observations,
+        step_limit=3,
+    )
+
+
+def _read_runtime(
+    *,
+    permissions: frozenset[str] = frozenset({"read"}),
+    user_id: str = "usr_pedro",
+    company_id: str = "comp_mineracao_andes",
+    central_asset_id: str = "asset_G501",
+) -> ReadToolRuntime:
+    return ReadToolRuntime.create(
+        user_id=user_id,
+        company_id=company_id,
+        permissions=permissions,
+        central_asset_id=central_asset_id,
+        client=IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(
+                lambda request: pytest.fail(f"HTTP inesperado: {request.url}")
+            ),
+        ),
+    )
+
+
+def _write_runtime(
+    *,
+    permissions: frozenset[str] = frozenset(
+        {"read", "action_low", "action_high", "escalate"}
+    ),
+    current_case_id: str = "case_tkt_inv_04",
+    central_asset_id: str = "asset_G501",
+) -> WriteToolRuntime:
+    return WriteToolRuntime.create(
+        user_id="usr_pedro",
+        company_id="comp_mineracao_andes",
+        permissions=permissions,
+        central_asset_id=central_asset_id,
+        current_case_id=current_case_id,
+        configured_model_id="mdl_vib_v3",
+        client=IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(
+                lambda request: pytest.fail(f"HTTP inesperado: {request.url}")
+            ),
+        ),
+    )
+
+
+def _planner_history(
+    count: int,
+    *,
+    request_id: str = "req_planner_01",
+) -> tuple[tuple[PersistedToolCall, ...], tuple[ToolObservation, ...]]:
+    calls: list[PersistedToolCall] = []
+    observations: list[ToolObservation] = []
+    for index in range(count):
+        asset_id = f"asset_G{500 + index}"
+        call = PersistedToolCall(
+            request_id=request_id,
+            call_id=f"call_{request_id}_{index}",
+            name="get_asset",
+            arguments={"asset_id": asset_id},
+        )
+        calls.append(call)
+        observations.append(
+            ToolObservation(
+                request_id=request_id,
+                call_id=call.call_id,
+                content={"id": asset_id, "mode": "complete"},
+                artifact=ToolArtifact(
+                    tool_name=call.name,
+                    arguments={"asset_id": asset_id},
+                    source=ToolSource(
+                        kind="industrial_api",
+                        resource=f"/assets/{asset_id}",
+                    ),
+                    outcome=ToolOutcome(partial_data={"id": asset_id}),
+                ),
+            )
+        )
+    return tuple(calls), tuple(observations)
+
+
+def test_select_planner_tools_reuses_read_catalog_only_with_read_permission():
+    offered = select_planner_tools(_state(), _read_runtime())
+
+    assert offered
+    assert all(any(selected is catalogued for catalogued in READ_TOOLS) for selected in offered)
+    assert select_planner_tools(
+        _state(permissions=frozenset()),
+        _read_runtime(permissions=frozenset()),
+    ) == ()
+
+
+def test_select_planner_tools_requires_typed_analysis_and_knowledge_ids():
+    without_discovered_ids = select_planner_tools(_state(), _read_runtime())
+    names_without_ids = {tool.name for tool in without_discovered_ids}
+
+    request = _request().model_copy(
+        update={
+            "message": (
+                "Consulte an_diag_2026 e o documento kb_bearing_guidance."
+            )
+        }
+    )
+    with_discovered_ids = select_planner_tools(
+        _state(request=request),
+        _read_runtime(),
+    )
+    names_with_ids = {tool.name for tool in with_discovered_ids}
+
+    assert "get_analysis" not in names_without_ids
+    assert "get_knowledge_document" not in names_without_ids
+    assert "get_analysis" in names_with_ids
+    assert "get_knowledge_document" in names_with_ids
+
+
+def test_select_planner_tools_hides_asset_argument_tools_without_request_asset():
+    request = _request().model_copy(update={"asset_id": None})
+
+    offered_names = {
+        tool.name
+        for tool in select_planner_tools(
+            _state(request=request),
+            _read_runtime(),
+        )
+    }
+
+    assert offered_names == {"get_model", "search_knowledge"}
+
+
+def test_select_planner_tools_uses_only_ids_observed_for_current_request():
+    old_call = PersistedToolCall(
+        request_id="req_old",
+        call_id="call_old",
+        name="list_asset_analyses",
+        arguments={"asset_id": "asset_G501"},
+    )
+    old_observation = ToolObservation(
+        request_id="req_old",
+        call_id=old_call.call_id,
+        content={"analyses": [{"id": "an_old_request"}]},
+        artifact=ToolArtifact(
+            tool_name=old_call.name,
+            arguments={"asset_id": "asset_G501"},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/analyses",
+            ),
+            outcome=ToolOutcome(partial_data={"id": "an_old_request"}),
+        ),
+    )
+    names_with_old_only = {
+        tool.name
+        for tool in select_planner_tools(
+            _state(
+                tool_calls=(old_call,),
+                tool_observations=(old_observation,),
+            ),
+            _read_runtime(),
+        )
+    }
+    current_call = old_call.model_copy(
+        update={"request_id": "req_planner_01", "call_id": "call_current"}
+    )
+    current_observation = ToolObservation(
+        request_id="req_planner_01",
+        call_id="call_current",
+        content={"analyses": [{"id": "an_current_request"}]},
+        artifact=old_observation.artifact,
+    )
+    names_with_current = {
+        tool.name
+        for tool in select_planner_tools(
+            _state(
+                tool_calls=(old_call, current_call),
+                tool_observations=(old_observation, current_observation),
+            ),
+            _read_runtime(),
+        )
+    }
+
+    assert "get_analysis" not in names_with_old_only
+    assert "get_analysis" in names_with_current
+
+
+def test_select_planner_tools_offers_proposals_only_with_write_runtime():
+    permissions = frozenset({"read", "action_low", "action_high", "escalate"})
+    request = _request().model_copy(
+        update={
+            "message": (
+                "Pedido com alvos tipados an_diag_2026 e mdl_vib_v3."
+            )
+        }
+    )
+    state = _state(permissions=permissions, request=request)
+
+    read_only_names = {
+        tool.name
+        for tool in select_planner_tools(
+            state,
+            _read_runtime(permissions=permissions),
+        )
+    }
+    write_tools = select_planner_tools(state, _write_runtime())
+    write_names = {tool.name for tool in write_tools}
+
+    assert read_only_names.isdisjoint(tool.name for tool in WRITE_PROPOSAL_TOOLS)
+    assert {tool.name for tool in WRITE_PROPOSAL_TOOLS} <= write_names
+    assert all(
+        any(selected is catalogued for catalogued in (*READ_TOOLS, *WRITE_PROPOSAL_TOOLS))
+        for selected in write_tools
+    )
+
+
+@pytest.mark.parametrize(
+    ("permissions", "expected_names"),
+    [
+        (
+            frozenset({"action_low"}),
+            {
+                "propose_reprocess_analysis",
+                "propose_request_specialist_analysis",
+            },
+        ),
+        (
+            frozenset({"action_high"}),
+            {
+                "propose_update_asset_criticality",
+                "propose_request_model_retraining",
+            },
+        ),
+        (frozenset({"escalate"}), {"propose_escalate_case"}),
+        (frozenset({"read"}), set()),
+    ],
+)
+def test_select_planner_tools_applies_each_proposal_permission(
+    permissions,
+    expected_names,
+):
+    request = _request().model_copy(
+        update={"message": "Alvos an_diag_2026 e mdl_vib_v3."}
+    )
+
+    offered_names = {
+        tool.name
+        for tool in select_planner_tools(
+            _state(permissions=permissions, request=request),
+            _write_runtime(permissions=permissions),
+        )
+        if tool.name.startswith("propose_")
+    }
+
+    assert offered_names == expected_names
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        _read_runtime(user_id="usr_outro"),
+        _read_runtime(company_id="comp_outra"),
+        _read_runtime(central_asset_id="asset_G999"),
+        _write_runtime(current_case_id="case_outro"),
+    ],
+    ids=["person", "company", "central-asset", "current-case"],
+)
+def test_select_planner_tools_fails_closed_for_trusted_scope_drift(runtime):
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(_state(), runtime)
+
+    assert exc_info.value.code is PlannerErrorCode.RUNTIME_SCOPE_MISMATCH
+
+
 def test_planner_system_prompt_has_a_versioned_safe_role():
     normalized_prompt = PLANNER_SYSTEM_PROMPT.casefold()
 
@@ -114,6 +424,39 @@ def test_planner_system_prompt_has_a_versioned_safe_role():
     assert "não invente evidência" in normalized_prompt
     assert "não executam efeito" in normalized_prompt
     assert "raciocínio interno" in normalized_prompt
+
+
+def test_planner_limits_are_immutable_and_fixed_to_the_approved_budget():
+    limits = PlannerLimits()
+
+    assert limits.tool_calls == 7
+    assert limits.selections == 8
+    assert limits.finalizations == 1
+    assert limits.context_characters == 48_000
+    with pytest.raises(ValidationError):
+        limits.selections = 9
+    with pytest.raises(ValidationError):
+        PlannerLimits(context_characters=48_001)
+
+
+@pytest.mark.parametrize(
+    "invalid_usage",
+    [
+        {"selection_count": 9},
+        {"finalization_count": 2},
+        {"selection_count": True},
+        {"selection_count": "1"},
+    ],
+    ids=[
+        "selections-above-limit",
+        "finalizations-above-limit",
+        "boolean-counter",
+        "string-counter",
+    ],
+)
+def test_planner_usage_rejects_values_above_the_fixed_budget(invalid_usage):
+    with pytest.raises(ValidationError):
+        PlannerUsage(request_id="req_invalid_usage", **invalid_usage)
 
 
 @pytest.mark.parametrize(
@@ -193,6 +536,703 @@ def test_planner_selects_one_offered_tool_without_executing_it():
     assert model._events == ["bind_tools", "selection_request"]
     assert isinstance(model._selection_messages[0], SystemMessage)
     assert model._selection_messages[0].content == PLANNER_SYSTEM_PROMPT
+
+
+def test_planner_refuses_ninth_selection_before_calling_the_model():
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(
+                    request_id="req_planner_01",
+                    selection_count=8,
+                ),
+                offered_tools=(get_asset,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.SELECTION_LIMIT_EXCEEDED
+    assert model._events == []
+
+
+def test_planner_rejects_usage_from_another_request_before_model():
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_current",
+                usage=PlannerUsage(request_id="req_other"),
+                offered_tools=(get_asset,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_USAGE
+    assert model._events == []
+
+
+def test_invalid_selection_consumes_and_exposes_the_selection_budget():
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "outside-public-schema"},
+                    "id": "call_invalid_at_budget_boundary",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_invalid_at_budget_boundary",
+                usage=PlannerUsage(
+                    request_id="req_invalid_at_budget_boundary",
+                    selection_count=7,
+                ),
+                offered_tools=(get_asset,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_TOOL_ARGUMENTS
+    assert exc_info.value.usage == PlannerUsage(
+        request_id="req_invalid_at_budget_boundary",
+        selection_count=8,
+    )
+
+    retry_model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+    with pytest.raises(PlannerProtocolError) as retry_exc:
+        asyncio.run(
+            Planner(retry_model).ainvoke(
+                _request(),
+                request_id="req_invalid_at_budget_boundary",
+                usage=exc_info.value.usage,
+                offered_tools=(get_asset,),
+            )
+        )
+    assert retry_exc.value.code is PlannerErrorCode.SELECTION_LIMIT_EXCEEDED
+    assert retry_model._events == []
+
+
+@pytest.mark.parametrize(
+    ("prior_selections", "accepted"),
+    [(7, True), (8, False)],
+    ids=["below", "at-limit"],
+)
+def test_planner_selection_limit_boundaries(prior_selections, accepted):
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "asset_G501"},
+                    "id": "call_selection_boundary",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+    invocation = Planner(model).ainvoke(
+        _request(),
+        request_id="req_selection_boundary",
+        usage=PlannerUsage(
+            request_id="req_selection_boundary",
+            selection_count=prior_selections,
+        ),
+        offered_tools=(get_asset,),
+    )
+
+    if accepted:
+        result = asyncio.run(invocation)
+        assert isinstance(result, PlannerToolTurn)
+        assert result.usage is not None
+        assert result.usage.selection_count == 8
+        assert model._events == ["bind_tools", "selection_request"]
+    else:
+        with pytest.raises(PlannerProtocolError) as exc_info:
+            asyncio.run(invocation)
+        assert exc_info.value.code is PlannerErrorCode.SELECTION_LIMIT_EXCEEDED
+        assert model._events == []
+
+
+def test_planner_usage_is_json_safe_and_resets_for_a_new_request():
+    state = _state()
+
+    assert state.planner_usage == PlannerUsage(request_id="req_planner_01")
+    restored = AgentState.model_validate_json(state.model_dump_json())
+    assert restored.planner_usage == state.planner_usage
+
+    continued = state.continue_with(
+        request=_request().model_copy(update={"message": "Novo pedido no caso."}),
+        identity=state.identity,
+        permissions=state.permissions,
+        request_id="req_planner_02",
+        execution_id="exec_planner_02",
+    )
+
+    assert continued.planner_usage == PlannerUsage(request_id="req_planner_02")
+
+
+def test_agent_state_binds_legacy_planner_history_to_the_checkpoint_request():
+    legacy_calls, legacy_observations = _planner_history(1, request_id="req_legacy")
+    legacy_wire = _state().model_dump(mode="json")
+    legacy_wire.pop("planner_usage")
+    legacy_wire["tool_calls"] = [
+        {
+            key: value
+            for key, value in legacy_calls[0].model_dump(mode="json").items()
+            if key != "request_id"
+        }
+    ]
+    legacy_wire["tool_observations"] = [
+        {
+            key: value
+            for key, value in legacy_observations[0].model_dump(mode="json").items()
+            if key != "request_id"
+        }
+    ]
+
+    restored = AgentState.model_validate(legacy_wire)
+
+    assert restored.planner_usage == PlannerUsage(request_id="req_planner_01")
+    assert restored.tool_calls[0].request_id == "req_planner_01"
+    assert restored.tool_observations[0].request_id == "req_planner_01"
+
+
+def test_agent_state_rejects_current_planner_history_above_tool_budget():
+    calls, observations = _planner_history(8)
+
+    with pytest.raises(ValidationError):
+        _state(tool_calls=calls, tool_observations=observations)
+
+
+def test_planner_refuses_eighth_tool_call_before_any_http_execution():
+    calls, observations = _planner_history(7)
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "asset_G999"},
+                    "id": "call_eighth",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(
+                    request_id="req_planner_01",
+                    selection_count=7,
+                ),
+                offered_tools=(get_asset,),
+                tool_calls=calls,
+                tool_observations=observations,
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.TOOL_CALL_LIMIT_EXCEEDED
+    assert model._events == []
+
+
+@pytest.mark.parametrize(
+    ("prior_calls", "expected_code", "expected_events"),
+    [
+        (6, None, ["bind_tools", "selection_request"]),
+        (7, PlannerErrorCode.TOOL_CALL_LIMIT_EXCEEDED, []),
+        (8, PlannerErrorCode.INVALID_HISTORY, []),
+    ],
+    ids=["below", "at-limit", "above"],
+)
+def test_planner_tool_call_limit_boundaries(
+    prior_calls,
+    expected_code,
+    expected_events,
+):
+    calls, observations = _planner_history(prior_calls)
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "asset_G999"},
+                    "id": "call_tool_boundary",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+    invocation = Planner(model).ainvoke(
+        _request(),
+        request_id="req_planner_01",
+        usage=PlannerUsage(request_id="req_planner_01"),
+        offered_tools=(get_asset,),
+        tool_calls=calls,
+        tool_observations=observations,
+    )
+
+    if expected_code is None:
+        result = asyncio.run(invocation)
+        assert isinstance(result, PlannerToolTurn)
+    else:
+        with pytest.raises(PlannerProtocolError) as exc_info:
+            asyncio.run(invocation)
+        assert exc_info.value.code is expected_code
+    assert model._events == expected_events
+
+
+def test_planner_rejects_canonical_repeat_but_allows_distinct_arguments():
+    calls, observations = _planner_history(1)
+    repeated_model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "asset_G500"},
+                    "id": "provider_changed_call_id",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(repeated_model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(request_id="req_planner_01"),
+                offered_tools=(get_asset,),
+                tool_calls=calls,
+                tool_observations=observations,
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.REPEATED_TOOL_CALL
+
+    distinct_model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "asset_G501"},
+                    "id": "call_distinct_arguments",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+    distinct = asyncio.run(
+        Planner(distinct_model).ainvoke(
+            _request(),
+            request_id="req_planner_01",
+            usage=PlannerUsage(request_id="req_planner_01"),
+            offered_tools=(get_asset,),
+            tool_calls=calls,
+            tool_observations=observations,
+        )
+    )
+
+    assert isinstance(distinct, PlannerToolTurn)
+    assert distinct.tool_call.arguments.to_python() == {"asset_id": "asset_G501"}
+
+
+def test_planner_rejects_provider_call_id_reused_with_distinct_arguments():
+    calls, observations = _planner_history(1)
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "asset_G999"},
+                    "id": calls[0].call_id,
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(request_id="req_planner_01"),
+                offered_tools=(get_asset,),
+                tool_calls=calls,
+                tool_observations=observations,
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_SELECTION
+    assert exc_info.value.usage == PlannerUsage(
+        request_id="req_planner_01",
+        selection_count=1,
+    )
+    assert model._events == ["bind_tools", "selection_request"]
+
+
+def test_planner_excludes_other_request_history_from_prompt_and_fingerprint():
+    old_calls, old_observations = _planner_history(7, request_id="req_old")
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "asset_G500"},
+                    "id": "call_current_same_arguments",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+
+    result = asyncio.run(
+        Planner(model).ainvoke(
+            _request(),
+            request_id="req_planner_01",
+            usage=PlannerUsage(request_id="req_planner_01"),
+            offered_tools=(get_asset,),
+            tool_calls=old_calls,
+            tool_observations=old_observations,
+        )
+    )
+
+    assert isinstance(result, PlannerToolTurn)
+    assert result.tool_call.arguments.to_python() == {"asset_id": "asset_G500"}
+    sent_context = str(model._selection_messages)
+    assert "req_old" not in sent_context
+    assert "asset_G500" not in sent_context
+    assert '{"omitted_interactions":0}' in sent_context
+
+
+def test_planner_filters_interleaved_history_as_current_request_pairs():
+    current_calls, current_observations = _planner_history(2)
+    old_calls, old_observations = _planner_history(2, request_id="req_old")
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "asset_G999"},
+                    "id": "call_after_interleaved_history",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+
+    result = asyncio.run(
+        Planner(model).ainvoke(
+            _request(),
+            request_id="req_planner_01",
+            usage=PlannerUsage(
+                request_id="req_planner_01",
+                selection_count=2,
+            ),
+            offered_tools=(get_asset,),
+            tool_calls=(
+                old_calls[0],
+                current_calls[0],
+                old_calls[1],
+                current_calls[1],
+            ),
+            tool_observations=(
+                old_observations[0],
+                current_observations[0],
+                old_observations[1],
+                current_observations[1],
+            ),
+        )
+    )
+
+    assert isinstance(result, PlannerToolTurn)
+    assert result.usage == PlannerUsage(
+        request_id="req_planner_01",
+        selection_count=3,
+    )
+    sent_context = str(model._selection_messages)
+    assert "req_old" not in sent_context
+    assert current_calls[0].call_id in sent_context
+    assert current_calls[1].call_id in sent_context
+
+
+def test_planner_rejects_duplicate_call_ids_in_current_history_before_model():
+    calls, observations = _planner_history(2)
+    duplicate_calls = (
+        calls[0],
+        calls[1].model_copy(update={"call_id": calls[0].call_id}),
+    )
+    duplicate_observations = (
+        observations[0],
+        observations[1].model_copy(update={"call_id": calls[0].call_id}),
+    )
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(request_id="req_planner_01"),
+                offered_tools=(get_asset,),
+                tool_calls=duplicate_calls,
+                tool_observations=duplicate_observations,
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert model._events == []
+
+
+def test_planner_refuses_second_finalization_before_structured_model_call():
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(
+                    request_id="req_planner_01",
+                    selection_count=1,
+                    finalization_count=1,
+                ),
+                offered_tools=(get_asset,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.FINALIZATION_LIMIT_EXCEEDED
+    assert model._events == []
+
+
+@pytest.mark.parametrize(
+    ("prior_finalizations", "accepted"),
+    [(0, True), (1, False)],
+    ids=["below", "at-limit"],
+)
+def test_planner_finalization_limit_boundaries(prior_finalizations, accepted):
+    terminal = PlannerTerminalDecision(
+        decision=PlannerDecisionKind.GUIDE,
+        stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+    )
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(content=""),
+        terminal_response=terminal,
+    )
+    invocation = Planner(model).ainvoke(
+        _request(),
+        request_id="req_finalization_boundary",
+        usage=PlannerUsage(
+            request_id="req_finalization_boundary",
+            finalization_count=prior_finalizations,
+        ),
+        offered_tools=(get_asset,),
+    )
+
+    if accepted:
+        result = asyncio.run(invocation)
+        assert isinstance(result, PlannerDecisionTurn)
+        assert result.usage is not None
+        assert result.usage.selection_count == 1
+        assert result.usage.finalization_count == 1
+        assert model._events[-2:] == ["with_structured_output", "terminal_request"]
+    else:
+        with pytest.raises(PlannerProtocolError) as exc_info:
+            asyncio.run(invocation)
+        assert exc_info.value.code is PlannerErrorCode.FINALIZATION_LIMIT_EXCEEDED
+        assert model._events == []
+
+
+def test_planner_context_limit_is_exactly_48000_characters():
+    def invoke_with_message(message: str):
+        model = _RecordingPlannerModel(
+            selector_response=AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_asset",
+                        "args": {"asset_id": "asset_G501"},
+                        "id": "call_context_boundary",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        )
+        request = _request().model_copy(update={"message": message})
+        try:
+            result = asyncio.run(
+                Planner(model).ainvoke(
+                    request,
+                    request_id="req_context_boundary",
+                    usage=PlannerUsage(request_id="req_context_boundary"),
+                    offered_tools=(get_asset,),
+                )
+            )
+        except PlannerProtocolError as error:
+            return error, model
+        return result, model
+
+    baseline, _ = invoke_with_message("x")
+    assert isinstance(baseline, PlannerToolTurn)
+    assert baseline.context is not None
+    fixed_characters = baseline.context.characters - 1
+
+    below, _ = invoke_with_message("x" * (47_999 - fixed_characters))
+    on_limit, _ = invoke_with_message("x" * (48_000 - fixed_characters))
+    above, above_model = invoke_with_message("x" * (48_001 - fixed_characters))
+
+    assert isinstance(below, PlannerToolTurn)
+    assert below.context is not None
+    assert below.context.characters == 47_999
+    assert isinstance(on_limit, PlannerToolTurn)
+    assert on_limit.context is not None
+    assert on_limit.context.characters == 48_000
+    assert isinstance(above, PlannerProtocolError)
+    assert above.code is PlannerErrorCode.CONTEXT_LIMIT_EXCEEDED
+    assert above_model._events == []
+
+
+def test_planner_context_counts_the_bound_tool_wire_before_model():
+    oversized_tool = get_asset.model_copy(update={"description": "x" * 48_000})
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_oversized_tool_wire",
+                usage=PlannerUsage(request_id="req_oversized_tool_wire"),
+                offered_tools=(oversized_tool,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.CONTEXT_LIMIT_EXCEEDED
+    assert model._events == []
+
+
+def test_planner_omits_old_interactions_whole_and_keeps_latest_degraded_error():
+    calls, base_observations = _planner_history(2)
+    observations = (
+        ToolObservation(
+            request_id="req_planner_01",
+            call_id=calls[0].call_id,
+            content={"old_payload": "OLD_SENTINEL_" + ("x" * 30_000)},
+            artifact=base_observations[0].artifact,
+        ),
+        ToolObservation(
+            request_id="req_planner_01",
+            call_id=calls[1].call_id,
+            content={
+                "mode": "partial",
+                "notes": "LATEST_DEGRADED_SENTINEL",
+                "error": {
+                    "category": "timeout",
+                    "code": "LATEST_TIMEOUT_SENTINEL",
+                },
+                "partial_data": "y" * 20_000,
+            },
+            artifact=base_observations[1].artifact,
+        ),
+    )
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_asset",
+                    "args": {"asset_id": "asset_G999"},
+                    "id": "call_after_degraded",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    )
+
+    result = asyncio.run(
+        Planner(model).ainvoke(
+            _request(),
+            request_id="req_planner_01",
+            usage=PlannerUsage(
+                request_id="req_planner_01",
+                selection_count=2,
+            ),
+            offered_tools=(get_asset,),
+            tool_calls=calls,
+            tool_observations=observations,
+        )
+    )
+
+    assert isinstance(result, PlannerToolTurn)
+    assert result.context is not None
+    assert result.context.omitted_interactions == 1
+    sent_context = str(model._selection_messages)
+    assert "OLD_SENTINEL" not in sent_context
+    assert "LATEST_DEGRADED_SENTINEL" in sent_context
+    assert "LATEST_TIMEOUT_SENTINEL" in sent_context
+    assert '{"omitted_interactions":1}' in sent_context
+    assert _request().message in sent_context
+
+
+def test_planner_never_compacts_away_the_latest_degraded_observation():
+    calls, base_observations = _planner_history(1)
+    degraded_observation = ToolObservation(
+        request_id="req_planner_01",
+        call_id=calls[0].call_id,
+        content={
+            "mode": "partial",
+            "notes": "LATEST_DEGRADED_MUST_REMAIN",
+            "partial_data": "x" * 48_000,
+        },
+        artifact=base_observations[0].artifact.model_copy(
+            update={
+                "outcome": base_observations[0].artifact.outcome.model_copy(
+                    update={"mode": "partial", "notes": "dados incompletos"}
+                )
+            }
+        ),
+    )
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=PlannerUsage(
+                    request_id="req_planner_01",
+                    selection_count=1,
+                ),
+                offered_tools=(get_asset,),
+                tool_calls=calls,
+                tool_observations=(degraded_observation,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.CONTEXT_LIMIT_EXCEEDED
+    assert model._events == []
 
 
 def test_planner_discards_selector_text_and_uses_a_separate_terminal_request():
@@ -417,6 +1457,36 @@ def test_planner_fails_closed_for_invalid_terminal_output():
     assert "não deve chegar ao cliente" not in error_text
 
 
+def test_invalid_terminal_output_consumes_selection_and_finalization_budgets():
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(content="descartar"),
+        terminal_response={
+            "decision": "act",
+            "stop_reason": "sufficient_evidence",
+        },
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_invalid_terminal_budget",
+                usage=PlannerUsage(
+                    request_id="req_invalid_terminal_budget",
+                    selection_count=3,
+                ),
+                offered_tools=(get_asset,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_TERMINAL_OUTPUT
+    assert exc_info.value.usage == PlannerUsage(
+        request_id="req_invalid_terminal_budget",
+        selection_count=4,
+        finalization_count=1,
+    )
+
+
 @pytest.mark.parametrize(
     ("invalid_boundary", "expected_code"),
     [
@@ -537,11 +1607,13 @@ def test_planner_tool_cycle_survives_sqlite_close_and_reopen(tmp_path: Path):
     checkpoint_path = tmp_path / "planner-cycle.sqlite3"
     request = _request()
     call = PersistedToolCall(
+        request_id="req_planner_01",
         call_id="call_get_asset_01",
         name="get_asset",
         arguments={"asset_id": "asset_G501"},
     )
     observation = ToolObservation(
+        request_id="req_planner_01",
         call_id=call.call_id,
         content={"id": "asset_G501", "sensor_status": "online"},
         artifact=ToolArtifact(
@@ -574,6 +1646,10 @@ def test_planner_tool_cycle_survives_sqlite_close_and_reopen(tmp_path: Path):
         ),
         tool_calls=(call,),
         tool_observations=(observation,),
+        planner_usage=PlannerUsage(
+            request_id="req_planner_01",
+            selection_count=1,
+        ),
         step_limit=3,
     )
     serialized_state = state.model_dump(mode="json")
@@ -614,6 +1690,7 @@ def test_planner_tool_cycle_survives_sqlite_close_and_reopen(tmp_path: Path):
     )
     assert restored_state.tool_calls == (call,)
     assert restored_state.tool_observations == (observation,)
+    assert restored_state.planner_usage == state.planner_usage
     assert restored_state.tool_observations[0].content is not None
     assert restored_state.tool_observations[0].content.to_python() == {
         "id": "asset_G501",
