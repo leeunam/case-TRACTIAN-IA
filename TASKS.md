@@ -747,6 +747,15 @@ parser divergente de timestamps e reutiliza `parse_aware_iso_timestamp` em
 análises, baseline, RMS, espectro e modelo. Passaram **782 testes sem SQLite**;
 o novo restore SQLite passou externamente, e os locks offline permaneceram em
 49 pacotes do agente e 55 da API.
+No oitavo ciclo corretivo, `CompanyId` tornou-se o tipo compartilhado entre o
+wire completo de ativo e o preflight do planner. Assim, um artifact correlato
+com empresa fora de `comp_*` falha como histórico inválido antes do catálogo ou
+modelo, mesmo quando pedido e runtime carregam o mesmo tenant amplo. O wire de
+ponto também reutiliza `PointId`; a auditoria dos identificadores confirmou
+que ativo, empresa, pai e ponto preservam a autoridade do wire, enquanto o
+`point.asset_id` descartado continua validado pelo executor antes da
+normalização. Passaram **784 testes focados sem SQLite**, e os locks offline
+permaneceram em 49 pacotes do agente e 55 da API.
 
 ### Task 12 — integrar o planner ao LangGraph e preservar as escritas
 

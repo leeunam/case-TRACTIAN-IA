@@ -56,6 +56,7 @@ from tractian_agent.tools.assets import (
 )
 from tractian_agent.tools.identifiers import (
     AnalysisId,
+    CompanyId,
     KnowledgeDocumentId,
     ModelId,
     PointId,
@@ -117,6 +118,7 @@ class PlannerLimits(StrictModel):
 PLANNER_LIMITS: Final = PlannerLimits()
 
 _ANALYSIS_ID_ADAPTER: Final = TypeAdapter(AnalysisId)
+_COMPANY_ID_ADAPTER: Final = TypeAdapter(CompanyId)
 _KNOWLEDGE_ID_ADAPTER: Final = TypeAdapter(KnowledgeDocumentId)
 _MODEL_ID_ADAPTER: Final = TypeAdapter(ModelId)
 _POINT_ID_ADAPTER: Final = TypeAdapter(PointId)
@@ -328,7 +330,8 @@ def _asset_artifact_is_concrete(artifact: AssetToolArtifact) -> bool:
         technical.line_frequency_hz,
     )
     return (
-        _nonblank(asset.name)
+        _validated_id(asset.company_id, _COMPANY_ID_ADAPTER) is not None
+        and _nonblank(asset.name)
         and _nonblank(asset.hierarchy.plant)
         and _nonblank(asset.hierarchy.line)
         and _nonblank(technical.machine_type)

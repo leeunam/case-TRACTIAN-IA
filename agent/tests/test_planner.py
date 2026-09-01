@@ -2100,6 +2100,158 @@ def test_planner_rejects_complete_asset_impossible_for_the_executor():
     assert model._events == []
 
 
+def test_select_rejects_complete_asset_company_that_executor_cannot_emit():
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "complete",
+                "notes": None,
+                "data": {
+                    "id": "asset_G501",
+                    "name": "Motor principal",
+                    "company_id": "tenant_x",
+                    "criticality": "critical",
+                    "plant": "Planta 1",
+                    "line": "Britagem",
+                    "parent_asset_id": None,
+                    "machine_type": "motor_induction",
+                    "rotation_rpm": 1780.0,
+                    "bearing_pn": None,
+                    "bpfo_hz": None,
+                    "bpfi_hz": None,
+                    "bsf_hz": None,
+                    "ftf_hz": None,
+                    "line_frequency_hz": 60.0,
+                    "sensor_status": "online",
+                    "points": [
+                        {
+                            "id": "pt_G501_de",
+                            "asset_id": "asset_G501",
+                            "location": "DE",
+                            "sensor_status": "online",
+                        }
+                    ],
+                },
+            },
+        )
+
+    async def invoke_executor():
+        runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="tenant_x",
+            permissions=frozenset({"read"}),
+            central_asset_id="asset_G501",
+            client=IndustrialApiClient(
+                "https://industrial.test",
+                transport=httpx.MockTransport(handler),
+            ),
+        )
+        try:
+            return await execute_get_asset("asset_G501", runtime)
+        finally:
+            await runtime.client.aclose()
+
+    executor_result = asyncio.run(invoke_executor())
+    assert executor_result.error is not None
+    assert executor_result.error.category is ApiErrorCategory.INVALID_RESPONSE
+
+    call, observation, _ = _real_complete_observation("get_asset")
+    artifact = observation.artifact.validated_read_artifact()
+    assert isinstance(artifact, AssetToolArtifact)
+    impossible_asset = artifact.outcome.asset.model_copy(
+        update={"company_id": "tenant_x"}
+    )
+    impossible_observation = ToolObservation.model_validate_json(
+        ToolObservation(
+            request_id=call.request_id,
+            call_id=call.call_id,
+            content=observation.content,
+            artifact=artifact.model_copy(
+                update={
+                    "outcome": artifact.outcome.model_copy(
+                        update={"asset": impossible_asset}
+                    )
+                }
+            ),
+        ).model_dump_json()
+    )
+    request = _request().model_copy(
+        update={
+            "identity": Identity(
+                user_id="usr_pedro",
+                company_id="tenant_x",
+            )
+        }
+    )
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        select_planner_tools(
+            _state(
+                request=request,
+                tool_calls=(call,),
+                tool_observations=(impossible_observation,),
+            ),
+            _read_runtime(company_id="tenant_x"),
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_planner_rejects_impossible_complete_asset_company_before_model():
+    call, observation, _ = _real_complete_observation("get_asset")
+    artifact = observation.artifact.validated_read_artifact()
+    assert isinstance(artifact, AssetToolArtifact)
+    impossible_asset = artifact.outcome.asset.model_copy(
+        update={"company_id": "tenant_x"}
+    )
+    impossible_observation = ToolObservation.model_validate_json(
+        ToolObservation(
+            request_id=call.request_id,
+            call_id=call.call_id,
+            content=observation.content,
+            artifact=artifact.model_copy(
+                update={
+                    "outcome": artifact.outcome.model_copy(
+                        update={"asset": impossible_asset}
+                    )
+                }
+            ),
+        ).model_dump_json()
+    )
+    request = _request().model_copy(
+        update={
+            "identity": Identity(
+                user_id="usr_pedro",
+                company_id="tenant_x",
+            )
+        }
+    )
+    usage = PlannerUsage(request_id="req_planner_01", selection_count=1)
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                request,
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(get_asset,),
+                tool_calls=(call,),
+                tool_observations=(impossible_observation,),
+            )
+        )
+
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert exc_info.value.usage == usage
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert "tenant_x" not in str(exc_info.value)
+    assert model._events == []
+
+
 def test_select_planner_tools_rejects_complete_analysis_impossible_for_executor():
     impossible_analysis = AnalysisArtifact(
         id="an_impossible",

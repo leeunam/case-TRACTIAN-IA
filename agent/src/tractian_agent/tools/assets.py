@@ -10,7 +10,7 @@ from pydantic import ConfigDict, Field, JsonValue
 
 from tractian_agent.contracts import ApiError, ResponseMode, StrictModel
 
-from .identifiers import AssetId
+from .identifiers import AssetId, CompanyId, PointId
 from .observations import (
     ToolArtifact,
     ToolOutcome,
@@ -23,7 +23,7 @@ from .runtime import ReadToolRuntime
 class _AssetPointWire(StrictModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    id: str = Field(min_length=1, pattern=r"^pt_[A-Za-z0-9_-]{1,64}$")
+    id: PointId
     asset_id: AssetId
     location: str = Field(min_length=1, pattern=r"\S")
     sensor_status: str = Field(min_length=1, pattern=r"\S")
@@ -36,7 +36,7 @@ class _AssetWire(StrictModel):
 
     id: AssetId
     name: str = Field(min_length=1, pattern=r"\S")
-    company_id: str = Field(min_length=1, pattern=r"^comp_[A-Za-z0-9_-]{1,64}$")
+    company_id: CompanyId
     criticality: Literal["low", "medium", "high", "critical"]
     plant: str = Field(min_length=1, pattern=r"\S")
     line: str = Field(min_length=1, pattern=r"\S")
