@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from enum import Enum
+import hashlib
+import json
 from typing import Annotated, Literal
 
 from pydantic import ConfigDict, Field, TypeAdapter, model_validator
@@ -90,6 +92,25 @@ WriteProposal = Annotated[
     | EscalateCaseProposal,
     Field(discriminator="action"),
 ]
+
+
+def canonical_write_payload_hash(proposal: WriteProposal) -> str:
+    """Gera o hash do corpo que será enviado, sem incluir o alvo confiável."""
+    body: dict[str, object]
+    if isinstance(proposal, UpdateAssetCriticalityProposal):
+        body = {
+            "changes": {"criticality": proposal.criticality},
+            "justification": proposal.justification,
+        }
+    else:
+        body = {"justification": proposal.justification}
+    encoded = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:v1:{hashlib.sha256(encoded).hexdigest()}"
 
 
 class WriteMaterialParameters(StrictModel):

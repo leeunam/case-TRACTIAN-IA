@@ -66,6 +66,7 @@ from tractian_agent.write_contracts import (
     PersistedActionReceipt,
     PersistedApiError,
     ReprocessIntentScope,
+    UpdateAssetCriticalityIntentScope,
     WriteIntent,
 )
 from tractian_agent.write_policy import (
@@ -79,6 +80,7 @@ from tractian_agent.write_policy import (
     TrustedActionApproval,
     UpdateAssetCriticalityProposal,
     WritePolicyResult,
+    canonical_write_payload_hash,
 )
 
 
@@ -400,6 +402,7 @@ def test_terminal_state_rejects_incompatible_write_intent_or_execution_result():
     completed_data = _intent().model_dump(mode="python")
     completed_data.update(
         request_id="req_01",
+        payload_hash=canonical_write_payload_hash(proposal),
         status=IntentStatus.COMPLETED,
         attempts=1,
         receipt=ActionReceipt(
@@ -425,6 +428,85 @@ def test_terminal_state_rejects_incompatible_write_intent_or_execution_result():
 
     with pytest.raises(ValidationError, match="terminal diverge"):
         AgentState.model_validate(execution_wire)
+
+
+@pytest.mark.parametrize("tamper", ["target", "payload_hash", "criticality"])
+def test_terminal_execution_rejects_adulterated_effect_binding(tamper: str):
+    receipt = ActionReceipt(
+        accepted=True,
+        action_id="act_effect_binding",
+        message="Ação concluída.",
+    )
+    if tamper == "criticality":
+        proposal = UpdateAssetCriticalityProposal(
+            criticality="critical",
+            justification="A criticidade máxima foi aplicada.",
+        )
+        intent = WriteIntent(
+            intent_id="intent_effect_criticality",
+            request_id="req_01",
+            scope=UpdateAssetCriticalityIntentScope(
+                action="update_asset_criticality",
+                case_id="case_tkt_inv_04",
+                company_id="comp_mineracao_andes",
+                user_id="usr_pedro",
+                asset_id="asset_G501",
+                criticality="critical",
+                justification=proposal.justification,
+            ),
+            payload_hash=canonical_write_payload_hash(proposal),
+            decision=WritePolicyResult(
+                decision=PolicyDecision.ALLOW,
+                reason=PolicyReason.AUTHORIZED,
+            ),
+            status=IntentStatus.COMPLETED,
+            prepared_execution_id="exec_01",
+            attempts=1,
+            receipt=receipt,
+        )
+        state = _state(
+            pending_proposal=proposal,
+            intents=(intent,),
+            decision=AgentDecision.ACT,
+            final_result=FinalResult(
+                decision=AgentDecision.ACT,
+                message="Criticidade atualizada.",
+            ),
+            resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+        )
+        wire = state.model_dump(mode="json")
+        wire["pending_proposal"]["criticality"] = "medium"
+    else:
+        proposal = ReprocessProposal(
+            analysis_id="an_9906",
+            justification="O reprocesso foi concluído.",
+        )
+        intent_data = _intent().model_dump(mode="python")
+        intent_data.update(
+            request_id="req_01",
+            payload_hash=canonical_write_payload_hash(proposal),
+            status=IntentStatus.COMPLETED,
+            attempts=1,
+            receipt=receipt,
+        )
+        state = _state(
+            pending_proposal=proposal,
+            intents=(WriteIntent.model_validate(intent_data),),
+            decision=AgentDecision.ACT,
+            final_result=FinalResult(
+                decision=AgentDecision.ACT,
+                message="Reprocesso concluído.",
+            ),
+            resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+        )
+        wire = state.model_dump(mode="json")
+        if tamper == "target":
+            wire["pending_proposal"]["analysis_id"] = "an_other"
+        else:
+            wire["intents"][0]["payload_hash"] = "sha256:v1:" + "b" * 64
+
+    with pytest.raises(ValidationError, match="terminal diverge"):
+        AgentState.model_validate(wire)
 
 
 def test_new_request_resets_request_bound_planner_progress_and_anchor():

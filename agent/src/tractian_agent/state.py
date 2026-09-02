@@ -39,16 +39,84 @@ from tractian_agent.tools.technical import (
     RmsToolArtifact,
     SpectrumToolArtifact,
 )
-from tractian_agent.write_contracts import IntentStatus, PersistedApiError, WriteIntent
+from tractian_agent.write_contracts import (
+    EscalateCaseIntentScope,
+    IntentStatus,
+    PersistedApiError,
+    ReprocessIntentScope,
+    RequestModelRetrainingIntentScope,
+    RequestSpecialistAnalysisIntentScope,
+    UpdateAssetCriticalityIntentScope,
+    WriteIntent,
+    WriteIntentScope,
+    intent_scope_material_parameters,
+    intent_scope_target_id,
+)
 from tractian_agent.write_policy import (
+    EscalateCaseProposal,
     PolicyDecision,
+    ReprocessProposal,
+    RequestModelRetrainingProposal,
+    RequestSpecialistAnalysisProposal,
     TrustedActionApproval,
+    UpdateAssetCriticalityProposal,
+    WriteMaterialParameters,
     WriteProposal,
+    canonical_write_payload_hash,
 )
 
 
 def _normalized_key(value: str) -> str:
     return "".join(character for character in value.casefold() if character.isalnum())
+
+
+def _proposal_matches_persisted_intent(
+    proposal: WriteProposal,
+    scope: WriteIntentScope,
+    *,
+    request: PersistedSupportRequest,
+    payload_hash: str,
+) -> bool:
+    """Vincula o efeito terminal à proposal sem recuperar runtime no estado."""
+    if (
+        proposal.action != scope.action
+        or canonical_write_payload_hash(proposal) != payload_hash
+    ):
+        return False
+    persisted_target = intent_scope_target_id(scope)
+    persisted_material = intent_scope_material_parameters(scope)
+    if isinstance(proposal, ReprocessProposal):
+        return (
+            isinstance(scope, ReprocessIntentScope)
+            and proposal.analysis_id == persisted_target
+            and persisted_material == WriteMaterialParameters()
+        )
+    if isinstance(proposal, RequestSpecialistAnalysisProposal):
+        return (
+            isinstance(scope, RequestSpecialistAnalysisIntentScope)
+            and proposal.analysis_id == persisted_target
+            and persisted_material == WriteMaterialParameters()
+        )
+    if isinstance(proposal, UpdateAssetCriticalityProposal):
+        return (
+            isinstance(scope, UpdateAssetCriticalityIntentScope)
+            and request.asset_id is not None
+            and persisted_target == request.asset_id
+            and persisted_material
+            == WriteMaterialParameters(criticality=proposal.criticality)
+        )
+    if isinstance(proposal, RequestModelRetrainingProposal):
+        # O model_id é confiável, mas não pertence ao estado persistível.
+        return (
+            isinstance(scope, RequestModelRetrainingIntentScope)
+            and persisted_material == WriteMaterialParameters()
+        )
+    return (
+        isinstance(proposal, EscalateCaseProposal)
+        and isinstance(scope, EscalateCaseIntentScope)
+        and persisted_target == request.case_id
+        and persisted_material == WriteMaterialParameters()
+    )
 
 
 def _key_segments(value: str) -> frozenset[str]:
@@ -816,9 +884,14 @@ class AgentState(FrozenStateModel):
             intent = current_intents[0]
             if intent.decision.decision is not PolicyDecision.ALLOW:
                 return False
-            if self.pending_proposal.action != intent.scope.action:
-                return False
             if intent.status is IntentStatus.COMPLETED:
+                if not _proposal_matches_persisted_intent(
+                    self.pending_proposal,
+                    intent.scope,
+                    request=self.request,
+                    payload_hash=intent.payload_hash,
+                ):
+                    return False
                 expected_decision = (
                     AgentDecision.ESCALATE
                     if intent.scope.action == "escalate_case"

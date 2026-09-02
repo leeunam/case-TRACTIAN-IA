@@ -45,6 +45,7 @@ from tractian_agent.write_policy import (
     ReprocessProposal,
     TrustedActionApproval,
     WritePolicyResult,
+    canonical_write_payload_hash,
 )
 
 
@@ -201,6 +202,10 @@ def _terminal_denial_state() -> AgentState:
 
 def _terminal_execution_state() -> AgentState:
     state = _initial_state(step_limit=5)
+    proposal = ReprocessProposal(
+        analysis_id="an_historical",
+        justification="O reprocesso foi autorizado e concluído.",
+    )
     completed_data = _denied_historical_intent(state.request_id).model_dump(
         mode="python"
     )
@@ -210,6 +215,7 @@ def _terminal_execution_state() -> AgentState:
             reason=PolicyReason.AUTHORIZED,
         ),
         status=IntentStatus.COMPLETED,
+        payload_hash=canonical_write_payload_hash(proposal),
         idempotency_key="tractian-agent:intent_req_01",
         expires_at=datetime.now(timezone.utc) + timedelta(days=1),
         prepared_execution_id=state.execution_id,
@@ -222,10 +228,7 @@ def _terminal_execution_state() -> AgentState:
     )
     values = state.model_dump(mode="python")
     values.update(
-        pending_proposal=ReprocessProposal(
-            analysis_id="an_historical",
-            justification="O reprocesso foi autorizado e concluído.",
-        ),
+        pending_proposal=proposal,
         intents=(WriteIntent.model_validate(completed_data),),
         decision=AgentDecision.ACT,
         final_result=FinalResult(
@@ -862,6 +865,8 @@ def test_terminal_anchor_table_rejects_known_but_impossible_state(
         "fallback_finish_as_request_information",
         "denial_as_active_intent",
         "execution_as_guide",
+        "execution_with_other_target",
+        "execution_with_other_payload_hash",
     ],
 )
 def test_adulterated_terminal_checkpoint_fails_closed_before_return(
@@ -888,8 +893,15 @@ def test_adulterated_terminal_checkpoint_fails_closed_before_return(
         }
     else:
         persisted_values = _terminal_execution_state().model_dump(mode="json")
-        persisted_values["decision"] = AgentDecision.GUIDE.value
-        persisted_values["final_result"]["decision"] = AgentDecision.GUIDE.value
+        if tamper == "execution_as_guide":
+            persisted_values["decision"] = AgentDecision.GUIDE.value
+            persisted_values["final_result"]["decision"] = AgentDecision.GUIDE.value
+        elif tamper == "execution_with_other_target":
+            persisted_values["pending_proposal"]["analysis_id"] = "an_other"
+        else:
+            persisted_values["intents"][0]["payload_hash"] = (
+                "sha256:v1:" + "b" * 64
+            )
     graph = _RecordingGraph(persisted_values, planner_enabled=True)
 
     async def scenario():

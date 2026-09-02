@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timedelta, timezone
-import hashlib
 import json
 from typing import Any, Literal
 from uuid import uuid4
@@ -84,6 +83,7 @@ from tractian_agent.write_policy import (
     UpdateAssetCriticalityProposal,
     WriteProposal,
     WritePolicyResult,
+    canonical_write_payload_hash,
     evaluate_write_policy,
     resolve_action_scope,
 )
@@ -174,23 +174,8 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _canonical_payload_body(proposal: WriteProposal) -> dict[str, object]:
-    if isinstance(proposal, UpdateAssetCriticalityProposal):
-        return {
-            "changes": {"criticality": proposal.criticality},
-            "justification": proposal.justification,
-        }
-    return {"justification": proposal.justification}
-
-
 def _canonical_payload_hash(proposal: WriteProposal) -> str:
-    body = json.dumps(
-        _canonical_payload_body(proposal),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return f"sha256:v1:{hashlib.sha256(body).hexdigest()}"
+    return canonical_write_payload_hash(proposal)
 
 
 def _current_write_proposal(state: AgentState) -> WriteProposal:
