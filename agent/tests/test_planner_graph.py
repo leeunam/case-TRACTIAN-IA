@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from datetime import datetime, timezone
 import hashlib
 import json
 from typing import Any
@@ -19,6 +20,7 @@ from tractian_agent.checkpoint import open_checkpointer
 from tractian_agent.client import IndustrialApiClient
 from tractian_agent.contracts import Identity, ResponseMode, SupportRequest
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
+from tractian_agent.evidence import compile_observations
 from tractian_agent.graph import build_agent_graph
 from tractian_agent.planner import (
     Planner,
@@ -609,9 +611,13 @@ def test_each_planner_proposal_runs_through_tool_node_without_effect(
                 company_id=runtime.identity.company_id,
                 user_id=runtime.identity.user_id,
             ),
-            tool_calls=trusted_calls,
-            tool_observations=trusted_observations,
-            planner_usage=PlannerUsage(
+                tool_calls=trusted_calls,
+                tool_observations=trusted_observations,
+                ledger=compile_observations(
+                    trusted_observations,
+                    recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+                ),
+                planner_usage=PlannerUsage(
                 request_id=request_id,
                 selection_count=len(trusted_calls),
             ),
@@ -1435,6 +1441,280 @@ def test_degraded_read_is_persisted_and_reaches_structured_terminal(tmp_path):
     assert state.ledger.items
     assert all(item.quality.value == "partial" for item in state.ledger.items)
     assert {gap.reason.value for gap in state.ledger.gaps} == {"partial"}
+
+
+def test_public_reads_preserve_conflict_through_sqlite_reopen(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        point_id = request.url.params.get("point_id")
+        return httpx.Response(
+            200,
+            json={
+                "mode": "complete",
+                "notes": None,
+                "data": {
+                    "asset_id": "asset_G501",
+                    "point_id": point_id or "pt_G501_de",
+                    "completeness": 0.61 if point_id else 0.98,
+                    "freshness_minutes": 2,
+                    "snr_db": 24.5,
+                    "staleness_flag": False,
+                },
+            },
+        )
+
+    def quality_call(call_id: str, point_id: str | None) -> AIMessage:
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_data_quality",
+                    "args": (
+                        {"asset_id": "asset_G501"}
+                        if point_id is None
+                        else {"asset_id": "asset_G501", "point_id": point_id}
+                    ),
+                    "id": call_id,
+                    "type": "tool_call",
+                }
+            ],
+        )
+
+    model = _ScriptedPlannerModel(
+        selector_responses=(
+            quality_call("call_quality_asset", None),
+            quality_call("call_quality_point", "pt_G501_de"),
+            AIMessage(content=""),
+        ),
+        terminal_responses=(
+            PlannerTerminalDecision(
+                decision=PlannerDecisionKind.REQUIRE_HUMAN_REVIEW,
+                stop_reason=PlannerStopReason.HUMAN_REVIEW_REQUIRED,
+            ),
+        ),
+    )
+
+    async def scenario():
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(handler),
+        )
+        runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read"}),
+            central_asset_id="asset_G501",
+            client=client,
+        )
+        config = {"configurable": {"thread_id": "thread_quality_conflict"}}
+        try:
+            async with open_checkpointer(tmp_path / "conflict.sqlite3") as saver:
+                graph = build_agent_graph(saver, planner=Planner(model))
+                state = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_quality_conflict",
+                    request_id="req_quality_conflict",
+                    execution_id="exec_quality_conflict",
+                )
+            async with open_checkpointer(tmp_path / "conflict.sqlite3") as saver:
+                reopened = AgentState.model_validate(
+                    (await build_agent_graph(saver, planner=Planner(model)).aget_state(config)).values
+                )
+            return state, reopened
+        finally:
+            await client.aclose()
+
+    state, reopened = asyncio.run(scenario())
+
+    assert len(state.tool_observations) == 2
+    assert state.ledger.items
+    assert state.ledger.gaps == ()
+    assert state.ledger.conflicts
+    assert state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+    assert reopened.ledger == state.ledger
+
+
+def test_public_obsolete_read_preserves_gap_through_sqlite_reopen(tmp_path):
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "complete",
+                "notes": None,
+                "data": {
+                    "asset_id": "asset_G501",
+                    "point_id": "pt_G501_de",
+                    "completeness": 0.98,
+                    "freshness_minutes": 2,
+                    "snr_db": 24.5,
+                    "staleness_flag": True,
+                },
+            },
+        )
+
+    model = _ScriptedPlannerModel(
+        selector_responses=(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_data_quality",
+                        "args": {"asset_id": "asset_G501"},
+                        "id": "call_quality_obsolete",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content=""),
+        ),
+        terminal_responses=(
+            PlannerTerminalDecision(
+                decision=PlannerDecisionKind.REQUEST_INFORMATION,
+                stop_reason=PlannerStopReason.MISSING_INFORMATION,
+                missing_information="Aguardar dados atuais de qualidade.",
+            ),
+        ),
+    )
+
+    async def scenario():
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(handler),
+        )
+        runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read"}),
+            central_asset_id="asset_G501",
+            client=client,
+        )
+        config = {"configurable": {"thread_id": "thread_quality_obsolete"}}
+        try:
+            async with open_checkpointer(tmp_path / "obsolete.sqlite3") as saver:
+                graph = build_agent_graph(saver, planner=Planner(model))
+                state = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_quality_obsolete",
+                    request_id="req_quality_obsolete",
+                    execution_id="exec_quality_obsolete",
+                )
+            async with open_checkpointer(tmp_path / "obsolete.sqlite3") as saver:
+                reopened = AgentState.model_validate(
+                    (await build_agent_graph(saver, planner=Planner(model)).aget_state(config)).values
+                )
+            return state, reopened
+        finally:
+            await client.aclose()
+
+    state, reopened = asyncio.run(scenario())
+
+    assert state.ledger.items
+    assert all(item.quality.value == "obsolete" for item in state.ledger.items)
+    assert {gap.reason.value for gap in state.ledger.gaps} == {"obsolete"}
+    assert state.ledger.conflicts == ()
+    assert state.decision is AgentDecision.REQUEST_INFORMATION
+    assert reopened.ledger == state.ledger
+
+
+def test_public_new_request_archives_ledger_through_sqlite_reopen(tmp_path):
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "mode": "complete",
+                "notes": None,
+                "data": {
+                    "asset_id": "asset_G501",
+                    "point_id": "pt_G501_de",
+                    "completeness": 0.98,
+                    "freshness_minutes": 2,
+                    "snr_db": 24.5,
+                    "staleness_flag": False,
+                },
+            },
+        )
+
+    model = _ScriptedPlannerModel(
+        selector_responses=(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_data_quality",
+                        "args": {"asset_id": "asset_G501"},
+                        "id": "call_history_quality",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content=""),
+            AIMessage(content=""),
+        ),
+        terminal_responses=(
+            PlannerTerminalDecision(
+                decision=PlannerDecisionKind.REQUEST_INFORMATION,
+                stop_reason=PlannerStopReason.MISSING_INFORMATION,
+                missing_information="Aguardar a próxima solicitação.",
+            ),
+            PlannerTerminalDecision(
+                decision=PlannerDecisionKind.REQUEST_INFORMATION,
+                stop_reason=PlannerStopReason.MISSING_INFORMATION,
+                missing_information="Sem leitura nova para esta solicitação.",
+            ),
+        ),
+    )
+
+    async def scenario():
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(handler),
+        )
+        runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read"}),
+            central_asset_id="asset_G501",
+            client=client,
+        )
+        checkpoint_path = tmp_path / "history.sqlite3"
+        config = {"configurable": {"thread_id": "thread_ledger_history"}}
+        try:
+            async with open_checkpointer(checkpoint_path) as saver:
+                first = await invoke_agent(
+                    build_agent_graph(saver, planner=Planner(model)),
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_ledger_history",
+                    request_id="req_ledger_history_one",
+                    execution_id="exec_ledger_history_one",
+                )
+            async with open_checkpointer(checkpoint_path) as saver:
+                second = await invoke_agent(
+                    build_agent_graph(saver, planner=Planner(model)),
+                    request=_request(message="Nova solicitação independente."),
+                    runtime=runtime,
+                    thread_id="thread_ledger_history",
+                    request_id="req_ledger_history_two",
+                    execution_id="exec_ledger_history_two",
+                )
+            async with open_checkpointer(checkpoint_path) as saver:
+                restored = AgentState.model_validate(
+                    (await build_agent_graph(saver, planner=Planner(model)).aget_state(config)).values
+                )
+            return first, second, restored
+        finally:
+            await client.aclose()
+
+    first, second, restored = asyncio.run(scenario())
+
+    assert first.ledger.items
+    assert second.ledger.items == ()
+    assert second.ledger_history == (first.ledger,)
+    assert restored.ledger_history == (first.ledger,)
+    assert all(item.request_id == "req_ledger_history_one" for item in restored.ledger_history[0].items)
 
 
 def test_unexpected_tool_failure_terminates_safely_without_retry(tmp_path):

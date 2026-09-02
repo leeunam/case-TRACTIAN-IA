@@ -13,7 +13,11 @@ from tractian_agent.contracts import (
     SupportRequest,
     ToolCall,
 )
-from tractian_agent.evidence import compile_observations
+from tractian_agent.evidence import (
+    compile_action_intents,
+    compile_observations,
+    merge_ledgers,
+)
 from tractian_agent.state import (
     AgentDecision,
     AgentState,
@@ -130,6 +134,23 @@ def _state(**changes: object) -> AgentState:
         "step_limit": 3,
     }
     data.update(changes)
+    if "ledger" not in changes:
+        recorded_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        observations = tuple(
+            observation
+            for observation in data.get("tool_observations", ())
+            if observation.request_id == data["request_id"]
+            and observation.artifact.validated_read_artifact() is not None
+        )
+        intents = tuple(
+            intent
+            for intent in data.get("intents", ())
+            if intent.request_id == data["request_id"]
+        )
+        data["ledger"] = merge_ledgers(
+            compile_observations(observations, recorded_at=recorded_at),
+            compile_action_intents(intents, recorded_at=recorded_at),
+        )
     return AgentState(**data)
 
 
@@ -317,6 +338,310 @@ def test_ledger_rejects_tampered_tool_provenance(field, replacement):
             tool_observations=(observation,),
             ledger=wire,
         )
+
+
+def test_ledger_rejects_removed_fact_from_validated_observation():
+    call = PersistedToolCall(
+        request_id="req_01",
+        call_id="call_ledger_removed_fact",
+        name="get_data_quality",
+        arguments={"asset_id": "asset_G501", "point_id": None},
+    )
+    observation = ToolObservation(
+        request_id="req_01",
+        call_id=call.call_id,
+        artifact=DataQualityToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=DataQualityArtifact(
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=0.98,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=False,
+                ),
+            ),
+        ),
+    )
+    ledger = compile_observations(
+        (observation,),
+        recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    wire = ledger.model_dump(mode="json")
+    wire["items"].pop()
+
+    with pytest.raises(ValidationError, match="ledger"):
+        _state(
+            tool_calls=(call,),
+            tool_observations=(observation,),
+            ledger=wire,
+        )
+
+
+def test_ledger_rejects_removed_field_when_typed_source_remains():
+    observation = ToolObservation(
+        request_id="req_01",
+        call_id="call_ledger_missing_field",
+        artifact=DataQualityToolArtifact(
+            tool_name="get_data_quality",
+            arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=DataQualityArtifact(
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=0.98,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=False,
+                ),
+            ),
+        ),
+    )
+    ledger = compile_observations(
+        (observation,),
+        recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    wire = _state(tool_observations=(observation,), ledger=ledger).model_dump(mode="json")
+    del wire["ledger"]
+
+    with pytest.raises(ValidationError, match="ledger"):
+        AgentState.model_validate(wire)
+
+
+def test_ledger_rejects_removed_gap_from_validated_observation():
+    complete = ToolObservation(
+        request_id="req_01",
+        call_id="call_ledger_complete",
+        artifact=DataQualityToolArtifact(
+            tool_name="get_data_quality",
+            arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=DataQualityArtifact(
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=0.98,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=False,
+                ),
+            ),
+        ),
+    )
+    failed = ToolObservation(
+        request_id="req_01",
+        call_id="call_ledger_error",
+        artifact=DataQualityToolArtifact(
+            tool_name="get_data_quality",
+            arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                error=ApiError(
+                    category=ApiErrorCategory.TIMEOUT,
+                    code="READ_TIMEOUT",
+                    message="falha sanitizada",
+                )
+            ),
+        ),
+    )
+    ledger = compile_observations(
+        (complete, failed),
+        recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    assert ledger.gaps
+    wire = ledger.model_dump(mode="json")
+    wire["gaps"] = []
+
+    with pytest.raises(ValidationError, match="ledger"):
+        _state(tool_observations=(complete, failed), ledger=wire)
+
+
+def test_ledger_rejects_removed_terminal_action_fact():
+    observation = ToolObservation(
+        request_id="req_01",
+        call_id="call_ledger_action_read",
+        artifact=DataQualityToolArtifact(
+            tool_name="get_data_quality",
+            arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=DataQualityArtifact(
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=0.98,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=False,
+                ),
+            ),
+        ),
+    )
+    intent_data = _intent().model_dump(mode="python")
+    intent_data.update(
+        request_id="req_01",
+        status=IntentStatus.COMPLETED,
+        attempts=1,
+        receipt=ActionReceipt(
+            accepted=True,
+            action_id="act_ledger_action",
+            message="Texto livre não é evidência.",
+        ),
+    )
+    terminal = WriteIntent.model_validate(intent_data)
+    recorded_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    ledger = merge_ledgers(
+        compile_observations((observation,), recorded_at=recorded_at),
+        compile_action_intents((terminal,), recorded_at=recorded_at),
+    )
+    wire = ledger.model_dump(mode="json")
+    wire["items"] = [item for item in wire["items"] if item["intent_id"] is None]
+
+    with pytest.raises(ValidationError, match="ledger"):
+        _state(
+            tool_observations=(observation,),
+            intents=(terminal,),
+            ledger=wire,
+        )
+
+
+def test_ledger_rejects_removed_conflicting_source():
+    first = ToolObservation(
+        request_id="req_01",
+        call_id="call_ledger_conflict_first",
+        artifact=DataQualityToolArtifact(
+            tool_name="get_data_quality",
+            arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=DataQualityArtifact(
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=0.98,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=False,
+                ),
+            ),
+        ),
+    )
+    divergent = ToolObservation(
+        request_id="req_01",
+        call_id="call_ledger_conflict_second",
+        artifact=DataQualityToolArtifact(
+            tool_name="get_data_quality",
+            arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=DataQualityArtifact(
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=0.61,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=False,
+                ),
+            ),
+        ),
+    )
+    ledger = compile_observations(
+        (first, divergent),
+        recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    assert ledger.conflicts
+    wire = ledger.model_dump(mode="json")
+    wire["items"] = [
+        item
+        for item in wire["items"]
+        if item["call_id"] != divergent.call_id
+    ]
+    wire["conflicts"] = []
+
+    with pytest.raises(ValidationError, match="ledger"):
+        _state(tool_observations=(first, divergent), ledger=wire)
+
+
+def test_ledger_history_rejects_tampered_source_value():
+    call = PersistedToolCall(
+        request_id="req_01",
+        call_id="call_ledger_history",
+        name="get_data_quality",
+        arguments={"asset_id": "asset_G501", "point_id": None},
+    )
+    observation = ToolObservation(
+        request_id="req_01",
+        call_id=call.call_id,
+        artifact=DataQualityToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=DataQualityArtifact(
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=0.98,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=False,
+                ),
+            ),
+        ),
+    )
+    ledger = compile_observations(
+        (observation,),
+        recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    state = _state(
+        tool_calls=(call,),
+        tool_observations=(observation,),
+        ledger=ledger,
+    )
+    continued = state.continue_with(
+        request=_request().model_copy(update={"message": "Nova solicitação."}),
+        identity=_identity(),
+        permissions=frozenset({"read"}),
+        request_id="req_02",
+        execution_id="exec_02",
+    )
+    wire = continued.model_dump(mode="json")
+    wire["ledger_history"][0]["items"][0]["value"] = {"encoded": "0.01"}
+
+    with pytest.raises(ValidationError, match="histórico do ledger"):
+        AgentState.model_validate(wire)
 
 
 def test_new_state_starts_with_empty_typed_evidence_and_observable_collections():

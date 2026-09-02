@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import json
 import math
@@ -1154,7 +1154,6 @@ class AgentState(FrozenStateModel):
             or len(current_observation_ids) != len(set(current_observation_ids))
         ):
             raise ValueError("IDs de tool call devem ser únicos por request_id")
-        self._validate_current_ledger()
         if self.planner_terminal is not None and self.planner_failure is not None:
             raise ValueError(
                 "decisão terminal e falha do planner são mutuamente exclusivos"
@@ -1183,79 +1182,104 @@ class AgentState(FrozenStateModel):
             and not self.has_coherent_terminal_result()
         ):
             raise ValueError("resultado terminal diverge da âncora persistida")
+        self._validate_current_ledger()
         return self
 
     def _validate_current_ledger(self) -> None:
-        """Falha fechada se um fato persistido não vier da fonte tipada atual."""
-        ledger = self.ledger
+        """Recompila integralmente o ledger atual e o histórico, sem subconjuntos."""
         for historic in self.ledger_history:
             if historic.request_id is None:
                 raise ValueError("histórico do ledger exige request_id")
-            if any(item.request_id != historic.request_id for item in historic.items):
-                raise ValueError("fato histórico diverge da request_id")
-            if any(gap.request_id != historic.request_id for gap in historic.gaps):
-                raise ValueError("lacuna histórica diverge da request_id")
-        if not (ledger.items or ledger.gaps or ledger.conflicts):
-            if ledger.request_id is not None:
-                raise ValueError("ledger vazio não pode declarar request_id")
+            self._validate_ledger_for_request(
+                historic,
+                request_id=historic.request_id,
+                label="histórico do ledger",
+            )
+
+        if (
+            self.ledger.request_id is None
+            and not self.ledger.items
+            and not self.ledger.gaps
+            and not self.ledger.conflicts
+            and any(
+                historic.request_id == self.request_id
+                for historic in self.ledger_history
+            )
+        ):
+            # Reuso será rejeitado pela entrada pública; o histórico segue auditável.
             return
-        if ledger.request_id != self.request_id:
-            raise ValueError("ledger atual pertence a outra request_id")
-        if any(item.request_id != self.request_id for item in ledger.items):
-            raise ValueError("fato do ledger pertence a outra request_id")
-        if any(gap.request_id != self.request_id for gap in ledger.gaps):
-            raise ValueError("lacuna do ledger pertence a outra request_id")
+        self._validate_ledger_for_request(
+            self.ledger,
+            request_id=self.request_id,
+            label="ledger atual",
+        )
+
+    def _validate_ledger_for_request(
+        self,
+        ledger: EvidenceLedger,
+        *,
+        request_id: str,
+        label: str,
+    ) -> None:
+        """Compara uma projeção semântica completa com todas as fontes tipadas."""
+        if ledger.request_id not in {request_id, None}:
+            raise ValueError(f"{label} pertence a outra request_id")
+        if ledger.request_id is None and (
+            ledger.items or ledger.gaps or ledger.conflicts
+        ):
+            raise ValueError(f"{label} com conteúdo exige request_id")
 
         # Import tardio preserva state -> evidence como fronteira sem ciclo.
-        from tractian_agent.evidence import compile_action_intents, compile_observations, merge_ledgers
+        from tractian_agent.evidence import (
+            compile_action_intents,
+            compile_observations,
+            merge_ledgers,
+        )
 
-        observations = {
-            observation.call_id: observation
+        observations = tuple(
+            observation
             for observation in self.tool_observations
-            if observation.request_id == self.request_id
-        }
-        intents = {
-            intent.intent_id: intent
-            for intent in self.intents
-            if intent.request_id == self.request_id
-        }
-        for item in ledger.items:
-            if item.source_kind is EvidenceSourceKind.TOOL:
-                observation = observations.get(item.call_id)
-                if observation is None:
-                    raise ValueError("fato do ledger referencia tool ausente")
-                expected = compile_observations(
-                    (observation,), recorded_at=item.recorded_at
-                )
-            else:
-                intent = intents.get(item.intent_id)
-                if intent is None:
-                    raise ValueError("fato do ledger referencia intenção ausente")
-                expected = compile_action_intents((intent,), recorded_at=item.recorded_at)
-            if item not in expected.items:
-                raise ValueError("fato do ledger diverge da fonte tipada")
-        for gap in ledger.gaps:
-            if gap.call_id is not None:
-                observation = observations.get(gap.call_id)
-                if observation is None:
-                    raise ValueError("lacuna do ledger referencia tool ausente")
-                expected = compile_observations(
-                    (observation,), recorded_at=datetime.now().astimezone()
-                )
-            elif gap.intent_id is not None:
-                intent = intents.get(gap.intent_id)
-                if intent is None:
-                    raise ValueError("lacuna do ledger referencia intenção ausente")
-                expected = compile_action_intents(
-                    (intent,), recorded_at=datetime.now().astimezone()
-                )
-            else:
-                raise ValueError("lacuna do ledger exige proveniência")
-            if gap not in expected.gaps:
-                raise ValueError("lacuna do ledger diverge da fonte tipada")
-        expected_conflicts = merge_ledgers(ledger).conflicts
-        if ledger.conflicts != expected_conflicts:
-            raise ValueError("conflitos do ledger divergem dos fatos persistidos")
+            if observation.request_id == request_id
+            and observation.artifact.validated_read_artifact() is not None
+        )
+        intents = tuple(
+            intent for intent in self.intents if intent.request_id == request_id
+        )
+        canonical_time = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        expected = merge_ledgers(
+            compile_observations(observations, recorded_at=canonical_time),
+            compile_action_intents(intents, recorded_at=canonical_time),
+        )
+        if self._ledger_semantics(ledger, canonical_time=canonical_time) != self._ledger_semantics(
+            expected,
+            canonical_time=canonical_time,
+        ):
+            raise ValueError(f"{label} diverge da recompilação canônica")
+
+    @staticmethod
+    def _ledger_semantics(
+        ledger: EvidenceLedger,
+        *,
+        canonical_time: datetime,
+    ) -> tuple[object, ...]:
+        """Normaliza somente o instante de gravação, que não vem da fonte."""
+        items = tuple(
+            sorted(
+                (
+                    item.model_copy(update={"recorded_at": canonical_time})
+                    for item in ledger.items
+                ),
+                key=lambda item: item.evidence_id,
+            )
+        )
+        gaps = tuple(sorted(ledger.gaps, key=lambda gap: gap.model_dump_json()))
+        conflicts = tuple(
+            sorted(
+                ledger.conflicts,
+                key=lambda conflict: (conflict.canonical_key, conflict.evidence_ids),
+            )
+        )
+        return (ledger.request_id, items, gaps, conflicts)
 
 
     def continue_with(

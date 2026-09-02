@@ -298,6 +298,13 @@ def _replace_intent(state: AgentState, replacement: WriteIntent) -> AgentState:
     )
     if not found:
         raise ValueError("intenção a atualizar não pertence ao estado")
+    if replacement.status in {
+        IntentStatus.COMPLETED,
+        IntentStatus.FAILED,
+        IntentStatus.UNCERTAIN,
+    }:
+        # O resultado terminal e seu ledger precisam chegar ao checkpoint juntos.
+        return state.model_copy(update={"intents": replacements})
     return _replace_state(state, intents=replacements)
 
 
@@ -308,10 +315,11 @@ def _terminal_result(
     message: str,
 ) -> AgentState:
     return _record_ledger(
-        _replace_state(
-            state,
-            decision=decision,
-            final_result=FinalResult(decision=decision, message=message),
+        state.model_copy(
+            update={
+                "decision": decision,
+                "final_result": FinalResult(decision=decision, message=message),
+            }
         )
     )
 
@@ -703,12 +711,13 @@ async def _planner_tool(
             artifact=artifact,
         )
         validate_planner_read_observation(advanced, context, observation)
-        updated = _replace_state(
-            advanced,
-            tool_observations=(*advanced.tool_observations, observation),
-            planner_terminal=None,
-            planner_failure=None,
-            resume_anchor=ResumeAnchor.PLANNER_TOOL,
+        updated = advanced.model_copy(
+            update={
+                "tool_observations": (*advanced.tool_observations, observation),
+                "planner_terminal": None,
+                "planner_failure": None,
+                "resume_anchor": ResumeAnchor.PLANNER_TOOL,
+            }
         )
         updated = _record_ledger(updated)
         if updated.step_count >= updated.step_limit:

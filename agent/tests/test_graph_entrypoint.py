@@ -12,6 +12,7 @@ from tractian_agent.checkpoint import LocalCheckpointOwner, open_checkpointer
 from tractian_agent.client import IndustrialApiClient
 from tractian_agent.contracts import ActionReceipt, Identity, ResponseMode, SupportRequest
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
+from tractian_agent.evidence import compile_action_intents
 from tractian_agent.graph import CompiledAgentGraph, build_agent_graph
 from tractian_agent.state import (
     AgentDecision,
@@ -226,10 +227,15 @@ def _terminal_execution_state() -> AgentState:
             message="Reprocesso concluído.",
         ),
     )
+    completed = WriteIntent.model_validate(completed_data)
     values = state.model_dump(mode="python")
     values.update(
         pending_proposal=proposal,
-        intents=(WriteIntent.model_validate(completed_data),),
+        intents=(completed,),
+        ledger=compile_action_intents(
+            (completed,),
+            recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        ),
         decision=AgentDecision.ACT,
         final_result=FinalResult(
             decision=AgentDecision.ACT,

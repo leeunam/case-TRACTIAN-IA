@@ -20,6 +20,7 @@ from pydantic import PrivateAttr, ValidationError
 from tractian_agent.checkpoint import open_checkpointer
 from tractian_agent.client import IndustrialApiClient
 from tractian_agent.contracts import ApiError, ApiErrorCategory, Identity, ResponseMode, SupportRequest
+from tractian_agent.evidence import compile_observations
 from tractian_agent.planner import (
     PLANNER_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT_VERSION,
@@ -207,6 +208,15 @@ def _state(
         ),
         tool_calls=tool_calls,
         tool_observations=tool_observations,
+        ledger=compile_observations(
+            tuple(
+                observation
+                for observation in tool_observations
+                if observation.request_id == "req_planner_01"
+                and observation.artifact.validated_read_artifact() is not None
+            ),
+            recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        ),
         step_limit=3,
     )
 
@@ -5138,6 +5148,10 @@ def test_legacy_and_two_request_planner_state_survives_sqlite_reopen(
         ),
         tool_calls=(call, legacy_call),
         tool_observations=(observation, legacy_observation),
+        ledger=compile_observations(
+            (observation,),
+            recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        ),
         planner_usage=PlannerUsage(
             request_id="req_planner_01",
             selection_count=1,
