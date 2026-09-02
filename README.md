@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner LLM opt-in, ledger determinístico de evidências e checkpointer SQLite de desenvolvimento. Em 02/09/2026, `make test` passou com 99 testes da API e 1.463 do agente (1.562 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 7 estão concluídas. O grafo atual não é um agente de produção: writer, resposta gerada ao cliente, gate de liberação, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação e checkpointer SQLite de desenvolvimento. Em 02/09/2026, `make test` passou com 99 testes da API e 1.514 do agente (1.613 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 8 estão concluídas. O grafo atual ainda não é um agente de produção: revisão humana retomável, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -16,7 +16,7 @@ O agente atende três tipos de solicitação:
 
 Se faltarem evidências, houver conflito ou a ação ultrapassar a permissão do usuário, o agente não inventa uma conclusão. Ele solicita dados, confirmação ou revisão humana.
 
-## Arquitetura planejada
+## Arquitetura atual e evolução planejada
 
 ```mermaid
 flowchart TD
@@ -29,7 +29,8 @@ flowchart TD
     G --> D
     D --> H[Writer: redige com base no ledger]
     H --> I[Gate determinístico de segurança]
-    I --> J[Resposta, confirmação ou revisão humana]
+    I --> J[Resposta ou pedido seguro]
+    I -. futura fila retomável .-> L[Revisão humana]
     C -. traces e métricas .-> K[Logfire]
 ```
 
@@ -41,6 +42,14 @@ Existe **um agente lógico com dois papéis de LLM**:
 Essa separação reduz contexto, facilita testes e impede que a redação altere silenciosamente a decisão. LangGraph controla estado, nós, transições, interrupções e retomadas. Código determinístico continua responsável por identidade, permissão, argumentos, justificativa, idempotência e liberação da resposta.
 
 No MVP, planner e writer podem usar o mesmo modelo com prompts e contratos diferentes. A separação é de responsabilidade, não uma obrigação de contratar dois modelos.
+
+O writer usa o prompt `writer-v1`, não recebe tools e devolve somente um draft
+estruturado com a decisão imutável, IDs ordenados e próximo passo enumerado. O
+gate recalcula em código as referências, suficiência, limitações, permissões e
+estado da intenção. Apenas um atestado `release` permite ao renderer buscar os
+valores no ledger; a mensagem técnica não vem do modelo e é revalidada ao
+restaurar o checkpoint. Uma saída de formato inválido admite somente um repair;
+duas falhas ou qualquer incerteza terminam em aviso seguro para futura revisão.
 
 O **ledger de evidências** associa fatos às fontes consultadas no estado da execução. Ele recebe somente observações de leitura validadas e recibos tipados de intenções terminais; texto livre de LLM, proposals e mensagens de recibo não viram fatos. O Logfire receberá traces e métricas para consulta humana e operação; ele não será o banco principal do ledger nem uma fonte que o agente consulta durante o atendimento. Logfire ainda não está implementado.
 
@@ -78,8 +87,8 @@ os validators e as regras de coerência do contrato continuam falhando fechados.
 O planner e seu contrato permanecem independentes desse detalhe de transporte.
 O modelo, credenciais e respostas brutas não entram no estado. IDs persistidos
 de tool call são derivados pelo runtime de `request_id` e do ordinal, nunca do
-ID externo do provider. NVIDIA NIM continua alternativa futura; writer poderá
-usar outro modelo quando existir, sem mudar as regras de negócio.
+ID externo do provider. NVIDIA NIM continua alternativa futura; o writer pode
+usar outro modelo sem mudar as regras de negócio ou o gate determinístico.
 
 O smoke opt-in `make smoke-groq` compara `openai/gpt-oss-120b` e
 `openai/gpt-oss-20b` com dados sintéticos, sem retry e com o mesmo orçamento de
@@ -197,7 +206,7 @@ Prompt curto recomendado:
 ├── CONTEXT.md
 ├── LICENSE
 ├── Makefile
-├── agent/                   # contratos, cliente, tools, política, operações, estado, grafo e checkpointer
+├── agent/                   # contratos, tools, planner, writer, gate, grafo e checkpointer
 ├── agent-input/             # entradas permitidas ao agente
 ├── api/                     # simulador FastAPI e testes
 ├── data/                    # dados do simulador
@@ -207,7 +216,7 @@ Prompt curto recomendado:
 
 ## Limitações atuais
 
-- Existe um grafo LangGraph com planner LLM opt-in, ledger de evidências, fluxos de escrita determinísticos e checkpointer. Ele ainda não possui writer, resposta gerada ao cliente, gate de segurança de liberação, Logfire nem runner Pydantic Evals; portanto não é um agente de produção.
+- Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, fluxos de escrita e checkpointer. Ele ainda não possui revisão humana retomável, Logfire nem runner Pydantic Evals; portanto não é um agente de produção.
 - As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
 - O simulador não representa todas as garantias transacionais de produção.
 - As rotas de ação do simulador devolvem recibos, mas não alteram os recursos Parquet; um novo GET não comprova a mutação solicitada.

@@ -332,12 +332,40 @@ pacotes. Writer e gate continuam pendentes na Fase 8.
 
 **Decidir:** schema da resposta, regras críticas e no máximo uma tentativa de reparo de formato.
 
-- [ ] Criar prompt separado para o writer.
-- [ ] Enviar ao writer somente decisão e evidências necessárias.
-- [ ] Validar formato, afirmações críticas, permissões e incerteza em código.
-- [ ] Pedir informação ou revisão humana quando a resposta não puder ser liberada com segurança.
+- [x] Criar prompt separado para o writer.
+- [x] Enviar ao writer somente decisão e evidências necessárias.
+- [x] Validar formato, afirmações críticas, permissões e incerteza em código.
+- [x] Pedir informação ou revisão humana quando a resposta não puder ser liberada com segurança.
 
 **Aceite:** o writer não consegue criar nova decisão, tool call ou fato não registrado.
+
+**Aceite verificado (02/09/2026):** o `Writer` usa o prompt versionado
+`writer-v1`, somente `with_structured_output` e uma projeção positiva com a
+decisão já tomada, fatos `claimable`, limitações referenciadas por hash estável
+e a informação ausente já decidida. Seu draft strict não contém prosa, valores
+ou tool calls. Uma falha de formato permite uma única tentativa adicional em
+superstep persistível; erro de provider não ganha retry. O `ReleaseGate` puro
+recalcula decisão, request, referências, próximo passo, suficiência, permissão,
+aprovação e estado da intenção, e o renderer resolve todo texto técnico somente
+no ledger. Draft, atestado e resposta são recompostos ao restaurar o estado, de
+modo que adulteração do checkpoint falha fechada.
+
+**Decisão local de segurança:** enquanto não existir claim-scope tipado, o gate
+trata qualquer lacuna, item parcial ou obsoleto e qualquer conflito da request
+atual como bloqueante para uma resposta técnica. Isso pode pedir revisão em
+casos conservadores, mas impede que o writer esconda uma lacuna fora da seleção.
+IDs de limitações derivam de tipo, request, todas as fontes/referências, razão e
+detalhe canônicos. O planner passa a reservar writer, um possível repair e gate
+dentro do teto de 24 passos; o fallback sem planner conserva os budgets exatos
+3/5 e a resposta determinística legada.
+
+As cinco ações passaram por interrupção após o efeito, fechamento/reabertura do
+SQLite, retomada somente em writer/gate e replay sem novo HTTP ou modelo. A
+confirmação estruturada também terminou no gate sem repetir efeito. As cinco
+suítes diretamente alteradas somaram 129 testes, as regressões dos fluxos de
+escrita 227, a suíte completa do agente 1.514 e o `make test` confirmou 99 testes
+da API + 1.514 do agente = 1.613 testes. `uv lock --check --offline` resolveu 49
+pacotes; permaneceu apenas o warning conhecido de `python_multipart`.
 
 ## Fase 9 — revisão humana
 

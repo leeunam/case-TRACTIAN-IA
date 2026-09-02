@@ -13,6 +13,8 @@ from tractian_agent.contracts import SupportRequest
 from tractian_agent.graph import (
     MINIMAL_GRAPH_STEP_COUNT,
     PLANNER_GRAPH_STEP_LIMIT,
+    PLANNER_MINIMAL_GRAPH_STEP_COUNT,
+    PLANNER_WRITE_GRAPH_STEP_COUNT,
     REPROCESS_GRAPH_STEP_COUNT,
 )
 from tractian_agent.state import AgentState, ResumeAnchor, ThreadScope
@@ -93,6 +95,12 @@ _PLANNER_RESUME_PAIRS = {
     (ResumeAnchor.PLANNER_SELECT, "planner_finalize"),
     (ResumeAnchor.PLANNER_TOOL, "planner_select"),
     (ResumeAnchor.PLANNER_TOOL, "write_policy"),
+    (ResumeAnchor.WRITE_POLICY, "writer"),
+    (ResumeAnchor.CONFIRMATION_GATE, "writer"),
+    (ResumeAnchor.EXECUTE_ACTION, "writer"),
+    (ResumeAnchor.PLANNER_FINALIZE, "writer"),
+    (ResumeAnchor.WRITER, "writer"),
+    (ResumeAnchor.WRITER, "release_gate"),
 }
 _ALLOWED_RESUME_PAIRS = (
     _COMMON_RESUME_PAIRS | _FALLBACK_RESUME_PAIRS | _PLANNER_RESUME_PAIRS
@@ -196,7 +204,17 @@ def _replace_state(state: AgentState, **changes: object) -> AgentState:
     return AgentState.model_validate(data)
 
 
-def _required_step_count(state: AgentState) -> int:
+def _required_step_count(
+    state: AgentState,
+    *,
+    planner_enabled: bool,
+) -> int:
+    if planner_enabled:
+        return (
+            PLANNER_WRITE_GRAPH_STEP_COUNT
+            if state.pending_proposal is not None
+            else PLANNER_MINIMAL_GRAPH_STEP_COUNT
+        )
     return (
         REPROCESS_GRAPH_STEP_COUNT
         if state.pending_proposal is not None
@@ -472,7 +490,7 @@ async def invoke_agent(
     ):
         raise AgentInvocationProtocolError(
             "PLANNER_STEP_LIMIT_EXCEEDED",
-            "o caminho do planner aceita no máximo 20 passos",
+            "o caminho do planner aceita no máximo 24 passos",
         )
     config: dict[str, object] = {"configurable": {"thread_id": thread_id}}
 
@@ -514,7 +532,7 @@ async def invoke_agent(
             ):
                 raise AgentInvocationProtocolError(
                     "PLANNER_STEP_LIMIT_EXCEEDED",
-                    "checkpoint do planner excede o teto de 20 passos",
+                    "checkpoint do planner excede o teto de 24 passos",
                 )
             persisted_original_approval = (
                 persisted.approval
@@ -606,7 +624,11 @@ async def invoke_agent(
                 )
                 if (
                     state.pending_proposal is not None
-                    and state.step_limit < _required_step_count(state)
+                    and state.step_limit
+                    < _required_step_count(
+                        state,
+                        planner_enabled=planner_enabled,
+                    )
                 ):
                     raise AgentInvocationProtocolError(
                         "STEP_LIMIT_EXHAUSTED",
@@ -619,7 +641,10 @@ async def invoke_agent(
                 )
                 invocation_input = None
             else:
-                if state.step_limit < _required_step_count(state):
+                if state.step_limit < _required_step_count(
+                    state,
+                    planner_enabled=planner_enabled,
+                ):
                     raise AgentInvocationProtocolError(
                         "STEP_LIMIT_EXHAUSTED",
                         "checkpoint parcial esgotou o orçamento de passos",
@@ -660,7 +685,12 @@ async def invoke_agent(
                 )
             if (
                 proposal is not None
-                and resolved_step_limit < REPROCESS_GRAPH_STEP_COUNT
+                and resolved_step_limit
+                < (
+                    PLANNER_WRITE_GRAPH_STEP_COUNT
+                    if planner_enabled
+                    else REPROCESS_GRAPH_STEP_COUNT
+                )
             ):
                 raise AgentInvocationProtocolError(
                     "STEP_LIMIT_EXHAUSTED",

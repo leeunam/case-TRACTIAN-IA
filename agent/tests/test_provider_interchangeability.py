@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+import json
 from typing import Any
 
 import httpx
@@ -24,9 +25,10 @@ from tractian_agent.planner import (
     PlannerStopReason,
     PlannerTerminalDecision,
 )
-from tractian_agent.state import AgentDecision
+from tractian_agent.state import AgentDecision, WriterDraft, WriterNextStep
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.write_policy import PolicyDecision, PolicyReason
+from tractian_agent.writer import Writer
 
 
 class _ProviderScriptedModel(BaseChatModel):
@@ -121,6 +123,50 @@ class _FakeModelProvider:
         return self.model
 
 
+class _ProviderWriterModel(BaseChatModel):
+    _contexts: list[dict[str, object]] = PrivateAttr(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "provider-writer-test"
+
+    def _generate(self, *args: Any, **kwargs: Any) -> ChatResult:
+        raise AssertionError("o writer deve usar saída estruturada")
+
+    def bind_tools(self, *args: Any, **kwargs: Any) -> RunnableLambda:
+        raise AssertionError("o writer não pode receber tools")
+
+    def with_structured_output(self, schema: object, **kwargs: Any) -> RunnableLambda:
+        assert schema is WriterDraft
+        assert kwargs == {"include_raw": False}
+
+        async def write(messages: list[BaseMessage]) -> WriterDraft:
+            context = json.loads(str(messages[-1].content))
+            self._contexts.append(context)
+            decision = AgentDecision(context["decision"])
+            return WriterDraft(
+                decision=decision,
+                evidence_ids=tuple(
+                    sorted(fact["evidence_id"] for fact in context["facts"])
+                ),
+                limitation_refs=tuple(
+                    sorted(
+                        limitation["limitation_ref"]
+                        for limitation in context["limitations"]
+                    )
+                ),
+                next_step={
+                    AgentDecision.GUIDE: WriterNextStep.MONITOR,
+                    AgentDecision.ACT: WriterNextStep.VERIFY_ACTION,
+                    AgentDecision.ESCALATE: WriterNextStep.AWAIT_ESCALATION,
+                    AgentDecision.REQUEST_INFORMATION: WriterNextStep.PROVIDE_INFORMATION,
+                    AgentDecision.REQUIRE_HUMAN_REVIEW: WriterNextStep.AWAIT_HUMAN_REVIEW,
+                }[decision],
+            )
+
+        return RunnableLambda(write)
+
+
 def _request() -> SupportRequest:
     return SupportRequest(
         case_id="case_tkt_inv_04",
@@ -149,6 +195,7 @@ def test_model_provider_swap_preserves_public_planner_contract_without_http(tmp_
 
     async def run(provider: ModelProvider, database_name: str):
         model = provider.create_chat_model(config)
+        writer_model = _ProviderWriterModel()
         client = IndustrialApiClient(
             "https://industrial.test",
             transport=httpx.MockTransport(forbidden_http),
@@ -164,7 +211,11 @@ def test_model_provider_swap_preserves_public_planner_contract_without_http(tmp_
         try:
             async with open_checkpointer(tmp_path / database_name) as saver:
                 state = await invoke_agent(
-                    build_agent_graph(saver, planner=Planner(model)),
+                    build_agent_graph(
+                        saver,
+                        planner=Planner(model),
+                        writer=Writer(writer_model),
+                    ),
                     request=_request(),
                     runtime=runtime,
                     thread_id="thread_provider_swap",
@@ -246,6 +297,7 @@ def test_provider_swap_preserves_read_catalog_and_pydantic_terminal_schema(tmp_p
 
     async def run(provider: ModelProvider, database_name: str):
         model = provider.create_chat_model(config)
+        writer_model = _ProviderWriterModel()
         client = IndustrialApiClient(
             "https://industrial.test",
             transport=httpx.MockTransport(asset_response),
@@ -260,7 +312,11 @@ def test_provider_swap_preserves_read_catalog_and_pydantic_terminal_schema(tmp_p
         try:
             async with open_checkpointer(tmp_path / database_name) as saver:
                 state = await invoke_agent(
-                    build_agent_graph(saver, planner=Planner(model)),
+                    build_agent_graph(
+                        saver,
+                        planner=Planner(model),
+                        writer=Writer(writer_model),
+                    ),
                     request=_request(),
                     runtime=runtime,
                     thread_id="thread_provider_read",

@@ -36,6 +36,12 @@ from tractian_agent.planner import (
     select_planner_tools,
     validate_planner_read_observation,
 )
+from tractian_agent.release_gate import (
+    ReleaseGateContext,
+    evaluate_release,
+    render_non_release_result,
+    render_released_result,
+)
 from tractian_agent.state import (
     AgentDecision,
     AgentState,
@@ -49,7 +55,10 @@ from tractian_agent.state import (
     ResumeAnchor,
     ReviewRecord,
     ReviewStatus,
+    ReleaseGateOutcome,
     ToolObservation,
+    WriterFailureCode,
+    WriterFailureRecord,
     validate_exact_json_model,
     validate_exact_read_artifact,
 )
@@ -92,12 +101,16 @@ from tractian_agent.write_policy import (
     evaluate_write_policy,
     resolve_action_scope,
 )
+from tractian_agent.writer import Writer, WriterProtocolError
 
 
 MINIMAL_GRAPH_STEP_COUNT = 3
 REPROCESS_GRAPH_STEP_COUNT = 5
-PLANNER_GRAPH_STEP_LIMIT = 20
-_PLANNER_FIXED_WRITE_STEPS = 4
+PLANNER_MINIMAL_GRAPH_STEP_COUNT = 6
+PLANNER_WRITE_GRAPH_STEP_COUNT = 8
+PLANNER_GRAPH_STEP_LIMIT = 24
+_PLANNER_FIXED_WRITE_STEPS = 7
+_PLANNER_TERMINAL_STEPS = 4
 _IDEMPOTENCY_TTL = timedelta(days=7)
 _AMBIGUOUS_ERROR_CATEGORIES = frozenset(
     {
@@ -525,7 +538,7 @@ def _planner_select_node(planner: Planner):
                 code="invalid_planner_turn",
                 anchor=ResumeAnchor.PLANNER_SELECT,
             )
-        if remaining_steps < 1:
+        if remaining_steps < _PLANNER_TERMINAL_STEPS:
             return _planner_failure_update(
                 updated,
                 stage="planner_select",
@@ -771,36 +784,163 @@ def _planner_finalize(state: AgentState) -> dict[str, object]:
             anchor=ResumeAnchor.PLANNER_FINALIZE,
         )
     decision = AgentDecision(terminal.decision)
-    messages = {
-        PlannerDecisionKind.GUIDE.value: (
-            "O planner encerrou com evidência suficiente; o writer ainda "
-            "não foi implementado."
-        ),
-        PlannerDecisionKind.REQUEST_INFORMATION.value: (
-            f"Informação adicional necessária: {terminal.missing_information}"
-        ),
-        PlannerDecisionKind.REQUIRE_HUMAN_REVIEW.value: (
-            "O planner determinou que o caso exige revisão humana."
-        ),
-    }
     updated = _replace_state(
         advanced,
         resume_anchor=ResumeAnchor.PLANNER_FINALIZE,
         decision=decision,
-        final_result=FinalResult(
-            decision=decision,
-            message=messages[terminal.decision],
-        ),
-        review=(
-            ReviewRecord(
-                status=ReviewStatus.REQUIRED,
-                reason="planner:human_review_required",
-            )
-            if decision is AgentDecision.REQUIRE_HUMAN_REVIEW
-            else advanced.review
-        ),
+        final_result=None,
+        review=None,
+        writer_draft=None,
+        writer_failure=None,
+        writer_attempts=0,
+        release_gate=None,
     )
     return _checkpoint_update(updated)
+
+
+def _writer_node(writer: Writer):
+    async def write(state: AgentState) -> dict[str, object]:
+        try:
+            advanced = state.advance_step()
+        except ValueError:
+            return _planner_failure_update(
+                state,
+                stage="planner_finalize",
+                code="step_limit_exhausted",
+                anchor=ResumeAnchor.PLANNER_FINALIZE,
+            )
+        if advanced.decision is None:
+            return _planner_failure_update(
+                advanced,
+                stage="planner_finalize",
+                code="missing_terminal_decision",
+                anchor=ResumeAnchor.PLANNER_FINALIZE,
+            )
+        attempt = advanced.writer_attempts + 1
+        missing_information = (
+            advanced.planner_terminal.missing_information
+            if advanced.planner_terminal is not None
+            else None
+        )
+        try:
+            draft = await writer.ainvoke_once(
+                decision=advanced.decision,
+                ledger=advanced.ledger,
+                missing_information=missing_information,
+            )
+        except WriterProtocolError:
+            updated = _replace_state(
+                advanced,
+                resume_anchor=ResumeAnchor.WRITER,
+                writer_attempts=attempt,
+                writer_draft=None,
+                writer_failure=WriterFailureRecord(
+                    code=WriterFailureCode.INVALID_STRUCTURED_OUTPUT,
+                    attempts=attempt,
+                    repairable=True,
+                ),
+                release_gate=None,
+            )
+            return _checkpoint_update(updated)
+        except Exception:
+            updated = _replace_state(
+                advanced,
+                resume_anchor=ResumeAnchor.WRITER,
+                writer_attempts=attempt,
+                writer_draft=None,
+                writer_failure=WriterFailureRecord(
+                    code=WriterFailureCode.MODEL_FAILURE,
+                    attempts=attempt,
+                    repairable=False,
+                ),
+                release_gate=None,
+            )
+            return _checkpoint_update(updated)
+        return _checkpoint_update(
+            _replace_state(
+                advanced,
+                resume_anchor=ResumeAnchor.WRITER,
+                writer_attempts=attempt,
+                writer_draft=draft,
+                writer_failure=None,
+                release_gate=None,
+            )
+        )
+
+    return write
+
+
+def _after_writer(state: AgentState) -> Literal["gate", "repair"]:
+    if (
+        state.writer_draft is None
+        and state.writer_failure is not None
+        and state.writer_failure.repairable
+        and state.writer_attempts < 2
+    ):
+        return "repair"
+    return "gate"
+
+
+def _release_gate_context(state: AgentState) -> ReleaseGateContext:
+    current_intents = tuple(
+        intent for intent in state.intents if intent.request_id == state.request_id
+    )
+    return ReleaseGateContext(
+        request_id=state.request_id,
+        decision=(
+            state.decision
+            if state.decision is not None
+            else AgentDecision.REQUIRE_HUMAN_REVIEW
+        ),
+        ledger=state.ledger,
+        draft=state.writer_draft,
+        permissions=state.permissions,
+        intents=current_intents,
+        approval=state.approval,
+        missing_information=(
+            state.planner_terminal.missing_information
+            if state.planner_terminal is not None
+            else None
+        ),
+        writer_failure=state.writer_failure,
+    )
+
+
+def _release_gate(state: AgentState) -> dict[str, object]:
+    try:
+        advanced = state.advance_step()
+    except ValueError:
+        return _planner_failure_update(
+            state,
+            stage="planner_finalize",
+            code="step_limit_exhausted",
+            anchor=ResumeAnchor.PLANNER_FINALIZE,
+        )
+    context = _release_gate_context(advanced)
+    attestation = evaluate_release(context)
+    if attestation.outcome is ReleaseGateOutcome.RELEASE:
+        final_result = render_released_result(context, attestation)
+        review = None
+    else:
+        final_result = render_non_release_result(context, attestation)
+        review = (
+            ReviewRecord(
+                status=ReviewStatus.REQUIRED,
+                reason=f"release_gate:{attestation.reason.value}",
+            )
+            if attestation.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+            else None
+        )
+    return _checkpoint_update(
+        _replace_state(
+            advanced,
+            resume_anchor=ResumeAnchor.RELEASE_GATE,
+            decision=final_result.decision,
+            final_result=final_result,
+            review=review,
+            release_gate=attestation,
+        )
+    )
 
 
 def _write_policy(
@@ -958,6 +1098,52 @@ def _confirmation_gate(
 
 def _after_confirmation(state: AgentState) -> Literal["end", "prepare"]:
     return "end" if state.final_result is not None else "prepare"
+
+
+def _planner_pending_response(update: dict[str, object]) -> dict[str, object]:
+    """Remove a resposta legada antes que ela alcance um checkpoint planner."""
+    updated = AgentState.model_validate(update)
+    if updated.final_result is None:
+        return update
+    return _checkpoint_update(
+        _replace_state(
+            updated,
+            final_result=None,
+            review=None,
+            writer_draft=None,
+            writer_failure=None,
+            writer_attempts=0,
+            release_gate=None,
+        )
+    )
+
+
+def _planner_write_policy(
+    state: AgentState,
+    runtime: Runtime[ReadToolRuntime],
+) -> dict[str, object]:
+    return _planner_pending_response(_write_policy(state, runtime))
+
+
+def _after_planner_write_policy(
+    state: AgentState,
+) -> Literal["confirmation", "writer"]:
+    intent = _current_intent(state)
+    return "writer" if intent.status is IntentStatus.DENIED else "confirmation"
+
+
+def _planner_confirmation_gate(
+    state: AgentState,
+    runtime: Runtime[ReadToolRuntime],
+) -> dict[str, object]:
+    return _planner_pending_response(_confirmation_gate(state, runtime))
+
+
+def _after_planner_confirmation(
+    state: AgentState,
+) -> Literal["prepare", "writer"]:
+    intent = _current_intent(state)
+    return "writer" if intent.status is IntentStatus.DENIED else "prepare"
 
 
 def _prepare_intent(state: AgentState) -> dict[str, object]:
@@ -1350,18 +1536,37 @@ async def _execute_action(
     return _checkpoint_update(terminal)
 
 
+async def _planner_execute_action(
+    state: AgentState,
+    runtime: Runtime[ReadToolRuntime],
+) -> dict[str, object]:
+    return _planner_pending_response(await _execute_action(state, runtime))
+
+
 def build_agent_graph(
     checkpointer: BaseCheckpointSaver[str],
     *,
     planner: Planner | None = None,
+    writer: Writer | None = None,
 ) -> CompiledAgentGraph:
     """Compila o fallback determinístico ou o ciclo opt-in do planner."""
+    if (planner is None) != (writer is None):
+        raise ValueError("planner e writer devem ser fornecidos separadamente em conjunto")
     builder = StateGraph(AgentState, context_schema=ReadToolRuntime)
     builder.add_node("ingest", _ingest)
-    builder.add_node("write_policy", _write_policy)
-    builder.add_node("confirmation_gate", _confirmation_gate)
+    builder.add_node(
+        "write_policy",
+        _write_policy if planner is None else _planner_write_policy,
+    )
+    builder.add_node(
+        "confirmation_gate",
+        _confirmation_gate if planner is None else _planner_confirmation_gate,
+    )
     builder.add_node("prepare_intent", _prepare_intent)
-    builder.add_node("execute_action", _execute_action)
+    builder.add_node(
+        "execute_action",
+        _execute_action if planner is None else _planner_execute_action,
+    )
     builder.add_edge(START, "ingest")
     if planner is None:
         builder.add_node("route", _route)
@@ -1374,9 +1579,12 @@ def build_agent_graph(
         builder.add_edge("route", "finish")
         builder.add_edge("finish", END)
     else:
+        assert writer is not None
         builder.add_node("planner_select", _planner_select_node(planner))
         builder.add_node("planner_tool", _planner_tool)
         builder.add_node("planner_finalize", _planner_finalize)
+        builder.add_node("writer", _writer_node(writer))
+        builder.add_node("release_gate", _release_gate)
         builder.add_conditional_edges(
             "ingest",
             _after_ingest_with_planner,
@@ -1392,19 +1600,39 @@ def build_agent_graph(
             _after_planner_tool,
             {"end": END, "planner": "planner_select", "write": "write_policy"},
         )
-        builder.add_edge("planner_finalize", END)
-    builder.add_conditional_edges(
-        "write_policy",
-        _after_write_policy,
-        {"end": END, "gate": "confirmation_gate"},
-    )
-    builder.add_conditional_edges(
-        "confirmation_gate",
-        _after_confirmation,
-        {"end": END, "prepare": "prepare_intent"},
-    )
-    builder.add_edge("prepare_intent", "execute_action")
-    builder.add_edge("execute_action", END)
+        builder.add_edge("planner_finalize", "writer")
+        builder.add_conditional_edges(
+            "writer",
+            _after_writer,
+            {"repair": "writer", "gate": "release_gate"},
+        )
+        builder.add_edge("release_gate", END)
+    if planner is None:
+        builder.add_conditional_edges(
+            "write_policy",
+            _after_write_policy,
+            {"end": END, "gate": "confirmation_gate"},
+        )
+        builder.add_conditional_edges(
+            "confirmation_gate",
+            _after_confirmation,
+            {"end": END, "prepare": "prepare_intent"},
+        )
+        builder.add_edge("prepare_intent", "execute_action")
+        builder.add_edge("execute_action", END)
+    else:
+        builder.add_conditional_edges(
+            "write_policy",
+            _after_planner_write_policy,
+            {"confirmation": "confirmation_gate", "writer": "writer"},
+        )
+        builder.add_conditional_edges(
+            "confirmation_gate",
+            _after_planner_confirmation,
+            {"prepare": "prepare_intent", "writer": "writer"},
+        )
+        builder.add_edge("prepare_intent", "execute_action")
+        builder.add_edge("execute_action", "writer")
     return CompiledAgentGraph(
         builder.compile(checkpointer=checkpointer),
         planner_enabled=planner is not None,

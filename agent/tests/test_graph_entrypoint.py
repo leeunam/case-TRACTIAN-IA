@@ -579,9 +579,12 @@ def test_nonterminal_resume_rejects_invalid_pending_work_shape(
     [
         (ResumeAnchor.INGEST, "planner_select"),
         (ResumeAnchor.PLANNER_TOOL, "planner_select"),
+        (ResumeAnchor.WRITE_POLICY, "writer"),
+        (ResumeAnchor.CONFIRMATION_GATE, "writer"),
+        (ResumeAnchor.EXECUTE_ACTION, "writer"),
     ],
 )
-def test_planner_select_resume_accepts_both_explicit_predecessors(
+def test_planner_resume_accepts_each_explicit_predecessor(
     anchor: ResumeAnchor,
     next_node: str,
 ):
@@ -608,6 +611,62 @@ def test_planner_select_resume_accepts_both_explicit_predecessors(
     asyncio.run(scenario())
 
     assert graph.as_node == anchor.value
+
+
+def test_planner_direct_write_reserves_writer_repair_and_gate_budget():
+    proposal = ReprocessProposal(
+        analysis_id="an_9901",
+        justification="O rolamento foi trocado e a análise deve ser refeita.",
+    )
+    approval = TrustedActionApproval(
+        action="reprocess_analysis",
+        target_id="an_9901",
+        source=ApprovalSource.ORIGINAL_REQUEST,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                client=client,
+            )
+            rejected = _RecordingGraph(planner_enabled=True)
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    rejected,
+                    request=_request(message="Reprocesse a análise informada."),
+                    runtime=runtime,
+                    thread_id="thread_planner_budget_rejected",
+                    request_id="req_planner_budget_rejected",
+                    execution_id="exec_planner_budget_rejected",
+                    step_limit=7,
+                    proposal=proposal,
+                    original_approval=approval,
+                )
+            accepted_graph = _RecordingGraph(planner_enabled=True)
+            accepted = await invoke_agent(
+                accepted_graph,
+                request=_request(message="Reprocesse a análise informada."),
+                runtime=runtime,
+                thread_id="thread_planner_budget_accepted",
+                request_id="req_planner_budget_accepted",
+                execution_id="exec_planner_budget_accepted",
+                step_limit=8,
+                proposal=proposal,
+                original_approval=approval,
+            )
+        return error.value, rejected, accepted
+
+    error, rejected, accepted = asyncio.run(scenario())
+
+    assert error.code == "STEP_LIMIT_EXHAUSTED"
+    assert rejected.state_config is not None
+    assert rejected.invoke_config is None
+    assert accepted.step_limit == 8
 
 
 @pytest.mark.parametrize(
@@ -770,7 +829,7 @@ def test_new_request_can_migrate_from_valid_terminal_fallback_to_planner():
     assert graph.as_node == ResumeAnchor.START.value
     assert migrated.request_id == "req_migrated_to_planner"
     assert migrated.resume_anchor is ResumeAnchor.START
-    assert migrated.step_limit == 20
+    assert migrated.step_limit == 24
 
 
 def test_new_request_can_migrate_from_valid_terminal_planner_to_fallback():
@@ -929,7 +988,7 @@ def test_adulterated_terminal_checkpoint_fails_closed_before_return(
 
 
 def test_planner_step_limit_above_cap_only_blocks_same_request_resume():
-    state = _terminal_read_state().model_copy(update={"step_limit": 21})
+    state = _terminal_read_state().model_copy(update={"step_limit": 25})
 
     async def scenario():
         async with IndustrialApiClient("https://industrial.test") as client:
@@ -966,10 +1025,10 @@ def test_planner_step_limit_above_cap_only_blocks_same_request_resume():
     assert same_graph.as_node is None
     assert same_graph.invoke_config is None
     assert new_graph.as_node == ResumeAnchor.START.value
-    assert migrated.step_limit == 20
+    assert migrated.step_limit == 24
 
 
-def test_planner_builder_defaults_to_20_and_rejects_21_before_checkpoint():
+def test_planner_builder_defaults_to_24_and_rejects_25_before_checkpoint():
     async def scenario():
         async with IndustrialApiClient("https://industrial.test") as client:
             graph = _RecordingGraph(planner_enabled=True)
@@ -990,13 +1049,13 @@ def test_planner_builder_defaults_to_20_and_rejects_21_before_checkpoint():
                     thread_id="thread_planner_over_budget",
                     request_id="req_planner_over_budget",
                     execution_id="exec_planner_over_budget",
-                    step_limit=21,
+                    step_limit=25,
                 )
         return state, rejected, error.value
 
     state, rejected, error = asyncio.run(scenario())
 
-    assert state.step_limit == 20
+    assert state.step_limit == 24
     assert error.code == "PLANNER_STEP_LIMIT_EXCEEDED"
     assert rejected.state_config is None
     assert rejected.invoke_config is None

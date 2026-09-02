@@ -36,6 +36,9 @@ from tractian_agent.state import (
     ResumeAnchor,
     ThreadScope,
     ToolObservation,
+    ReleaseGateOutcome,
+    WriterDraft,
+    WriterNextStep,
 )
 from tractian_agent.tools.analyses import (
     AnalysisListToolArtifact,
@@ -51,6 +54,7 @@ from tractian_agent.tools.knowledge import (
 from tractian_agent.tools.observations import ToolSource
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.write_contracts import (
+    ConfirmationReply,
     IntentStatus,
     ReprocessIntentScope,
     WriteIntent,
@@ -67,6 +71,7 @@ from tractian_agent.write_policy import (
     UpdateAssetCriticalityProposal,
     TrustedActionApproval,
 )
+from tractian_agent.writer import Writer
 
 
 class _ScriptedPlannerModel(BaseChatModel):
@@ -122,6 +127,105 @@ class _ScriptedPlannerModel(BaseChatModel):
         return RunnableLambda(finalize)
 
 
+class _EchoWriterModel(BaseChatModel):
+    _events: list[str] = PrivateAttr(default_factory=list)
+    _payloads: list[str] = PrivateAttr(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "echo-writer-graph-model"
+
+    def _generate(self, *args: Any, **kwargs: Any) -> ChatResult:
+        raise AssertionError("o writer deve usar saída estruturada")
+
+    def bind_tools(self, *args: Any, **kwargs: Any) -> RunnableLambda:
+        raise AssertionError("o writer não pode receber tools")
+
+    def with_structured_output(
+        self,
+        schema: object,
+        *,
+        include_raw: bool = False,
+        **kwargs: Any,
+    ) -> RunnableLambda:
+        assert schema is WriterDraft
+        assert include_raw is False
+        self._events.append("with_structured_output")
+
+        async def write(messages: list[BaseMessage]) -> WriterDraft:
+            self._events.append("writer_request")
+            raw_payload = str(messages[-1].content)
+            self._payloads.append(raw_payload)
+            payload = json.loads(raw_payload)
+            decision = AgentDecision(payload["decision"])
+            next_step = {
+                AgentDecision.GUIDE: WriterNextStep.MONITOR,
+                AgentDecision.ACT: WriterNextStep.VERIFY_ACTION,
+                AgentDecision.ESCALATE: WriterNextStep.AWAIT_ESCALATION,
+                AgentDecision.REQUEST_INFORMATION: WriterNextStep.PROVIDE_INFORMATION,
+                AgentDecision.REQUIRE_HUMAN_REVIEW: WriterNextStep.AWAIT_HUMAN_REVIEW,
+            }[decision]
+            return WriterDraft(
+                decision=decision,
+                evidence_ids=tuple(
+                    sorted(fact["evidence_id"] for fact in payload["facts"])
+                ),
+                limitation_refs=tuple(
+                    sorted(
+                        limitation["limitation_ref"]
+                        for limitation in payload["limitations"]
+                    )
+                ),
+                next_step=next_step,
+            )
+
+        return RunnableLambda(write)
+
+
+class _SequenceWriterGraphModel(BaseChatModel):
+    responses: tuple[object, ...]
+    _index: int = PrivateAttr(default=0)
+    _payloads: list[str] = PrivateAttr(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "sequence-writer-graph-model"
+
+    def _generate(self, *args: Any, **kwargs: Any) -> ChatResult:
+        raise AssertionError("o writer deve usar saída estruturada")
+
+    def bind_tools(self, *args: Any, **kwargs: Any) -> RunnableLambda:
+        raise AssertionError("o writer não pode receber tools")
+
+    def with_structured_output(
+        self,
+        schema: object,
+        *,
+        include_raw: bool = False,
+        **kwargs: Any,
+    ) -> RunnableLambda:
+        assert schema is WriterDraft
+        assert include_raw is False
+
+        async def write(messages: list[BaseMessage]) -> object:
+            self._payloads.append(str(messages[-1].content))
+            response = self.responses[self._index]
+            self._index += 1
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        return RunnableLambda(write)
+
+
+def _build_planner_graph(saver: object, model: BaseChatModel):
+    return build_agent_graph(
+        saver,
+        planner=Planner(model),
+        writer=Writer(_EchoWriterModel()),
+    )
+
+
 def _request(*, message: str = "Consulte o cadastro deste ativo.") -> SupportRequest:
     return SupportRequest(
         case_id="case_tkt_inv_04",
@@ -161,6 +265,24 @@ def _asset_payload() -> dict[str, object]:
                 "sensor_status": "online",
             }
         ],
+    }
+
+
+def _analysis_payload() -> dict[str, object]:
+    return {
+        "id": "an_9906",
+        "asset_id": "asset_G501",
+        "point_id": "pt_G501_de",
+        "type": "bearing_fault",
+        "detection_mode": "baseline",
+        "severity": "high",
+        "confidence": 0.78,
+        "baseline_state_at_detection": "established",
+        "evidence": [],
+        "limitations": [],
+        "model_version": "3.2.1",
+        "created_at": "2026-01-02T03:04:05+00:00",
+        "status": "current",
     }
 
 
@@ -285,6 +407,8 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
             ),
         ),
     )
+    writer_model = _EchoWriterModel()
+    writer = Writer(writer_model)
 
     async def scenario():
         checkpoint_path = tmp_path / "planner.sqlite3"
@@ -301,7 +425,11 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
         )
         try:
             async with open_checkpointer(checkpoint_path) as saver:
-                graph = build_agent_graph(saver, planner=Planner(model))
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(model),
+                    writer=writer,
+                )
                 state = await invoke_agent(
                     graph,
                     request=_request(),
@@ -319,6 +447,7 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
                         await build_agent_graph(
                             reopened_saver,
                             planner=Planner(model),
+                            writer=writer,
                         ).aget_state(
                             {"configurable": {"thread_id": "thread_planner_read"}}
                         )
@@ -332,11 +461,14 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
 
     assert len(requests) == 1
     assert requests[0].url.path == "/assets/asset_G501"
-    assert state.step_limit == 20
-    assert state.step_count == 5
-    assert state.resume_anchor is ResumeAnchor.PLANNER_FINALIZE
+    assert state.step_limit == 24
+    assert state.step_count == 7
+    assert state.resume_anchor is ResumeAnchor.RELEASE_GATE
     assert state.decision is AgentDecision.GUIDE
     assert state.final_result is not None
+    assert state.writer_draft is not None
+    assert state.release_gate is not None
+    assert state.release_gate.outcome is ReleaseGateOutcome.RELEASE
     assert len(state.tool_calls) == 1
     assert len(state.tool_observations) == 1
     observation = state.tool_observations[0]
@@ -372,6 +504,7 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
         "with_structured_output",
         "terminal_request",
     ]
+    assert writer_model._events == ["with_structured_output", "writer_request"]
 
 
 def test_planner_rejects_coerced_rotation_in_raw_read_artifact(
@@ -465,7 +598,7 @@ def test_planner_rejects_coerced_rotation_in_raw_read_artifact(
             async with open_checkpointer(
                 tmp_path / "coerced-rotation.sqlite3"
             ) as saver:
-                graph = build_agent_graph(saver, planner=Planner(model))
+                graph = _build_planner_graph(saver, model)
                 await graph.ainvoke(
                     state.model_dump(mode="json"),
                     config,
@@ -628,7 +761,7 @@ def test_each_planner_proposal_runs_through_tool_node_without_effect(
             async with open_checkpointer(
                 tmp_path / f"{tool_name}.sqlite3"
             ) as saver:
-                graph = build_agent_graph(saver, planner=Planner(model))
+                graph = _build_planner_graph(saver, model)
                 await graph.ainvoke(
                     state.model_dump(mode="json"),
                     config,
@@ -757,7 +890,7 @@ def test_planner_rejects_noncanonical_raw_proposal_wire(
             async with open_checkpointer(
                 tmp_path / f"noncanonical-{malformation}.sqlite3"
             ) as saver:
-                graph = build_agent_graph(saver, planner=Planner(model))
+                graph = _build_planner_graph(saver, model)
                 await graph.ainvoke(
                     state.model_dump(mode="json"),
                     config,
@@ -858,7 +991,7 @@ def test_planner_cycle_resumes_from_each_new_nonterminal_node(
             async with open_checkpointer(
                 tmp_path / f"resume-{interrupt_after}.sqlite3"
             ) as saver:
-                graph = build_agent_graph(saver, planner=Planner(model))
+                graph = _build_planner_graph(saver, model)
                 await graph.ainvoke(
                     state.model_dump(mode="json"),
                     config,
@@ -885,7 +1018,7 @@ def test_planner_cycle_resumes_from_each_new_nonterminal_node(
     assert partial.values["resume_anchor"] == expected_anchor.value
     assert partial.values["step_count"] == expected_steps
     assert resumed.execution_id == "exec_after_resume"
-    assert resumed.resume_anchor is ResumeAnchor.PLANNER_FINALIZE
+    assert resumed.resume_anchor is ResumeAnchor.RELEASE_GATE
     assert resumed.final_result is not None
     assert resumed.planner_failure is None
     assert len(requests) == 1
@@ -926,6 +1059,8 @@ def test_planner_generated_proposal_uses_policy_and_executes_once(tmp_path):
             ),
         )
     )
+    writer_model = _EchoWriterModel()
+    writer = Writer(writer_model)
     approval = TrustedActionApproval(
         action="update_asset_criticality",
         target_id="asset_G501",
@@ -949,7 +1084,11 @@ def test_planner_generated_proposal_uses_policy_and_executes_once(tmp_path):
         request = _request(message="Atualize a criticidade do ativo central.")
         try:
             async with open_checkpointer(tmp_path / "planner-write.sqlite3") as saver:
-                graph = build_agent_graph(saver, planner=Planner(model))
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(model),
+                    writer=writer,
+                )
                 completed = await invoke_agent(
                     graph,
                     request=request,
@@ -974,17 +1113,678 @@ def test_planner_generated_proposal_uses_policy_and_executes_once(tmp_path):
 
     completed, replayed = asyncio.run(scenario())
 
-    assert completed.step_count == 7
-    assert completed.step_limit == 20
-    assert completed.resume_anchor is ResumeAnchor.EXECUTE_ACTION
+    assert completed.step_count == 9
+    assert completed.step_limit == 24
+    assert completed.resume_anchor is ResumeAnchor.RELEASE_GATE
     assert completed.decision is AgentDecision.ACT
     assert completed.pending_proposal == UpdateAssetCriticalityProposal(
         criticality="critical",
         justification=justification,
     )
     assert completed.intents[0].status.value == "completed"
+    assert completed.release_gate is not None
+    assert completed.release_gate.outcome is ReleaseGateOutcome.RELEASE
+    assert completed.final_result is not None
+    assert completed.final_result.evidence_ids == tuple(
+        item.evidence_id for item in completed.ledger.items
+    )
+    assert "asset_G501" not in completed.final_result.message
+    assert writer_model._events == ["with_structured_output", "writer_request"]
     assert replayed == completed
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    (
+        "slug",
+        "proposal",
+        "approval",
+        "permission",
+        "write_method",
+        "write_path",
+        "decision",
+        "requires_preflight",
+    ),
+    [
+        (
+            "reprocess",
+            ReprocessProposal(
+                analysis_id="an_9906",
+                justification="Há dados novos para repetir a análise.",
+            ),
+            TrustedActionApproval(
+                action="reprocess_analysis",
+                target_id="an_9906",
+                source=ApprovalSource.ORIGINAL_REQUEST,
+            ),
+            "action_low",
+            "POST",
+            "/analyses/an_9906/reprocess",
+            AgentDecision.ACT,
+            True,
+        ),
+        (
+            "specialist",
+            RequestSpecialistAnalysisProposal(
+                analysis_id="an_9906",
+                justification="A limitação exige análise especializada.",
+            ),
+            TrustedActionApproval(
+                action="request_specialist_analysis",
+                target_id="an_9906",
+                source=ApprovalSource.ORIGINAL_REQUEST,
+            ),
+            "action_low",
+            "POST",
+            "/analyses/an_9906/request-specialist",
+            AgentDecision.ACT,
+            True,
+        ),
+        (
+            "criticality",
+            UpdateAssetCriticalityProposal(
+                criticality="critical",
+                justification="O impacto operacional exige prioridade máxima.",
+            ),
+            TrustedActionApproval(
+                action="update_asset_criticality",
+                target_id="asset_G501",
+                material_parameters={"criticality": "critical"},
+                source=ApprovalSource.ORIGINAL_REQUEST,
+            ),
+            "action_high",
+            "PATCH",
+            "/assets/asset_G501",
+            AgentDecision.ACT,
+            False,
+        ),
+        (
+            "retraining",
+            RequestModelRetrainingProposal(
+                justification="Erros sistemáticos sustentam novo treinamento.",
+            ),
+            TrustedActionApproval(
+                action="request_model_retraining",
+                target_id="mdl_vib_v3",
+                source=ApprovalSource.ORIGINAL_REQUEST,
+            ),
+            "action_high",
+            "POST",
+            "/models/mdl_vib_v3/request-retraining",
+            AgentDecision.ACT,
+            False,
+        ),
+        (
+            "escalation",
+            EscalateCaseProposal(
+                justification="O caso ultrapassa o atendimento remoto.",
+            ),
+            TrustedActionApproval(
+                action="escalate_case",
+                target_id="case_tkt_inv_04",
+                source=ApprovalSource.ORIGINAL_REQUEST,
+            ),
+            "escalate",
+            "POST",
+            "/cases/case_tkt_inv_04/escalate",
+            AgentDecision.ESCALATE,
+            False,
+        ),
+    ],
+)
+def test_all_write_flows_use_public_planner_writer_gate_and_replay_once(
+    tmp_path,
+    slug,
+    proposal,
+    approval,
+    permission,
+    write_method,
+    write_path,
+    decision,
+    requires_preflight,
+):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            assert requires_preflight
+            assert request.url.path == "/analyses/an_9906"
+            return httpx.Response(
+                200,
+                json={"mode": "complete", "notes": None, "data": _analysis_payload()},
+            )
+        assert request.method == write_method
+        assert request.url.path == write_path
+        return httpx.Response(
+            200,
+            json={
+                "accepted": True,
+                "action_id": f"act_{slug}_writer_gate",
+                "message": "Ação aceita pela plataforma.",
+            },
+        )
+
+    writer_model = _EchoWriterModel()
+    planner_model = _ScriptedPlannerModel(selector_responses=())
+
+    async def scenario():
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(handler),
+        )
+        runtime = WriteToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read", permission}),
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            configured_model_id="mdl_vib_v3",
+            client=client,
+        )
+        request = _request(message="Execute a ação industrial solicitada.")
+        checkpoint_path = tmp_path / f"flow-{slug}.sqlite3"
+        try:
+            async with open_checkpointer(checkpoint_path) as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=Writer(writer_model),
+                )
+                uninterrupted_ainvoke = graph.ainvoke
+
+                async def interrupt_after_effect(input, config, **kwargs):
+                    return await uninterrupted_ainvoke(
+                        input,
+                        config,
+                        interrupt_after=["execute_action"],
+                        **kwargs,
+                    )
+
+                graph.ainvoke = interrupt_after_effect
+                partial = await invoke_agent(
+                    graph,
+                    request=request,
+                    runtime=runtime,
+                    thread_id=f"thread_flow_{slug}",
+                    request_id=f"req_flow_{slug}",
+                    execution_id=f"exec_flow_{slug}",
+                    proposal=proposal,
+                    original_approval=approval,
+                )
+            async with open_checkpointer(checkpoint_path) as saver:
+                resumed_graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=Writer(writer_model),
+                )
+                completed = await invoke_agent(
+                    resumed_graph,
+                    request=request,
+                    runtime=runtime,
+                    thread_id=f"thread_flow_{slug}",
+                    request_id=f"req_flow_{slug}",
+                    execution_id=f"exec_flow_{slug}_resume",
+                    proposal=proposal,
+                    original_approval=approval,
+                )
+                replayed = await invoke_agent(
+                    resumed_graph,
+                    request=request,
+                    runtime=runtime,
+                    thread_id=f"thread_flow_{slug}",
+                    request_id=f"req_flow_{slug}",
+                    execution_id=f"exec_flow_{slug}_delivery_retry",
+                    proposal=proposal,
+                    original_approval=approval,
+                )
+            return partial, completed, replayed
+        finally:
+            await client.aclose()
+
+    partial, completed, replayed = asyncio.run(scenario())
+
+    assert partial.step_count == 5
+    assert partial.resume_anchor is ResumeAnchor.EXECUTE_ACTION
+    assert partial.final_result is None
+    assert completed.step_count == 7
+    assert completed.step_limit == 24
+    assert completed.decision is decision
+    assert completed.resume_anchor is ResumeAnchor.RELEASE_GATE
+    assert completed.release_gate is not None
+    assert completed.release_gate.outcome is ReleaseGateOutcome.RELEASE
+    assert completed.final_result is not None
+    assert completed.final_result.decision is decision
+    assert approval.target_id not in completed.final_result.message
+    assert writer_model._events == ["with_structured_output", "writer_request"]
+    assert planner_model._events == []
+    assert replayed == completed
+    assert len(requests) == (2 if requires_preflight else 1)
+    if slug == "reprocess":
+        write_request = requests[-1]
+        assert write_request.headers["idempotency-key"] == (
+            completed.intents[0].idempotency_key
+        )
+
+
+def test_writer_graph_projection_excludes_every_non_allowlisted_state_sentinel(
+    tmp_path,
+):
+    identity = Identity(
+        user_id="usr_identity_sentinel",
+        company_id="comp_identity_sentinel",
+    )
+    first_request = SupportRequest(
+        case_id="case_tkt_inv_04",
+        ticket_id="TKT-INV-04",
+        asset_id="asset_G501",
+        message="FIRST_REQUEST_SENTINEL",
+        identity=identity,
+    )
+    second_request = SupportRequest(
+        case_id="case_tkt_inv_04",
+        ticket_id="TKT-INV-04",
+        asset_id="asset_G501",
+        message="REQUEST_SENTINEL",
+        identity=identity,
+    )
+    proposal = UpdateAssetCriticalityProposal(
+        criticality="critical",
+        justification=(
+            "PROPOSAL_SENTINEL: o impacto operacional exige prioridade máxima."
+        ),
+    )
+    approval = TrustedActionApproval(
+        action=proposal.action,
+        target_id="asset_G501",
+        material_parameters={"criticality": "critical"},
+        source=ApprovalSource.ORIGINAL_REQUEST,
+    )
+    planner_model = _ScriptedPlannerModel(
+        selector_responses=(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_asset",
+                        "args": {"asset_id": "asset_G501"},
+                        "id": "call_history_sentinel",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content=""),
+        ),
+        terminal_responses=(
+            PlannerTerminalDecision(
+                decision=PlannerDecisionKind.GUIDE,
+                stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+            ),
+        ),
+    )
+    writer_model = _EchoWriterModel()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            payload = _asset_payload()
+            payload["name"] = "HISTORY_ARTIFACT_SENTINEL"
+            payload["company_id"] = identity.company_id
+            return httpx.Response(
+                200,
+                json={"mode": "complete", "notes": None, "data": payload},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "accepted": True,
+                "action_id": "act_allowlisted_sentinel",
+                "message": "RECEIPT_SENTINEL",
+            },
+        )
+
+    async def scenario():
+        client = IndustrialApiClient(
+            "https://runtime-sentinel.invalid",
+            transport=httpx.MockTransport(handler),
+        )
+        runtime = WriteToolRuntime.create(
+            user_id=identity.user_id,
+            company_id=identity.company_id,
+            permissions=frozenset({"read", "action_high"}),
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            client=client,
+        )
+        try:
+            async with open_checkpointer(tmp_path / "writer-allowlist.sqlite3") as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=Writer(writer_model),
+                )
+                first = await invoke_agent(
+                    graph,
+                    request=first_request,
+                    runtime=runtime,
+                    thread_id="thread_writer_allowlist",
+                    request_id="req_writer_allowlist_history",
+                    execution_id="exec_writer_allowlist_history",
+                )
+                second = await invoke_agent(
+                    graph,
+                    request=second_request,
+                    runtime=runtime,
+                    thread_id="thread_writer_allowlist",
+                    request_id="req_writer_allowlist_current",
+                    execution_id="exec_writer_allowlist_current",
+                    proposal=proposal,
+                    original_approval=approval,
+                )
+            return first, second
+        finally:
+            await client.aclose()
+
+    first, second = asyncio.run(scenario())
+
+    assert first.final_result is not None
+    assert len(second.ledger_history) == 1
+    assert "HISTORY_ARTIFACT_SENTINEL" in first.final_result.message
+    current_writer_payload = writer_model._payloads[-1]
+    assert "act_allowlisted_sentinel" in current_writer_payload
+    for forbidden in (
+        "FIRST_REQUEST_SENTINEL",
+        "REQUEST_SENTINEL",
+        "usr_identity_sentinel",
+        "comp_identity_sentinel",
+        "action_high",
+        "PROPOSAL_SENTINEL",
+        "RECEIPT_SENTINEL",
+        "HISTORY_ARTIFACT_SENTINEL",
+        "runtime-sentinel.invalid",
+        "asset_G501",
+    ):
+        assert forbidden not in current_writer_payload
+
+
+def test_writer_format_repair_survives_checkpoint_without_repeating_planner(
+    tmp_path,
+):
+    planner_model = _ScriptedPlannerModel(
+        selector_responses=(AIMessage(content=""),),
+        terminal_responses=(
+            PlannerTerminalDecision(
+                decision=PlannerDecisionKind.REQUEST_INFORMATION,
+                stop_reason=PlannerStopReason.MISSING_INFORMATION,
+                missing_information="Informe o ponto de medição.",
+            ),
+        ),
+    )
+    writer_model = _SequenceWriterGraphModel(
+        responses=(
+            {"decision": "request_information", "texto": "inválido"},
+            WriterDraft(
+                decision=AgentDecision.REQUEST_INFORMATION,
+                evidence_ids=(),
+                limitation_refs=(),
+                next_step=WriterNextStep.PROVIDE_INFORMATION,
+            ),
+        )
+    )
+    writer = Writer(writer_model)
+
+    async def scenario():
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(
+                lambda request: pytest.fail(f"HTTP inesperado: {request.url}")
+            ),
+        )
+        runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read"}),
+            central_asset_id="asset_G501",
+            client=client,
+        )
+        request = _request(message="Investigue, mas falta identificar o ponto.")
+        state = AgentState(
+            request=request,
+            identity=runtime.identity,
+            permissions=runtime.permissions,
+            request_id="req_writer_repair",
+            thread_id="thread_writer_repair",
+            execution_id="exec_writer_repair_1",
+            thread_scope=ThreadScope(
+                thread_id="thread_writer_repair",
+                case_id=request.case_id,
+                company_id=runtime.identity.company_id,
+                user_id=runtime.identity.user_id,
+            ),
+            step_limit=24,
+        )
+        config = {"configurable": {"thread_id": state.thread_id}}
+        checkpoint_path = tmp_path / "writer-repair.sqlite3"
+        try:
+            async with open_checkpointer(checkpoint_path) as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=writer,
+                )
+                await graph.ainvoke(
+                    state.model_dump(mode="json"),
+                    config,
+                    context=runtime,
+                    durability="sync",
+                    interrupt_after=["writer"],
+                )
+                partial = await graph.aget_state(config)
+            async with open_checkpointer(checkpoint_path) as saver:
+                resumed = await invoke_agent(
+                    build_agent_graph(
+                        saver,
+                        planner=Planner(planner_model),
+                        writer=writer,
+                    ),
+                    request=request,
+                    runtime=runtime,
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_writer_repair_2",
+                )
+            return partial, resumed
+        finally:
+            await client.aclose()
+
+    partial, resumed = asyncio.run(scenario())
+
+    assert partial.next == ("writer",)
+    assert partial.values["writer_attempts"] == 1
+    assert partial.values["writer_failure"]["code"] == "invalid_structured_output"
+    assert resumed.writer_attempts == 2
+    assert resumed.writer_failure is None
+    assert resumed.decision is AgentDecision.REQUEST_INFORMATION
+    assert resumed.resume_anchor is ResumeAnchor.RELEASE_GATE
+    assert resumed.final_result is not None
+    assert resumed.final_result.message == (
+        "Para continuar, informe: Informe o ponto de medição."
+    )
+    assert writer_model._payloads[0] == writer_model._payloads[1]
+    assert planner_model._events == [
+        "bind_tools",
+        "selection_request",
+        "with_structured_output",
+        "terminal_request",
+    ]
+
+
+def test_valid_writer_checkpoint_resumes_only_the_release_gate(tmp_path):
+    planner_model = _ScriptedPlannerModel(
+        selector_responses=(AIMessage(content=""),),
+        terminal_responses=(
+            PlannerTerminalDecision(
+                decision=PlannerDecisionKind.REQUEST_INFORMATION,
+                stop_reason=PlannerStopReason.MISSING_INFORMATION,
+                missing_information="Informe o ponto de medição.",
+            ),
+        ),
+    )
+    writer_model = _EchoWriterModel()
+    checkpoint_path = tmp_path / "writer-valid-checkpoint.sqlite3"
+
+    async def scenario():
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(
+                lambda request: pytest.fail(f"HTTP inesperado: {request.url}")
+            ),
+        )
+        runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read"}),
+            central_asset_id="asset_G501",
+            client=client,
+        )
+        request = _request(message="Investigue, mas falta identificar o ponto.")
+        try:
+            async with open_checkpointer(checkpoint_path) as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=Writer(writer_model),
+                )
+                uninterrupted_ainvoke = graph.ainvoke
+
+                async def interrupt_after_writer(input, config, **kwargs):
+                    return await uninterrupted_ainvoke(
+                        input,
+                        config,
+                        interrupt_after=["writer"],
+                        **kwargs,
+                    )
+
+                graph.ainvoke = interrupt_after_writer
+                partial = await invoke_agent(
+                    graph,
+                    request=request,
+                    runtime=runtime,
+                    thread_id="thread_writer_valid_checkpoint",
+                    request_id="req_writer_valid_checkpoint",
+                    execution_id="exec_writer_valid_checkpoint_1",
+                )
+            async with open_checkpointer(checkpoint_path) as saver:
+                completed = await invoke_agent(
+                    build_agent_graph(
+                        saver,
+                        planner=Planner(planner_model),
+                        writer=Writer(writer_model),
+                    ),
+                    request=request,
+                    runtime=runtime,
+                    thread_id="thread_writer_valid_checkpoint",
+                    request_id="req_writer_valid_checkpoint",
+                    execution_id="exec_writer_valid_checkpoint_2",
+                )
+            return partial, completed
+        finally:
+            await client.aclose()
+
+    partial, completed = asyncio.run(scenario())
+
+    assert partial.resume_anchor is ResumeAnchor.WRITER
+    assert partial.writer_attempts == 1
+    assert partial.writer_draft is not None
+    assert partial.final_result is None
+    assert completed.resume_anchor is ResumeAnchor.RELEASE_GATE
+    assert completed.writer_attempts == 1
+    assert completed.final_result is not None
+    assert completed.final_result.decision is AgentDecision.REQUEST_INFORMATION
+    assert writer_model._events == ["with_structured_output", "writer_request"]
+    assert planner_model._events == [
+        "bind_tools",
+        "selection_request",
+        "with_structured_output",
+        "terminal_request",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("responses", "expected_attempts", "expected_code"),
+    [
+        (
+            (
+                {"decision": "guide", "technical_text": "primeiro inválido"},
+                {"decision": "guide", "technical_text": "segundo inválido"},
+            ),
+            2,
+            "invalid_structured_output",
+        ),
+        ((RuntimeError("provider indisponível"),), 1, "model_failure"),
+    ],
+)
+def test_writer_failure_stops_safely_without_hidden_retry(
+    tmp_path,
+    responses,
+    expected_attempts,
+    expected_code,
+):
+    planner_model = _ScriptedPlannerModel(
+        selector_responses=(AIMessage(content=""),),
+        terminal_responses=(
+            PlannerTerminalDecision(
+                decision=PlannerDecisionKind.REQUIRE_HUMAN_REVIEW,
+                stop_reason=PlannerStopReason.HUMAN_REVIEW_REQUIRED,
+            ),
+        ),
+    )
+    writer_model = _SequenceWriterGraphModel(responses=responses)
+
+    async def scenario():
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(
+                lambda request: pytest.fail(f"HTTP inesperado: {request.url}")
+            ),
+        )
+        runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read"}),
+            central_asset_id="asset_G501",
+            client=client,
+        )
+        try:
+            async with open_checkpointer(
+                tmp_path / f"writer-failure-{expected_code}.sqlite3"
+            ) as saver:
+                return await invoke_agent(
+                    build_agent_graph(
+                        saver,
+                        planner=Planner(planner_model),
+                        writer=Writer(writer_model),
+                    ),
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=f"thread_writer_failure_{expected_code}",
+                    request_id=f"req_writer_failure_{expected_code}",
+                    execution_id=f"exec_writer_failure_{expected_code}",
+                )
+        finally:
+            await client.aclose()
+
+    state = asyncio.run(scenario())
+
+    assert state.writer_attempts == expected_attempts
+    assert state.writer_failure is not None
+    assert state.writer_failure.code.value == expected_code
+    assert state.release_gate is not None
+    assert state.release_gate.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+    assert state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+    assert state.final_result is not None
+    assert state.final_result.evidence_ids == ()
+    assert "inválido" not in state.model_dump_json()
+    assert len(writer_model._payloads) == expected_attempts
 
 
 def test_write_policy_never_creates_a_second_intent_for_request_id(tmp_path):
@@ -1116,7 +1916,7 @@ def test_policy_requires_confirmation_when_proposal_exceeds_original_approval(
         try:
             async with open_checkpointer(tmp_path / "planner-deny.sqlite3") as saver:
                 return await invoke_agent(
-                    build_agent_graph(saver, planner=Planner(model)),
+                    _build_planner_graph(saver, model),
                     request=_request(message="Atualize a criticidade do ativo central."),
                     runtime=runtime,
                     thread_id="thread_planner_deny",
@@ -1138,6 +1938,115 @@ def test_policy_requires_confirmation_when_proposal_exceeds_original_approval(
     assert state.intents[0].status.value == "awaiting_confirmation"
     assert state.decision is AgentDecision.REQUEST_CONFIRMATION
     assert state.final_result is None
+
+
+def test_planner_confirmation_resume_reaches_writer_gate_without_repeating_effect(
+    tmp_path,
+):
+    requests: list[httpx.Request] = []
+    justification = "O impacto operacional exige criticidade máxima."
+    planner_model = _ScriptedPlannerModel(
+        selector_responses=(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "propose_update_asset_criticality",
+                        "args": {
+                            "criticality": "critical",
+                            "justification": justification,
+                        },
+                        "id": "call_confirmed_criticality",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        )
+    )
+    writer_model = _EchoWriterModel()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "PATCH"
+        assert request.url.path == "/assets/asset_G501"
+        return httpx.Response(
+            200,
+            json={
+                "accepted": True,
+                "action_id": "act_confirmed_writer_gate",
+                "message": "Ação aceita pela plataforma.",
+            },
+        )
+
+    async def scenario():
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(handler),
+        )
+        runtime = WriteToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read", "action_high"}),
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            client=client,
+        )
+        request = _request(message="Atualize a criticidade do ativo central.")
+        try:
+            async with open_checkpointer(tmp_path / "confirmed-writer.sqlite3") as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=Writer(writer_model),
+                )
+                partial = await invoke_agent(
+                    graph,
+                    request=request,
+                    runtime=runtime,
+                    thread_id="thread_confirmed_writer",
+                    request_id="req_confirmed_writer",
+                    execution_id="exec_confirmed_writer_1",
+                )
+                confirmation = ConfirmationReply(
+                    intent_id=partial.intents[0].intent_id,
+                    decision="approve",
+                )
+                completed = await invoke_agent(
+                    graph,
+                    request=request,
+                    runtime=runtime,
+                    thread_id="thread_confirmed_writer",
+                    request_id="req_confirmed_writer",
+                    execution_id="exec_confirmed_writer_2",
+                    confirmation=confirmation,
+                )
+                replayed = await invoke_agent(
+                    graph,
+                    request=request,
+                    runtime=runtime,
+                    thread_id="thread_confirmed_writer",
+                    request_id="req_confirmed_writer",
+                    execution_id="exec_confirmed_writer_3",
+                    confirmation=confirmation,
+                )
+            return partial, completed, replayed
+        finally:
+            await client.aclose()
+
+    partial, completed, replayed = asyncio.run(scenario())
+
+    assert partial.resume_anchor is ResumeAnchor.WRITE_POLICY
+    assert partial.final_result is None
+    assert partial.intents[0].status is IntentStatus.AWAITING_CONFIRMATION
+    assert completed.resume_anchor is ResumeAnchor.RELEASE_GATE
+    assert completed.release_gate is not None
+    assert completed.release_gate.outcome is ReleaseGateOutcome.RELEASE
+    assert completed.intents[0].status is IntentStatus.COMPLETED
+    assert completed.approval is not None
+    assert completed.approval.source is ApprovalSource.CONFIRMATION
+    assert replayed == completed
+    assert len(requests) == 1
+    assert writer_model._events == ["with_structured_output", "writer_request"]
 
 
 def test_resume_preserves_write_runtime_boundary_for_original_approval(tmp_path):
@@ -1186,7 +2095,7 @@ def test_resume_preserves_write_runtime_boundary_for_original_approval(tmp_path)
         config = {"configurable": {"thread_id": state.thread_id}}
         try:
             async with open_checkpointer(tmp_path / "resume-boundary.sqlite3") as saver:
-                graph = build_agent_graph(saver, planner=Planner(model))
+                graph = _build_planner_graph(saver, model)
                 await graph.ainvoke(
                     state.model_dump(mode="json"),
                     config,
@@ -1258,7 +2167,7 @@ def test_repeated_planner_call_terminates_safely_without_second_http(tmp_path):
         try:
             async with open_checkpointer(tmp_path / "repeated.sqlite3") as saver:
                 return await invoke_agent(
-                    build_agent_graph(saver, planner=Planner(model)),
+                    _build_planner_graph(saver, model),
                     request=_request(),
                     runtime=runtime,
                     thread_id="thread_repeated_tool",
@@ -1328,7 +2237,7 @@ def test_read_transport_error_is_observed_and_never_retried(tmp_path):
         try:
             async with open_checkpointer(tmp_path / "transport.sqlite3") as saver:
                 return await invoke_agent(
-                    build_agent_graph(saver, planner=Planner(model)),
+                    _build_planner_graph(saver, model),
                     request=_request(),
                     runtime=runtime,
                     thread_id="thread_transport_error",
@@ -1350,7 +2259,7 @@ def test_read_transport_error_is_observed_and_never_retried(tmp_path):
     assert state.ledger.gaps[0].call_id == observation.call_id
     assert state.planner_failure is None
     assert state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
-    assert state.resume_anchor is ResumeAnchor.PLANNER_FINALIZE
+    assert state.resume_anchor is ResumeAnchor.RELEASE_GATE
 
 
 def test_degraded_read_is_persisted_and_reaches_structured_terminal(tmp_path):
@@ -1410,7 +2319,7 @@ def test_degraded_read_is_persisted_and_reaches_structured_terminal(tmp_path):
         try:
             async with open_checkpointer(tmp_path / "degraded.sqlite3") as saver:
                 return await invoke_agent(
-                    build_agent_graph(saver, planner=Planner(model)),
+                    _build_planner_graph(saver, model),
                     request=_request(),
                     runtime=runtime,
                     thread_id="thread_degraded_asset",
@@ -1508,7 +2417,7 @@ def test_public_reads_preserve_conflict_through_sqlite_reopen(tmp_path):
         config = {"configurable": {"thread_id": "thread_quality_conflict"}}
         try:
             async with open_checkpointer(tmp_path / "conflict.sqlite3") as saver:
-                graph = build_agent_graph(saver, planner=Planner(model))
+                graph = _build_planner_graph(saver, model)
                 state = await invoke_agent(
                     graph,
                     request=_request(),
@@ -1519,7 +2428,7 @@ def test_public_reads_preserve_conflict_through_sqlite_reopen(tmp_path):
                 )
             async with open_checkpointer(tmp_path / "conflict.sqlite3") as saver:
                 reopened = AgentState.model_validate(
-                    (await build_agent_graph(saver, planner=Planner(model)).aget_state(config)).values
+                    (await _build_planner_graph(saver, model).aget_state(config)).values
                 )
             return state, reopened
         finally:
@@ -1592,7 +2501,7 @@ def test_public_obsolete_read_preserves_gap_through_sqlite_reopen(tmp_path):
         config = {"configurable": {"thread_id": "thread_quality_obsolete"}}
         try:
             async with open_checkpointer(tmp_path / "obsolete.sqlite3") as saver:
-                graph = build_agent_graph(saver, planner=Planner(model))
+                graph = _build_planner_graph(saver, model)
                 state = await invoke_agent(
                     graph,
                     request=_request(),
@@ -1603,7 +2512,7 @@ def test_public_obsolete_read_preserves_gap_through_sqlite_reopen(tmp_path):
                 )
             async with open_checkpointer(tmp_path / "obsolete.sqlite3") as saver:
                 reopened = AgentState.model_validate(
-                    (await build_agent_graph(saver, planner=Planner(model)).aget_state(config)).values
+                    (await _build_planner_graph(saver, model).aget_state(config)).values
                 )
             return state, reopened
         finally:
@@ -1684,7 +2593,7 @@ def test_public_new_request_archives_ledger_through_sqlite_reopen(tmp_path):
         try:
             async with open_checkpointer(checkpoint_path) as saver:
                 first = await invoke_agent(
-                    build_agent_graph(saver, planner=Planner(model)),
+                    _build_planner_graph(saver, model),
                     request=_request(),
                     runtime=runtime,
                     thread_id="thread_ledger_history",
@@ -1693,7 +2602,7 @@ def test_public_new_request_archives_ledger_through_sqlite_reopen(tmp_path):
                 )
             async with open_checkpointer(checkpoint_path) as saver:
                 second = await invoke_agent(
-                    build_agent_graph(saver, planner=Planner(model)),
+                    _build_planner_graph(saver, model),
                     request=_request(message="Nova solicitação independente."),
                     runtime=runtime,
                     thread_id="thread_ledger_history",
@@ -1702,7 +2611,7 @@ def test_public_new_request_archives_ledger_through_sqlite_reopen(tmp_path):
                 )
             async with open_checkpointer(checkpoint_path) as saver:
                 restored = AgentState.model_validate(
-                    (await build_agent_graph(saver, planner=Planner(model)).aget_state(config)).values
+                    (await _build_planner_graph(saver, model).aget_state(config)).values
                 )
             return first, second, restored
         finally:
@@ -1755,7 +2664,7 @@ def test_unexpected_tool_failure_terminates_safely_without_retry(tmp_path):
         )
         try:
             async with open_checkpointer(tmp_path / "tool-failure.sqlite3") as saver:
-                graph = build_agent_graph(saver, planner=Planner(model))
+                graph = _build_planner_graph(saver, model)
                 state = await invoke_agent(
                     graph,
                     request=_request(),
@@ -1825,7 +2734,7 @@ def test_planner_reserves_fixed_write_steps_before_proposal_tool(tmp_path):
         try:
             async with open_checkpointer(tmp_path / "budget.sqlite3") as saver:
                 return await invoke_agent(
-                    build_agent_graph(saver, planner=Planner(model)),
+                    _build_planner_graph(saver, model),
                     request=_request(message="Atualize a criticidade do ativo central."),
                     runtime=runtime,
                     thread_id="thread_budgeted_proposal",
