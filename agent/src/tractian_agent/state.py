@@ -40,7 +40,11 @@ from tractian_agent.tools.technical import (
     SpectrumToolArtifact,
 )
 from tractian_agent.write_contracts import IntentStatus, PersistedApiError, WriteIntent
-from tractian_agent.write_policy import TrustedActionApproval, WriteProposal
+from tractian_agent.write_policy import (
+    PolicyDecision,
+    TrustedActionApproval,
+    WriteProposal,
+)
 
 
 def _normalized_key(value: str) -> str:
@@ -742,6 +746,96 @@ class AgentState(FrozenStateModel):
     planner_terminal: PlannerTerminalRecord | None = None
     planner_failure: PlannerFailureRecord | None = None
 
+    def has_coherent_terminal_result(self) -> bool:
+        """Confere a matriz fechada dos resultados terminais persistidos."""
+        if self.final_result is None:
+            return True
+        if self.decision is None or self.final_result.decision is not self.decision:
+            return False
+
+        current_intents = tuple(
+            intent
+            for intent in self.intents
+            if intent.request_id == self.request_id
+        )
+        if self.planner_failure is not None:
+            expected_anchor = {
+                "planner_select": ResumeAnchor.PLANNER_SELECT,
+                "planner_tool": ResumeAnchor.PLANNER_TOOL,
+                "planner_finalize": ResumeAnchor.PLANNER_FINALIZE,
+            }[self.planner_failure.stage]
+            return (
+                self.resume_anchor is expected_anchor
+                and self.planner_terminal is None
+                and not current_intents
+            )
+
+        if self.resume_anchor is ResumeAnchor.FINISH:
+            return (
+                self.decision is AgentDecision.GUIDE
+                and self.planner_terminal is None
+                and self.pending_proposal is None
+                and self.approval is None
+                and not current_intents
+            )
+
+        if self.resume_anchor is ResumeAnchor.PLANNER_FINALIZE:
+            terminal = self.planner_terminal
+            if terminal is None or self.pending_proposal is not None or current_intents:
+                return False
+            expected_decision = AgentDecision(terminal.decision)
+            if self.decision is not expected_decision:
+                return False
+            if expected_decision is AgentDecision.REQUIRE_HUMAN_REVIEW:
+                return (
+                    self.review is not None
+                    and self.review.status is ReviewStatus.REQUIRED
+                )
+            return self.review is None
+
+        if self.resume_anchor in {
+            ResumeAnchor.WRITE_POLICY,
+            ResumeAnchor.CONFIRMATION_GATE,
+        }:
+            return (
+                self.decision is AgentDecision.GUIDE
+                and self.planner_terminal is None
+                and self.pending_proposal is not None
+                and len(current_intents) == 1
+                and current_intents[0].status is IntentStatus.DENIED
+                and current_intents[0].decision.decision is PolicyDecision.DENY
+            )
+
+        if self.resume_anchor is ResumeAnchor.EXECUTE_ACTION:
+            if (
+                self.planner_terminal is not None
+                or self.pending_proposal is None
+                or len(current_intents) != 1
+            ):
+                return False
+            intent = current_intents[0]
+            if intent.decision.decision is not PolicyDecision.ALLOW:
+                return False
+            if self.pending_proposal.action != intent.scope.action:
+                return False
+            if intent.status is IntentStatus.COMPLETED:
+                expected_decision = (
+                    AgentDecision.ESCALATE
+                    if intent.scope.action == "escalate_case"
+                    else AgentDecision.ACT
+                )
+                return self.decision is expected_decision
+            if intent.status is IntentStatus.UNCERTAIN:
+                return self.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+            if intent.status is IntentStatus.FAILED:
+                return self.decision in {
+                    AgentDecision.GUIDE,
+                    AgentDecision.REQUIRE_HUMAN_REVIEW,
+                }
+            return False
+
+        return False
+
     @model_validator(mode="before")
     @classmethod
     def _restore_request_bound_planner_state(cls, value: object) -> object:
@@ -861,6 +955,19 @@ class AgentState(FrozenStateModel):
             raise ValueError(
                 "falha do planner exige encerramento seguro e revisão humana"
             )
+        terminal_anchors = {
+            ResumeAnchor.FINISH,
+            ResumeAnchor.PLANNER_FINALIZE,
+            ResumeAnchor.WRITE_POLICY,
+            ResumeAnchor.CONFIRMATION_GATE,
+            ResumeAnchor.EXECUTE_ACTION,
+        }
+        if (
+            self.final_result is not None
+            and self.resume_anchor in terminal_anchors
+            and not self.has_coherent_terminal_result()
+        ):
+            raise ValueError("resultado terminal diverge da âncora persistida")
         return self
 
     def continue_with(

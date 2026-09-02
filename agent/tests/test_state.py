@@ -328,6 +328,105 @@ def test_planner_failure_requires_a_coherent_safe_terminal_state():
         )
 
 
+@pytest.mark.parametrize(
+    ("anchor", "planner_terminal", "decision"),
+    [
+        (
+            ResumeAnchor.PLANNER_FINALIZE,
+            PlannerTerminalRecord(
+                decision="guide",
+                stop_reason="sufficient_evidence",
+            ),
+            AgentDecision.ACT,
+        ),
+        (ResumeAnchor.FINISH, None, AgentDecision.REQUEST_INFORMATION),
+    ],
+)
+def test_terminal_state_rejects_decision_that_diverges_from_anchor_contract(
+    anchor: ResumeAnchor,
+    planner_terminal: PlannerTerminalRecord | None,
+    decision: AgentDecision,
+):
+    with pytest.raises(ValidationError, match="terminal diverge"):
+        _state(
+            resume_anchor=anchor,
+            planner_terminal=planner_terminal,
+            decision=decision,
+            final_result=FinalResult(
+                decision=decision,
+                message="Checkpoint terminal adulterado.",
+            ),
+        )
+
+
+def test_terminal_state_rejects_incompatible_write_intent_or_execution_result():
+    proposal = ReprocessProposal(
+        analysis_id="an_9906",
+        justification="A intenção terminal deve manter seu status canônico.",
+    )
+    denied_data = _intent().model_dump(mode="python")
+    denied_data.update(
+        request_id="req_01",
+        status=IntentStatus.DENIED,
+        decision=WritePolicyResult(
+            decision=PolicyDecision.DENY,
+            reason=PolicyReason.MISSING_PERMISSION,
+        ),
+        idempotency_key=None,
+        expires_at=None,
+        prepared_execution_id=None,
+    )
+    denied = WriteIntent.model_validate(denied_data)
+    denial_state = _state(
+        pending_proposal=proposal,
+        intents=(denied,),
+        decision=AgentDecision.GUIDE,
+        final_result=FinalResult(
+            decision=AgentDecision.GUIDE,
+            message="A política recusou a ação.",
+        ),
+        resume_anchor=ResumeAnchor.WRITE_POLICY,
+    )
+    denial_wire = denial_state.model_dump(mode="json")
+    denial_wire["intents"][0]["status"] = IntentStatus.AWAITING_CONFIRMATION.value
+    denial_wire["intents"][0]["decision"] = {
+        "decision": PolicyDecision.REQUIRE_CONFIRMATION.value,
+        "reason": PolicyReason.EXPLICIT_APPROVAL_REQUIRED.value,
+    }
+
+    with pytest.raises(ValidationError, match="terminal diverge"):
+        AgentState.model_validate(denial_wire)
+
+    completed_data = _intent().model_dump(mode="python")
+    completed_data.update(
+        request_id="req_01",
+        status=IntentStatus.COMPLETED,
+        attempts=1,
+        receipt=ActionReceipt(
+            accepted=True,
+            action_id="act_terminal_state",
+            message="Reprocesso concluído.",
+        ),
+    )
+    completed = WriteIntent.model_validate(completed_data)
+    execution_state = _state(
+        pending_proposal=proposal,
+        intents=(completed,),
+        decision=AgentDecision.ACT,
+        final_result=FinalResult(
+            decision=AgentDecision.ACT,
+            message="Reprocesso concluído.",
+        ),
+        resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+    )
+    execution_wire = execution_state.model_dump(mode="json")
+    execution_wire["decision"] = AgentDecision.GUIDE.value
+    execution_wire["final_result"]["decision"] = AgentDecision.GUIDE.value
+
+    with pytest.raises(ValidationError, match="terminal diverge"):
+        AgentState.model_validate(execution_wire)
+
+
 def test_new_request_resets_request_bound_planner_progress_and_anchor():
     terminal_prior = _state(
         resume_anchor=ResumeAnchor.PLANNER_TOOL,

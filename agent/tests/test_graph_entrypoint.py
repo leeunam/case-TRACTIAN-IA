@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from tractian_agent.checkpoint import LocalCheckpointOwner, open_checkpointer
 from tractian_agent.client import IndustrialApiClient
-from tractian_agent.contracts import Identity, ResponseMode, SupportRequest
+from tractian_agent.contracts import ActionReceipt, Identity, ResponseMode, SupportRequest
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
 from tractian_agent.graph import CompiledAgentGraph, build_agent_graph
 from tractian_agent.state import (
@@ -42,6 +42,7 @@ from tractian_agent.write_policy import (
     ApprovalSource,
     PolicyDecision,
     PolicyReason,
+    ReprocessProposal,
     TrustedActionApproval,
     WritePolicyResult,
 )
@@ -175,6 +176,63 @@ def _terminal_planner_state() -> AgentState:
             decision="guide",
             stop_reason="sufficient_evidence",
         ),
+    )
+    return AgentState.model_validate(values)
+
+
+def _terminal_denial_state() -> AgentState:
+    state = _initial_state(step_limit=5)
+    values = state.model_dump(mode="python")
+    values.update(
+        pending_proposal=ReprocessProposal(
+            analysis_id="an_historical",
+            justification="A política deve conservar a negação persistida.",
+        ),
+        intents=(_denied_historical_intent(state.request_id),),
+        decision=AgentDecision.GUIDE,
+        final_result=FinalResult(
+            decision=AgentDecision.GUIDE,
+            message="A política recusou a ação.",
+        ),
+        resume_anchor=ResumeAnchor.WRITE_POLICY,
+    )
+    return AgentState.model_validate(values)
+
+
+def _terminal_execution_state() -> AgentState:
+    state = _initial_state(step_limit=5)
+    completed_data = _denied_historical_intent(state.request_id).model_dump(
+        mode="python"
+    )
+    completed_data.update(
+        decision=WritePolicyResult(
+            decision=PolicyDecision.ALLOW,
+            reason=PolicyReason.AUTHORIZED,
+        ),
+        status=IntentStatus.COMPLETED,
+        idempotency_key="tractian-agent:intent_req_01",
+        expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+        prepared_execution_id=state.execution_id,
+        attempts=1,
+        receipt=ActionReceipt(
+            accepted=True,
+            action_id="act_terminal_execution",
+            message="Reprocesso concluído.",
+        ),
+    )
+    values = state.model_dump(mode="python")
+    values.update(
+        pending_proposal=ReprocessProposal(
+            analysis_id="an_historical",
+            justification="O reprocesso foi autorizado e concluído.",
+        ),
+        intents=(WriteIntent.model_validate(completed_data),),
+        decision=AgentDecision.ACT,
+        final_result=FinalResult(
+            decision=AgentDecision.ACT,
+            message="Reprocesso concluído.",
+        ),
+        resume_anchor=ResumeAnchor.EXECUTE_ACTION,
     )
     return AgentState.model_validate(values)
 
@@ -589,17 +647,18 @@ def test_resume_anchor_fails_closed_before_checkpoint_update(
 
 @pytest.mark.parametrize("new_request", [False, True])
 @pytest.mark.parametrize(
-    ("raw_anchor", "expected_code"),
+    ("raw_anchor", "expected_exception", "expected_code"),
     [
-        (None, "MISSING_RESUME_ANCHOR"),
-        ("invented_node", "UNKNOWN_RESUME_ANCHOR"),
-        (ResumeAnchor.START.value, "RESUME_ANCHOR_MISMATCH"),
-        (ResumeAnchor.PLANNER_FINALIZE.value, "RESUME_ANCHOR_MISMATCH"),
+        (None, AgentInvocationProtocolError, "MISSING_RESUME_ANCHOR"),
+        ("invented_node", AgentInvocationProtocolError, "UNKNOWN_RESUME_ANCHOR"),
+        (ResumeAnchor.START.value, AgentInvocationProtocolError, "RESUME_ANCHOR_MISMATCH"),
+        (ResumeAnchor.PLANNER_FINALIZE.value, ValidationError, None),
     ],
 )
 def test_terminal_resume_anchor_is_required_and_semantically_coherent(
     raw_anchor: str | None,
-    expected_code: str,
+    expected_exception: type[Exception],
+    expected_code: str | None,
     new_request: bool,
 ):
     state = _terminal_read_state()
@@ -612,7 +671,7 @@ def test_terminal_resume_anchor_is_required_and_semantically_coherent(
 
     async def scenario():
         async with IndustrialApiClient("https://industrial.test") as client:
-            with pytest.raises(AgentInvocationProtocolError) as error:
+            with pytest.raises(expected_exception) as error:
                 await invoke_agent(
                     graph,
                     request=(
@@ -629,7 +688,9 @@ def test_terminal_resume_anchor_is_required_and_semantically_coherent(
 
     error = asyncio.run(scenario())
 
-    assert error.code == expected_code
+    if expected_code is not None:
+        assert isinstance(error, AgentInvocationProtocolError)
+        assert error.code == expected_code
     assert graph.values == persisted_values
     assert graph.as_node is None
     assert graph.invoke_config is None
@@ -734,6 +795,21 @@ def test_terminal_anchor_table_rejects_known_but_impossible_state(
         base = _terminal_read_state()
         values = base.model_dump(mode="python")
         values["intents"] = (_denied_historical_intent(base.request_id),)
+        graph = _RecordingGraph(values, planner_enabled=True)
+
+        async def scenario():
+            async with IndustrialApiClient("https://industrial.test") as client:
+                with pytest.raises(ValidationError, match="terminal diverge"):
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=_runtime(client),
+                        thread_id=base.thread_id,
+                        request_id=base.request_id,
+                        execution_id="exec_impossible_terminal_anchor",
+                    )
+
+        asyncio.run(scenario())
     else:
         base = _initial_state(step_limit=20)
         values = base.model_dump(mode="python")
@@ -753,28 +829,83 @@ def test_terminal_anchor_table_rejects_known_but_impossible_state(
             ),
             resume_anchor=ResumeAnchor.PLANNER_SELECT,
         )
-    state = AgentState.model_validate(values)
-    graph = _RecordingGraph(
-        state.model_dump(mode="json"),
-        planner_enabled=True,
-    )
+        state = AgentState.model_validate(values)
+        graph = _RecordingGraph(
+            state.model_dump(mode="json"),
+            planner_enabled=True,
+        )
+
+        async def scenario():
+            async with IndustrialApiClient("https://industrial.test") as client:
+                with pytest.raises(AgentInvocationProtocolError) as error:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=_runtime(client),
+                        thread_id=state.thread_id,
+                        request_id=state.request_id,
+                        execution_id="exec_impossible_terminal_anchor",
+                    )
+            return error.value
+
+        error = asyncio.run(scenario())
+        assert error.code == "RESUME_ANCHOR_MISMATCH"
+
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "planner_guide_as_action",
+        "fallback_finish_as_request_information",
+        "denial_as_active_intent",
+        "execution_as_guide",
+    ],
+)
+def test_adulterated_terminal_checkpoint_fails_closed_before_return(
+    tamper: str,
+):
+    if tamper == "planner_guide_as_action":
+        persisted_values = _terminal_planner_state().model_dump(mode="json")
+        persisted_values["decision"] = AgentDecision.ACT.value
+        persisted_values["final_result"]["decision"] = AgentDecision.ACT.value
+    elif tamper == "fallback_finish_as_request_information":
+        persisted_values = _terminal_read_state().model_dump(mode="json")
+        persisted_values["decision"] = AgentDecision.REQUEST_INFORMATION.value
+        persisted_values["final_result"]["decision"] = (
+            AgentDecision.REQUEST_INFORMATION.value
+        )
+    elif tamper == "denial_as_active_intent":
+        persisted_values = _terminal_denial_state().model_dump(mode="json")
+        persisted_values["intents"][0]["status"] = (
+            IntentStatus.AWAITING_CONFIRMATION.value
+        )
+        persisted_values["intents"][0]["decision"] = {
+            "decision": PolicyDecision.REQUIRE_CONFIRMATION.value,
+            "reason": PolicyReason.EXPLICIT_APPROVAL_REQUIRED.value,
+        }
+    else:
+        persisted_values = _terminal_execution_state().model_dump(mode="json")
+        persisted_values["decision"] = AgentDecision.GUIDE.value
+        persisted_values["final_result"]["decision"] = AgentDecision.GUIDE.value
+    graph = _RecordingGraph(persisted_values, planner_enabled=True)
 
     async def scenario():
         async with IndustrialApiClient("https://industrial.test") as client:
-            with pytest.raises(AgentInvocationProtocolError) as error:
+            with pytest.raises(ValidationError, match="terminal diverge"):
                 await invoke_agent(
                     graph,
                     request=_request(),
                     runtime=_runtime(client),
-                    thread_id=state.thread_id,
-                    request_id=state.request_id,
-                    execution_id="exec_impossible_terminal_anchor",
+                    thread_id="thread_case_tkt_inv_04",
+                    request_id="req_01",
+                    execution_id="exec_adulterated_terminal",
                 )
-        return error.value
 
-    error = asyncio.run(scenario())
+    asyncio.run(scenario())
 
-    assert error.code == "RESUME_ANCHOR_MISMATCH"
     assert graph.as_node is None
     assert graph.invoke_config is None
 

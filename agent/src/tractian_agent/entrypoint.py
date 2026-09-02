@@ -183,46 +183,7 @@ def _validate_terminal_resume_anchor(
     state: AgentState,
     anchor: ResumeAnchor,
 ) -> None:
-    failure = state.planner_failure
-    if failure is not None:
-        expected = {
-            "planner_select": ResumeAnchor.PLANNER_SELECT,
-            "planner_tool": ResumeAnchor.PLANNER_TOOL,
-            "planner_finalize": ResumeAnchor.PLANNER_FINALIZE,
-        }[failure.stage]
-        valid = anchor is expected
-    else:
-        current_intents = _current_request_intents(state)
-        valid = {
-            ResumeAnchor.FINISH: (
-                state.planner_terminal is None
-                and state.pending_proposal is None
-                and not current_intents
-            ),
-            ResumeAnchor.PLANNER_FINALIZE: (
-                state.planner_terminal is not None
-                and state.pending_proposal is None
-                and not current_intents
-            ),
-            ResumeAnchor.WRITE_POLICY: (
-                len(current_intents) == 1
-                and current_intents[0].status is IntentStatus.DENIED
-            ),
-            ResumeAnchor.CONFIRMATION_GATE: (
-                len(current_intents) == 1
-                and current_intents[0].status is IntentStatus.DENIED
-            ),
-            ResumeAnchor.EXECUTE_ACTION: (
-                len(current_intents) == 1
-                and current_intents[0].status
-                in {
-                    IntentStatus.COMPLETED,
-                    IntentStatus.FAILED,
-                    IntentStatus.UNCERTAIN,
-                }
-            ),
-        }.get(anchor, False)
-    if not valid:
+    if anchor is not state.resume_anchor or not state.has_coherent_terminal_result():
         raise AgentInvocationProtocolError(
             "RESUME_ANCHOR_MISMATCH",
             "a âncora terminal diverge do resultado persistido",
