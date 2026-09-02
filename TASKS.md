@@ -252,10 +252,10 @@ com `tool=true`, `arguments=true`, `pydantic=false` e `calls=1`; falha de
 construção ou da primeira chamada mantém métricas falsas e zero chamadas. Os 26
 testes focados de provider e smoke passaram; os locks offline resolveram 49
 pacotes do agente e 55 da API; e `make test` passou com 59 testes da API e 1.445
-do agente (1.504 no total). O smoke pós-correção foi **skipped** sem chave, sem
-tocar a rede naquele ambiente.
+do agente (1.504 no total). Sem chave no ambiente automatizado, o smoke saiu
+como **skipped** sem tocar a rede; a execução manual final está registrada abaixo.
 
-**Evidência manual diagnóstica (02/09/2026):** com chave fornecida somente no
+**Evidência manual diagnóstica e final (02/09/2026):** com chave fornecida somente no
 terminal, o smoke mostrou o 120b aprovado (`portuguese`, tool, argumentos e
 Pydantic verdadeiros, duas chamadas) e o 20b com seleção aprovada, mas
 finalização reprovada após uma chamada. O probe isolado do 20b identificou
@@ -263,8 +263,12 @@ finalização reprovada após uma chamada. O probe isolado do 20b identificou
 de 128 tokens. Com 512, terminou com `finish_reason=stop`, 171 tokens de saída,
 150 tokens de raciocínio, sem erro de parser e com Pydantic válido. Isso demonstra
 insuficiência do orçamento antigo, não incompatibilidade do modelo. O parser do
-adapter e o smoke foram corrigidos e cobertos sem rede; o smoke completo ao vivo
-pós-correção ainda precisa ser repetido e não é declarado aprovado.
+adapter e o smoke foram corrigidos e cobertos sem rede. Na repetição completa
+pós-correção, 120b e 20b retornaram `status=passed`, português, tool, argumentos
+e Pydantic verdadeiros, com duas chamadas; as latências da única rodada foram
+1.733 ms e 804 ms, respectivamente. `stable=not_measured` é esperado com
+`runs=1`, portanto essa execução confirma compatibilidade funcional, mas não
+mede estabilidade nem fundamenta a escolha de modelo por desempenho.
 
 - [x] Criar interface de modelo independente do provedor.
 - [x] Implementar adapter inicial do Groq.
@@ -273,8 +277,8 @@ pós-correção ainda precisa ser repetido e não é declarado aprovado.
 - [x] Limitar passos, repetição e consumo de contexto.
 
 **Aceite verificado:** trocar o adapter não altera estado, tools ou regras de
-segurança; a prova de independência usa providers falsos, e a evidência ao vivo
-é registrada sem antecipar o resultado da repetição pós-correção.
+segurança; a prova de independência usa providers falsos, e o smoke ao vivo
+pós-correção aprovou os dois modelos Groq candidatos pelo mesmo contrato.
 
 ## Fase 7 — ledger de evidências
 

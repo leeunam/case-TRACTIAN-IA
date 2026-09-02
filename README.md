@@ -94,8 +94,11 @@ estava disponível. Na verificação manual posterior, o 120b passou os dois
 contratos; o 20b passou a seleção e falhou na finalização com o orçamento antigo
 de 128 tokens. Um probe isolado confirmou `json_validate_failed` em 128 e
 conclusão válida em 512, com `finish_reason=stop`, 171 tokens de saída, 150 deles
-de raciocínio e Pydantic válido. A repetição do smoke completo depois desta
-correção de orçamento e parser continua pendente e não é declarada aprovada.
+de raciocínio e Pydantic válido. Depois da correção de orçamento e parser, a
+repetição completa aprovou ambos os modelos com português, tool, argumentos e
+Pydantic válidos em duas chamadas. Como houve somente uma rodada, a estabilidade
+permanece corretamente `not_measured`; as latências observadas não constituem
+benchmark para escolher o modelo.
 
 ## Avaliação offline planejada
 
