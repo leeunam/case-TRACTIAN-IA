@@ -36,6 +36,7 @@ from tractian_agent.planner import (
 )
 from tractian_agent.state import (
     AgentState,
+    JsonSnapshot,
     PersistedToolCall,
     ThreadScope,
     ToolObservation,
@@ -3566,6 +3567,88 @@ def test_planner_rejects_current_history_from_another_asset_before_model():
     assert model._events == []
     assert error.__cause__ is None
     assert error.__context__ is None
+    assert sentinel not in "".join(traceback.format_exception(error))
+
+
+def test_planner_rejects_unsafe_degraded_artifact_before_model():
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_degraded_baseline",
+        name="get_baseline",
+        arguments={"asset_id": "asset_G501", "point_id": None},
+    )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content={
+            "mode": "partial",
+            "notes": "Baseline parcial.",
+            "partial_data": {},
+        },
+        artifact=BaselineToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/baseline",
+            ),
+            outcome=BaselineToolOutcome(
+                mode=ResponseMode.PARTIAL,
+                notes="Baseline parcial.",
+                partial_data={},
+            ),
+        ),
+    )
+    sentinel = "UNSAFE_DEGRADED_IDENTITY_SENTINEL"
+    typed_wire = observation.artifact.typed_artifact.to_python()
+    typed_wire["outcome"]["partial_data"] = {
+        "identity": {"user_id": sentinel},
+    }
+    content_wire = {
+        "mode": "partial",
+        "notes": "Baseline parcial.",
+        "partial_data": typed_wire["outcome"]["partial_data"],
+    }
+    tampered_artifact = observation.artifact.model_copy(
+        update={
+            "typed_artifact": JsonSnapshot(
+                encoded=json.dumps(typed_wire, sort_keys=True)
+            )
+        }
+    )
+    tampered_observation = observation.model_copy(
+        update={
+            "artifact": tampered_artifact,
+            "content": JsonSnapshot(
+                encoded=json.dumps(content_wire, sort_keys=True)
+            ),
+        }
+    )
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(content=""),
+        terminal_response=PlannerTerminalDecision(
+            decision=PlannerDecisionKind.GUIDE,
+            stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+        ),
+    )
+    usage = PlannerUsage(request_id="req_planner_01", selection_count=1)
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request(),
+                request_id="req_planner_01",
+                usage=usage,
+                offered_tools=(get_baseline,),
+                tool_calls=(call,),
+                tool_observations=(tampered_observation,),
+            )
+        )
+
+    error = exc_info.value
+    assert error.code is PlannerErrorCode.INVALID_HISTORY
+    assert error.usage == usage
+    assert model._events == []
     assert sentinel not in "".join(traceback.format_exception(error))
 
 

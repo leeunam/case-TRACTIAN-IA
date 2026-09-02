@@ -7,9 +7,10 @@ from enum import Enum
 import json
 import math
 import re
-from typing import Final, Literal
+from typing import Final, Literal, TypeVar
 
 from pydantic import (
+    BaseModel,
     ConfigDict,
     Field,
     JsonValue,
@@ -30,7 +31,7 @@ from tractian_agent.tools.knowledge import (
     KnowledgeSearchToolArtifact,
     ModelToolArtifact,
 )
-from tractian_agent.tools.observations import ToolArtifact
+from tractian_agent.tools.observations import ToolArtifact, assert_safe_partial_json
 from tractian_agent.tools.runtime import Permission, TrustedIdentity
 from tractian_agent.tools.technical import (
     BaselineToolArtifact,
@@ -198,6 +199,7 @@ def _validate_json_boundary(
 
 
 _JSON_VALUE_ADAPTER = TypeAdapter(JsonValue)
+_ExactModelT = TypeVar("_ExactModelT", bound=BaseModel)
 _READ_TOOL_ARTIFACT_MODELS: Final[dict[str, type[ToolArtifact]]] = {
     "get_asset": AssetToolArtifact,
     "list_asset_analyses": AnalysisListToolArtifact,
@@ -210,6 +212,65 @@ _READ_TOOL_ARTIFACT_MODELS: Final[dict[str, type[ToolArtifact]]] = {
     "search_knowledge": KnowledgeSearchToolArtifact,
     "get_knowledge_document": KnowledgeDocumentToolArtifact,
 }
+
+
+def _copy_exact_json_wire(value: object) -> JsonValue:
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("o wire JSON exige chaves string")
+        return {
+            key: _copy_exact_json_wire(nested_value)
+            for key, nested_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_copy_exact_json_wire(item) for item in value]
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    raise ValueError("o wire bruto não contém JSON estrito")
+
+
+def validate_exact_json_model(
+    model_type: type[_ExactModelT],
+    value: object,
+) -> _ExactModelT:
+    """Exige o wire JSON completo, estrito e idêntico ao modelo canônico."""
+    if not isinstance(value, Mapping):
+        raise ValueError("o wire bruto deve ser um objeto JSON")
+    raw_wire = _copy_exact_json_wire(value)
+    raw_encoded = json.dumps(
+        raw_wire,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    validated = model_type.model_validate_json(raw_encoded, strict=True)
+    canonical = validated.model_dump(mode="json")
+    if raw_encoded != json.dumps(
+        canonical,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ):
+        raise ValueError("o wire bruto diverge do modelo canônico")
+    return validated
+
+
+def validate_exact_read_artifact(
+    tool_name: str,
+    value: object,
+) -> ToolArtifact:
+    """Valida o artifact bruto pela classe exata da read tool selecionada."""
+    artifact_model = _READ_TOOL_ARTIFACT_MODELS.get(tool_name)
+    if artifact_model is None:
+        raise ValueError("read tool não possui modelo de artifact")
+    artifact = validate_exact_json_model(artifact_model, value)
+    if artifact.tool_name != tool_name:
+        raise ValueError("artifact bruto diverge da read tool")
+    return artifact
 
 
 class FrozenStateModel(StrictModel):
@@ -372,6 +433,16 @@ class PersistedToolOutcome(FrozenStateModel):
             forbidden_segment_patterns=_TECHNICAL_FORBIDDEN_SEGMENT_PATTERNS,
         )
 
+    @model_validator(mode="after")
+    def _reject_unsafe_degraded_partial_data(self) -> PersistedToolOutcome:
+        if (
+            self.mode is not None
+            and self.mode is not ResponseMode.COMPLETE
+            and self.partial_data is not None
+        ):
+            assert_safe_partial_json(self.partial_data.to_python())
+        return self
+
 
 class PersistedToolArtifact(FrozenStateModel):
     tool_name: str = Field(min_length=1, pattern=r"^\S+$")
@@ -391,7 +462,8 @@ class PersistedToolArtifact(FrozenStateModel):
     ) -> object:
         if isinstance(value, cls):
             return value
-        if isinstance(value, ToolArtifact):
+        trusted_tool_object = isinstance(value, ToolArtifact)
+        if trusted_tool_object:
             artifact_wire = value.model_dump(mode="python")
         elif isinstance(value, Mapping):
             artifact_wire = dict(value)
@@ -405,6 +477,10 @@ class PersistedToolArtifact(FrozenStateModel):
         )
         if artifact_model is None:
             return artifact_wire
+        _capture_public_argument_object(
+            artifact_wire.get("arguments"),
+            info.mode,
+        )
         typed_value = artifact_wire.get("typed_artifact")
         if typed_value is None:
             candidate = {
@@ -414,7 +490,11 @@ class PersistedToolArtifact(FrozenStateModel):
             }
         else:
             candidate = _snapshot_domain_value(typed_value, info.mode)
-        typed_artifact = artifact_model.model_validate(candidate)
+        typed_artifact = (
+            artifact_model.model_validate(candidate)
+            if trusted_tool_object and typed_value is None
+            else validate_exact_read_artifact(tool_name, candidate)
+        )
         canonical = typed_artifact.model_dump(mode="json")
         outcome = canonical["outcome"]
         projected_outcome = PersistedToolOutcome.model_validate(

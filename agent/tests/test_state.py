@@ -9,6 +9,7 @@ from tractian_agent.contracts import (
     ApiError,
     ApiErrorCategory,
     Identity,
+    ResponseMode,
     SupportRequest,
     ToolCall,
 )
@@ -894,9 +895,7 @@ def test_tool_observation_round_trips_json_safe_next_turn_content():
         )
 
 
-@pytest.mark.parametrize(
-    ("tool_name", "artifact_type", "outcome_type", "arguments", "resource"),
-    [
+_READ_ARTIFACT_CASES = [
         (
             "get_asset",
             AssetToolArtifact,
@@ -967,7 +966,12 @@ def test_tool_observation_round_trips_json_safe_next_turn_content():
             {"document_id": "kb_bearing_guidance"},
             "/knowledge/kb_bearing_guidance",
         ),
-    ],
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "artifact_type", "outcome_type", "arguments", "resource"),
+    _READ_ARTIFACT_CASES,
 )
 def test_tool_observation_rehydrates_exact_read_artifact_after_json_round_trip(
     tool_name,
@@ -1002,6 +1006,80 @@ def test_tool_observation_rehydrates_exact_read_artifact_after_json_round_trip(
     assert restored_artifact.model_dump(mode="json") == artifact.model_dump(
         mode="json"
     )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "artifact_type", "outcome_type", "arguments", "resource"),
+    _READ_ARTIFACT_CASES,
+)
+@pytest.mark.parametrize(
+    "unsafe_partial_data",
+    [
+        {"outer": {"identity": {"user_id": "usr_leaked"}}},
+        {"outer": {"headers": {"authorization": "leaked"}}},
+        {"outer": {"raw_response": {"body": "leaked"}}},
+    ],
+    ids=["identity", "headers", "raw-response"],
+)
+def test_degraded_read_artifact_rejects_unsafe_partial_data_before_checkpoint(
+    tool_name,
+    artifact_type,
+    outcome_type,
+    arguments,
+    resource,
+    unsafe_partial_data,
+):
+    artifact = artifact_type(
+        tool_name=tool_name,
+        arguments=arguments,
+        source=ToolSource(kind="industrial_api", resource=resource),
+        outcome=outcome_type(
+            mode=ResponseMode.PARTIAL,
+            notes="Resposta parcial.",
+            partial_data=unsafe_partial_data,
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="campo proibido"):
+        ToolObservation(
+            request_id="req_01",
+            call_id=f"call_{tool_name}",
+            content={
+                "mode": "partial",
+                "notes": "Resposta parcial.",
+                "partial_data": unsafe_partial_data,
+            },
+            artifact=artifact,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "artifact_type", "outcome_type", "arguments", "resource"),
+    _READ_ARTIFACT_CASES,
+)
+def test_raw_read_artifact_rejects_coerced_types_before_projection(
+    tool_name,
+    artifact_type,
+    outcome_type,
+    arguments,
+    resource,
+):
+    wire = artifact_type(
+        tool_name=tool_name,
+        arguments=arguments,
+        source=ToolSource(kind="industrial_api", resource=resource),
+        outcome=outcome_type(
+            error=ApiError(
+                category=ApiErrorCategory.TIMEOUT,
+                code="READ_TIMEOUT",
+                message="A consulta excedeu o tempo limite.",
+            )
+        ),
+    ).model_dump(mode="json")
+    wire["omitted_items"] = "0"
+
+    with pytest.raises(ValidationError):
+        PersistedToolArtifact.model_validate(wire)
 
 
 @pytest.mark.parametrize(
@@ -1133,11 +1211,11 @@ def test_persisted_argument_objects_keep_nested_mapping_and_round_trip():
     }
     call = PersistedToolCall(
         call_id="call_01",
-        name="get_asset",
+        name="custom_nested_tool",
         arguments=arguments,
     )
     artifact = PersistedToolArtifact(
-        tool_name="get_asset",
+        tool_name="custom_nested_tool",
         arguments=arguments,
         source={"kind": "industrial_api", "resource": "/assets/asset_G501"},
         outcome={},

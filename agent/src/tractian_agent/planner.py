@@ -61,6 +61,7 @@ from tractian_agent.tools.identifiers import (
     ModelId,
     PointId,
 )
+from tractian_agent.tools.observations import ToolArtifact, assert_safe_partial_json
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.tools.knowledge import (
     DegradedKnowledgeDocumentContent,
@@ -1477,6 +1478,8 @@ def _read_observation_is_semantically_valid(
             )
         if outcome.mode is None:
             return False
+        if outcome.partial_data is not None:
+            assert_safe_partial_json(outcome.partial_data)
         if not _bounded_model_content_is_empty(artifact):
             return False
         if not _degraded_content_matches_artifact(

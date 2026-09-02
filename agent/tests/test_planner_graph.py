@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+import json
 from typing import Any
 
 import httpx
 import pytest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.outputs import ChatResult
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool
@@ -30,14 +31,22 @@ from tractian_agent.state import (
     ResumeAnchor,
     ThreadScope,
 )
-from tractian_agent.tools.assets import AssetToolArtifact
+from tractian_agent.tools.assets import AssetToolArtifact, execute_get_asset
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
+from tractian_agent.write_contracts import (
+    IntentStatus,
+    ReprocessIntentScope,
+    WriteIntent,
+)
 from tractian_agent.write_policy import (
     ApprovalSource,
     EscalateCaseProposal,
+    PolicyDecision,
+    PolicyReason,
     ReprocessProposal,
     RequestModelRetrainingProposal,
     RequestSpecialistAnalysisProposal,
+    WritePolicyResult,
     UpdateAssetCriticalityProposal,
     TrustedActionApproval,
 )
@@ -235,6 +244,117 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
     ]
 
 
+def test_planner_rejects_coerced_rotation_in_raw_read_artifact(
+    tmp_path,
+    monkeypatch,
+):
+    model = _ScriptedPlannerModel(
+        selector_responses=(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_asset",
+                        "args": {"asset_id": "asset_G501"},
+                        "id": "call_coerced_rotation",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        )
+    )
+
+    async def scenario():
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(
+                    200,
+                    json={
+                        "mode": "complete",
+                        "notes": None,
+                        "data": _asset_payload(),
+                    },
+                )
+            ),
+        )
+        runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read"}),
+            central_asset_id="asset_G501",
+            client=client,
+        )
+        result = await execute_get_asset("asset_G501", runtime)
+        raw_artifact = result.artifact.model_dump(mode="json")
+        raw_artifact["outcome"]["asset"]["technical_configuration"][
+            "rotation_rpm"
+        ] = "1780.0"
+
+        class CoercedReadToolNode:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def ainvoke(self, *args, **kwargs):
+                return {
+                    "messages": [
+                        ToolMessage(
+                            content=json.dumps(
+                                result.content.model_dump(mode="json")
+                            ),
+                            artifact=raw_artifact,
+                            name="get_asset",
+                            tool_call_id="call_coerced_rotation",
+                            status="success",
+                        )
+                    ]
+                }
+
+        monkeypatch.setattr(
+            "tractian_agent.graph.ToolNode",
+            CoercedReadToolNode,
+        )
+        request = _request()
+        state = AgentState(
+            request=request,
+            identity=runtime.identity,
+            permissions=runtime.permissions,
+            request_id="req_coerced_rotation",
+            thread_id="thread_coerced_rotation",
+            execution_id="exec_coerced_rotation",
+            thread_scope=ThreadScope(
+                thread_id="thread_coerced_rotation",
+                case_id=request.case_id,
+                company_id=runtime.identity.company_id,
+                user_id=runtime.identity.user_id,
+            ),
+            step_limit=20,
+        )
+        config = {"configurable": {"thread_id": state.thread_id}}
+        try:
+            async with open_checkpointer(
+                tmp_path / "coerced-rotation.sqlite3"
+            ) as saver:
+                graph = build_agent_graph(saver, planner=Planner(model))
+                await graph.ainvoke(
+                    state.model_dump(mode="json"),
+                    config,
+                    context=runtime,
+                    durability="sync",
+                )
+                return AgentState.model_validate(
+                    (await graph.aget_state(config)).values
+                )
+        finally:
+            await client.aclose()
+
+    state = asyncio.run(scenario())
+
+    assert state.tool_observations == ()
+    assert state.planner_failure is not None
+    assert state.planner_failure.code == "invalid_tool_result"
+
+
 @pytest.mark.parametrize(
     ("tool_name", "arguments", "permission", "message", "expected"),
     [
@@ -387,6 +507,130 @@ def test_each_planner_proposal_runs_through_tool_node_without_effect(
     checkpoint_text = repr(snapshot.values)
     assert "ToolMessage" not in checkpoint_text
     assert "effect_executed" not in checkpoint_text
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing-content-status",
+        "missing-artifact-kind",
+        "missing-effect-executed",
+        "coerced-effect-executed",
+    ],
+)
+def test_planner_rejects_noncanonical_raw_proposal_wire(
+    tmp_path,
+    monkeypatch,
+    malformation,
+):
+    arguments = {
+        "criticality": "critical",
+        "justification": "O impacto operacional exige prioridade máxima.",
+    }
+    proposal = {
+        "action": "update_asset_criticality",
+        **arguments,
+    }
+    content = {"status": "proposed", "proposal": proposal}
+    artifact = {
+        "kind": "write_proposal",
+        "tool_name": "propose_update_asset_criticality",
+        "proposal": proposal,
+        "effect_executed": False,
+    }
+    if malformation == "missing-content-status":
+        content.pop("status")
+    elif malformation == "missing-artifact-kind":
+        artifact.pop("kind")
+    elif malformation == "missing-effect-executed":
+        artifact.pop("effect_executed")
+    else:
+        artifact["effect_executed"] = 0
+
+    class MalformedToolNode:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ainvoke(self, *args, **kwargs):
+            return {
+                "messages": [
+                    ToolMessage(
+                        content=json.dumps(content),
+                        artifact=artifact,
+                        name="propose_update_asset_criticality",
+                        tool_call_id="call_noncanonical_proposal",
+                        status="success",
+                    )
+                ]
+            }
+
+    monkeypatch.setattr("tractian_agent.graph.ToolNode", MalformedToolNode)
+    model = _ScriptedPlannerModel(
+        selector_responses=(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "propose_update_asset_criticality",
+                        "args": arguments,
+                        "id": "call_noncanonical_proposal",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        )
+    )
+
+    async def scenario():
+        client = IndustrialApiClient("https://industrial.test")
+        runtime = WriteToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"action_high"}),
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            client=client,
+        )
+        request = _request(message="Atualize a criticidade do ativo central.")
+        state = AgentState(
+            request=request,
+            identity=runtime.identity,
+            permissions=runtime.permissions,
+            request_id=f"req_noncanonical_{malformation}",
+            thread_id=f"thread_noncanonical_{malformation}",
+            execution_id="exec_noncanonical_proposal",
+            thread_scope=ThreadScope(
+                thread_id=f"thread_noncanonical_{malformation}",
+                case_id=request.case_id,
+                company_id=runtime.identity.company_id,
+                user_id=runtime.identity.user_id,
+            ),
+            step_limit=20,
+        )
+        config = {"configurable": {"thread_id": state.thread_id}}
+        try:
+            async with open_checkpointer(
+                tmp_path / f"noncanonical-{malformation}.sqlite3"
+            ) as saver:
+                graph = build_agent_graph(saver, planner=Planner(model))
+                await graph.ainvoke(
+                    state.model_dump(mode="json"),
+                    config,
+                    context=runtime,
+                    durability="sync",
+                )
+                return AgentState.model_validate(
+                    (await graph.aget_state(config)).values
+                )
+        finally:
+            await client.aclose()
+
+    state = asyncio.run(scenario())
+
+    assert state.pending_proposal is None
+    assert state.planner_failure is not None
+    assert state.planner_failure.stage == "planner_tool"
+    assert state.planner_failure.code == "invalid_tool_result"
 
 
 @pytest.mark.parametrize(
@@ -596,6 +840,87 @@ def test_planner_generated_proposal_uses_policy_and_executes_once(tmp_path):
     assert completed.intents[0].status.value == "completed"
     assert replayed == completed
     assert len(requests) == 1
+
+
+def test_write_policy_never_creates_a_second_intent_for_request_id(tmp_path):
+    request = _request(message="Atualize a criticidade do ativo central.")
+    existing_intent = WriteIntent(
+        intent_id="intent_existing_request",
+        request_id="req_duplicate_intent",
+        scope=ReprocessIntentScope(
+            action="reprocess_analysis",
+            case_id=request.case_id,
+            company_id=request.identity.company_id,
+            user_id=request.identity.user_id,
+            analysis_id="an_historical",
+            justification="Intenção terminal já registrada para esta solicitação.",
+        ),
+        payload_hash="sha256:v1:" + "b" * 64,
+        decision=WritePolicyResult(
+            decision=PolicyDecision.DENY,
+            reason=PolicyReason.MISSING_PERMISSION,
+        ),
+        status=IntentStatus.DENIED,
+    )
+
+    def forbidden_http(_: httpx.Request) -> httpx.Response:
+        raise AssertionError("request_id duplicada não pode alcançar HTTP")
+
+    async def scenario():
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(forbidden_http),
+        )
+        runtime = WriteToolRuntime.create(
+            user_id=request.identity.user_id,
+            company_id=request.identity.company_id,
+            permissions=frozenset({"read"}),
+            central_asset_id=request.asset_id,
+            current_case_id=request.case_id,
+            client=client,
+        )
+        state = AgentState(
+            request=request,
+            identity=runtime.identity,
+            permissions=runtime.permissions,
+            request_id="req_duplicate_intent",
+            thread_id="thread_duplicate_intent",
+            execution_id="exec_duplicate_intent",
+            thread_scope=ThreadScope(
+                thread_id="thread_duplicate_intent",
+                case_id=request.case_id,
+                company_id=request.identity.company_id,
+                user_id=request.identity.user_id,
+            ),
+            step_limit=5,
+            pending_proposal=UpdateAssetCriticalityProposal(
+                criticality="critical",
+                justification="O impacto operacional exige criticidade máxima.",
+            ),
+            intents=(existing_intent,),
+        )
+        config = {"configurable": {"thread_id": state.thread_id}}
+        try:
+            async with open_checkpointer(
+                tmp_path / "duplicate-intent.sqlite3"
+            ) as saver:
+                graph = build_agent_graph(saver)
+                with pytest.raises(ValueError, match="request_id já possui intenção"):
+                    await graph.ainvoke(
+                        state.model_dump(mode="json"),
+                        config,
+                        context=runtime,
+                        durability="sync",
+                    )
+                return await graph.aget_state(config)
+        finally:
+            await client.aclose()
+
+    snapshot = asyncio.run(scenario())
+    restored = AgentState.model_validate(snapshot.values)
+
+    assert len(restored.intents) == 1
+    assert restored.intents[0] == existing_intent
 
 
 def test_policy_requires_confirmation_when_proposal_exceeds_original_approval(

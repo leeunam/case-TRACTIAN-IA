@@ -46,6 +46,8 @@ from tractian_agent.state import (
     ReviewRecord,
     ReviewStatus,
     ToolObservation,
+    validate_exact_json_model,
+    validate_exact_read_artifact,
 )
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.tools.writes import (
@@ -651,8 +653,14 @@ async def _planner_tool(
         parsed_content = json.loads(message.content)
 
         if call.name in _PROPOSAL_ACTION_BY_TOOL:
-            content = WriteProposalContent.model_validate(parsed_content)
-            artifact = WriteProposalArtifact.model_validate(message.artifact)
+            content = validate_exact_json_model(
+                WriteProposalContent,
+                parsed_content,
+            )
+            artifact = validate_exact_json_model(
+                WriteProposalArtifact,
+                message.artifact,
+            )
             if artifact.tool_name != call.name or not _proposal_matches_call(
                 call.arguments.to_python(),
                 content,
@@ -675,7 +683,8 @@ async def _planner_tool(
                 )
             return _checkpoint_update(updated)
 
-        artifact = PersistedToolArtifact.model_validate(message.artifact)
+        raw_artifact = validate_exact_read_artifact(call.name, message.artifact)
+        artifact = PersistedToolArtifact.model_validate(raw_artifact)
         observation = ToolObservation(
             request_id=advanced.request_id,
             call_id=call.call_id,
@@ -780,6 +789,8 @@ def _write_policy(
     context = runtime.context
     if not isinstance(context, WriteToolRuntime):
         raise TypeError("runtime de escrita é obrigatório para avaliar ação")
+    if any(intent.request_id == state.request_id for intent in state.intents):
+        raise ValueError("request_id já possui intenção persistida")
     advanced = _replace_state(
         state.advance_step(),
         resume_anchor=ResumeAnchor.WRITE_POLICY,
