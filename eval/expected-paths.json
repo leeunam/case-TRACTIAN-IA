@@ -10,6 +10,10 @@
         "note": "config, sensor_status=offline"
       },
       {
+        "step": "GET /assets/asset_G501/analyses?status=inconclusive",
+        "note": "envelope mode=inconclusive; lista omitida por dados insuficientes"
+      },
+      {
         "step": "GET /assets/asset_G501/baseline",
         "note": "state=learning"
       },
@@ -22,8 +26,8 @@
         "note": "mode=unavailable"
       },
       {
-        "step": "POST /cases/case_tkt_inv_04/escalate",
-        "note": "escalar para humano"
+        "step": "GET /models/mdl_vib_v3",
+        "note": "gearbox suportado somente por detecção sintomática; sem baseline aprendível"
       }
     ]
   },
@@ -48,53 +52,81 @@
       {
         "step": "GET /models/mdl_vib_v3",
         "note": "processing_state=delayed"
+      },
+      {
+        "step": "GET /assets/asset_C710/data-quality",
+        "note": "completeness e snr atendem aos requisitos"
       }
     ]
   },
   {
     "id": "case_tkt_inv_06",
     "ticket_id": "TKT-INV-06",
-    "root_question": "O insight é falso positivo?",
+    "root_question": "As evidências disponíveis permitem concluir se o insight é falso positivo?",
     "mode": "conflict",
     "expected_path": [
       {
+        "step": "GET /assets/asset_S420/analyses",
+        "note": "descobrir an_9903 e an_9904; fontes em conflito"
+      },
+      {
         "step": "GET /analyses/an_9903",
-        "note": "imbalance, baseline_state_at_detection=invalidated"
+        "note": "imbalance sobre baseline_state_at_detection=invalidated; falso positivo não provado"
       },
       {
         "step": "GET /assets/asset_S420/baseline",
-        "note": "state=invalidated"
+        "note": "state=invalidated após manutenção; referência antiga"
       },
       {
         "step": "GET /assets/asset_S420/spectrum",
-        "note": "1x baixo não sustenta desbalanceamento"
+        "note": "pico de 1x e sub-harmônico sustentam hipóteses conflitantes"
       },
       {
         "step": "GET /analyses/an_9904",
-        "note": "conflito: especialista diz looseness"
+        "note": "especialista também usa baseline invalidated e indica looseness; conflito permanece"
+      },
+      {
+        "step": "GET /models/mdl_vib_v3",
+        "note": "versão e limitações do modelo"
       }
     ]
   },
   {
     "id": "case_tkt_inv_07",
     "ticket_id": "TKT-INV-07",
-    "root_question": "É falha elétrica ou mecânica?",
+    "root_question": "As evidências disponíveis permitem distinguir falha elétrica de mecânica?",
     "mode": "partial",
     "expected_path": [
       {
         "step": "GET /assets/asset_M605/rms",
-        "note": "salto abrupto"
+        "note": "série aproximadamente estável; máximo 2,158 abaixo do alarm_threshold 2,7 não corrobora o salto relatado"
       },
       {
         "step": "GET /assets/asset_M605/spectrum",
-        "note": "mode=partial, 2x f-linha?"
+        "note": "mode=partial; bands_missing inclui 120-140 Hz (2x f-linha)"
+      },
+      {
+        "step": "GET /assets/asset_M605/analyses",
+        "note": "descobrir an_9910 sem adivinhar ID"
+      },
+      {
+        "step": "GET /analyses/an_9910",
+        "note": "status=inconclusive; evidência agregada RMS=2,7 diverge do máximo da série e limitações incluem band_2x_line_missing"
+      },
+      {
+        "step": "GET /assets/asset_M605",
+        "note": "line_frequency_hz=60; banda elétrica esperada em 120 Hz"
+      },
+      {
+        "step": "GET /knowledge/search?q=falhas elétricas",
+        "note": "kb_guid_003; orientação sem concluir diante do conflito e do espectro parcial"
       }
     ]
   },
   {
     "id": "case_tkt_inv_08",
     "ticket_id": "TKT-INV-08",
-    "root_question": "Qual diagnóstico prevalece?",
+    "root_question": "Qual diagnóstico é mais sustentado pelas evidências disponíveis?",
     "mode": "conflict",
     "expected_path": [
       {
@@ -103,62 +135,78 @@
       },
       {
         "step": "GET /analyses/an_9907",
-        "note": "misalignment"
+        "note": "misalignment, confidence 0,69, baseline established"
       },
       {
         "step": "GET /analyses/an_9908",
-        "note": "looseness (especialista)"
+        "note": "looseness especialista, confidence 0,71, baseline established"
+      },
+      {
+        "step": "GET /assets/asset_M205/baseline",
+        "note": "state=established"
       },
       {
         "step": "GET /assets/asset_M205/spectrum",
-        "note": "subharmônicos sustentam looseness"
+        "note": "picos de 2x e 0,5x sustentam hipóteses diferentes; conflito permanece"
       }
     ]
   },
   {
     "id": "case_tkt_inv_09",
     "ticket_id": "TKT-INV-09",
-    "root_question": "A análise está stale por baseline invalidated?",
+    "root_question": "Por que a análise continua stale após a manutenção e qual é o próximo passo seguro?",
     "mode": "stale",
     "expected_path": [
       {
+        "step": "GET /assets/asset_B204/analyses?status=stale",
+        "note": "descobrir an_9906 sem adivinhar ID"
+      },
+      {
         "step": "GET /analyses/an_9906",
-        "note": "status=stale"
+        "note": "status=stale e created_at anterior à manutenção"
       },
       {
         "step": "GET /assets/asset_B204/baseline",
-        "note": "state=invalidated"
+        "note": "state=invalidated por maintenance_intervention"
       },
       {
-        "step": "POST /analyses/an_9906/reprocess",
-        "note": "justificativa: rolamento trocado, baseline invalidated"
+        "step": "GET /assets/asset_B204/rms",
+        "note": "RMS caiu e está abaixo da referência histórica pós-intervenção; orientar reprocesso sem executar escrita"
       }
     ]
   },
   {
     "id": "case_tkt_inv_10",
     "ticket_id": "TKT-INV-10",
-    "root_question": "A confiança é mal-calibrada frente à qualidade?",
+    "root_question": "A confiança declarada está suficientemente sustentada pela qualidade disponível neste caso?",
     "mode": "partial",
     "expected_path": [
       {
+        "step": "GET /assets/asset_V301/analyses",
+        "note": "descobrir an_9909 sem adivinhar ID"
+      },
+      {
         "step": "GET /analyses/an_9909",
-        "note": "confidence alta + low_signal_quality"
+        "note": "confidence alta + low_signal_quality; um caso não prova calibração estatística"
       },
       {
         "step": "GET /assets/asset_V301/data-quality",
-        "note": "completeness/snr baixo"
+        "note": "completeness/snr abaixo dos requisitos"
       },
       {
         "step": "GET /models/mdl_vib_v3",
-        "note": "min_snr_db=12, abaixo do medido"
+        "note": "min_snr_db=12 e min_completeness=0,8, acima dos valores medidos"
+      },
+      {
+        "step": "GET /assets/asset_V301/baseline",
+        "note": "state=established; baixa qualidade limita a sustentação"
       }
     ]
   },
   {
     "id": "case_tkt_inv_11",
     "ticket_id": "TKT-INV-11",
-    "root_question": "O modelo cobre e aprende baseline para motor DC?",
+    "root_question": "O modelo cobre motor DC, consegue aprender baseline e há histórico suficiente para avaliar seu desempenho?",
     "mode": "partial",
     "expected_path": [
       {
@@ -168,6 +216,14 @@
       {
         "step": "GET /assets/asset_M102/baseline",
         "note": "learnable=false, state=learning"
+      },
+      {
+        "step": "GET /assets/asset_M102",
+        "note": "config confirma tipo motor_dc e rotação"
+      },
+      {
+        "step": "GET /assets/asset_M102/analyses?seed=complete",
+        "note": "lista vazia; não há histórico de erros recorrentes"
       }
     ]
   },
@@ -178,12 +234,20 @@
     "mode": "partial",
     "expected_path": [
       {
+        "step": "GET /assets/asset_M208/analyses",
+        "note": "descobrir an_9905 sem adivinhar ID"
+      },
+      {
         "step": "GET /analyses/an_9905",
         "note": "detection_mode=symptom"
       },
       {
         "step": "GET /assets/asset_M208/baseline",
         "note": "state=learning, detection_mode=symptom"
+      },
+      {
+        "step": "GET /assets/asset_M208/spectrum",
+        "note": "assinatura de choque/atrito sustenta detecção sintomática"
       },
       {
         "step": "GET /knowledge/search?q=lubrificação",
@@ -198,35 +262,59 @@
     "mode": "stale",
     "expected_path": [
       {
+        "step": "GET /assets/asset_B204/analyses?status=stale",
+        "note": "descobrir an_9906 sem adivinhar ID"
+      },
+      {
         "step": "GET /analyses/an_9906",
-        "note": "stale"
+        "note": "stale; detectada com baseline established antes da manutenção"
       },
       {
         "step": "GET /assets/asset_B204/baseline",
-        "note": "invalidated"
+        "note": "agora invalidated por maintenance_intervention"
+      },
+      {
+        "step": "GET /assets/asset_B204/rms",
+        "note": "queda pós-intervenção para abaixo da referência histórica sustenta justificativa"
       },
       {
         "step": "POST /analyses/an_9906/reprocess",
-        "note": "justificativa válida -> accepted"
+        "note": "justificativa válida -> accepted; replay é validado em teste de componente"
       }
     ]
   },
   {
     "id": "case_tkt_exe_16",
     "ticket_id": "TKT-EXE-16",
-    "root_question": "Escalar para humano.",
+    "root_question": "Escalar para humano com evidência e justificativa.",
     "mode": "unavailable",
     "expected_path": [
       {
+        "step": "GET /assets/asset_G501/analyses",
+        "note": "envelope mode=inconclusive; lista omitida por dados insuficientes"
+      },
+      {
+        "step": "GET /assets/asset_G501/baseline",
+        "note": "state=learning e learnable=false"
+      },
+      {
+        "step": "GET /assets/asset_G501/data-quality",
+        "note": "gap e staleness"
+      },
+      {
+        "step": "GET /assets/asset_G501/rms",
+        "note": "unavailable"
+      },
+      {
         "step": "POST /cases/case_tkt_exe_16/escalate",
-        "note": "justificativa: dados ausentes + baseline learning + quebra"
+        "note": "justificativa: pedido explícito de campo + consulta de análises inconclusiva + gap + RMS unavailable"
       }
     ]
   },
   {
     "id": "case_tkt_ctx_01",
     "ticket_id": "TKT-CTX-01",
-    "root_question": "Recuperar o procedimento aplicável ao ativo e falha.",
+    "root_question": "Recuperar o procedimento aplicável ao ativo e explicitar os detalhes ausentes.",
     "mode": "partial",
     "expected_path": [
       {
@@ -239,18 +327,18 @@
       },
       {
         "step": "GET /knowledge/kb_proc_001",
-        "note": "passos + nota baseline invalidated"
+        "note": "passos gerais; não informa folga nem torque exato e remete ao catálogo"
       },
       {
         "step": "GET /assets/asset_M101/baseline",
-        "note": "contexto de invalidação pós-troca"
+        "note": "estado atual established; uma troca futura exigirá invalidar e reaprender"
       }
     ]
   },
   {
     "id": "case_tkt_ctx_02",
     "ticket_id": "TKT-CTX-02",
-    "root_question": "Definir termo via glossário e relacionar ao espectro do ativo.",
+    "root_question": "Definir BPFO e distinguir presença da frequência de evidência suficiente de falha atual.",
     "mode": "partial",
     "expected_path": [
       {
@@ -263,18 +351,26 @@
       },
       {
         "step": "GET /assets/asset_B204/spectrum",
-        "note": "pico em BPFO?"
+        "note": "pico em 107,4 Hz com amplitude 0,5, sem aumento sobre a referência 0,5"
       },
       {
         "step": "GET /assets/asset_B204/analyses",
-        "note": "análise usa BPFO como evidência?"
+        "note": "descobrir an_9906 sem adivinhar ID"
+      },
+      {
+        "step": "GET /analyses/an_9906",
+        "note": "BPFO 1,1, status stale e baseline_state_at_detection=established"
+      },
+      {
+        "step": "GET /assets/asset_B204/baseline",
+        "note": "state=invalidated em data posterior à análise"
       }
     ]
   },
   {
     "id": "case_tkt_ctx_03",
     "ticket_id": "TKT-CTX-03",
-    "root_question": "Explicar que o limiar deriva do baseline aprendido, não de norma fixa.",
+    "root_question": "Explicar o limiar derivado do baseline e verificar se a série disponível corrobora o alarme relatado.",
     "mode": "partial",
     "expected_path": [
       {
@@ -283,15 +379,15 @@
       },
       {
         "step": "GET /assets/asset_V301/baseline",
-        "note": "features reference+tolerance"
+        "note": "reference 3,2 + tolerance 1,4 = 4,6"
       },
       {
         "step": "GET /assets/asset_V301/rms",
-        "note": "alarm_threshold derivado"
+        "note": "alarm_threshold 4,6; máximo 4,079 e amostra mais recente 3,036 não corroboram alarme"
       },
       {
         "step": "GET /assets/asset_V301/data-quality",
-        "note": "qualidade afeta confiança no limiar"
+        "note": "qualidade baixa limita confiança na série"
       }
     ]
   },
@@ -314,52 +410,52 @@
         "note": "established (desvio real)"
       },
       {
+        "step": "GET /assets/asset_C710/rms",
+        "note": "série ultrapassa alarm_threshold e sustenta a justificativa"
+      },
+      {
         "step": "POST /analyses/an_9902/request-specialist",
-        "note": "justificativa: delayed+pending+desvio -> accepted"
+        "note": "justificativa: pending + desvio observado -> accepted"
       }
     ]
   },
   {
     "id": "case_tkt_exe_14",
     "ticket_id": "TKT-EXE-14",
-    "root_question": "Alterar configuração técnica (criticidade) de forma justificada.",
+    "root_question": "Solicitar a atualização de criticidade com justificativa e validar somente o recibo da ação.",
     "mode": "complete",
     "expected_path": [
       {
         "step": "GET /assets/asset_V301",
-        "note": "criticidade atual=high"
+        "note": "criticidade atual=high e configuração técnica"
       },
       {
         "step": "PATCH /assets/asset_V301",
-        "note": "justificativa + changes criticality=medium -> accepted"
-      },
-      {
-        "step": "GET /assets/asset_V301",
-        "note": "validar"
+        "note": "justificativa + changes criticality=medium; ActionResult accepted sem mutação do Parquet"
       }
     ]
   },
   {
     "id": "case_tkt_exe_15",
     "ticket_id": "TKT-EXE-15",
-    "root_question": "Solicitar retreinamento com justificativa baseada em evidência de erro sistemático.",
+    "root_question": "Há evidência sistemática suficiente para justificar uma solicitação de retreinamento?",
     "mode": "conflict",
     "expected_path": [
       {
-        "step": "GET /analyses/an_9903",
-        "note": "falso positivo: imbalance sobre baseline invalidated"
+        "step": "GET /assets/asset_S420/analyses",
+        "note": "descobrir an_9903/an_9904; conflito isolado"
       },
       {
-        "step": "GET /assets/asset_S420/analyses",
-        "note": "conflito com an_9904 (looseness)"
+        "step": "GET /analyses/an_9903",
+        "note": "imbalance sobre baseline invalidated; resultado frágil, não falso positivo comprovado"
+      },
+      {
+        "step": "GET /analyses/an_9904",
+        "note": "outra hipótese, looseness, também sob baseline invalidated"
       },
       {
         "step": "GET /models/mdl_vib_v3",
-        "note": "versão/cobertura"
-      },
-      {
-        "step": "POST /models/mdl_vib_v3/request-retraining",
-        "note": "justificativa: erro sistemático em spindle -> accepted"
+        "note": "versão e cobertura; dataset sem histórico sistemático suficiente, portanto não executar POST"
       }
     ]
   }

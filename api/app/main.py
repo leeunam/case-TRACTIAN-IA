@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 
 from . import store
@@ -21,7 +22,7 @@ from .idempotency import (
     canonical_payload_hash,
     get_idempotency_store,
 )
-from .models import ActionResult, Error
+from .models import ActionResult, AssetConfigUpdate, Error
 from .prob import Mode, envelope, resolve_mode
 
 app = FastAPI(
@@ -62,6 +63,20 @@ def require_permission(permission: str):
     return _dep
 
 
+def _require_company_scope(user: dict[str, Any], company_id: str) -> None:
+    """Bloqueia ação sobre recurso de outra empresa, mesmo com permissão global."""
+    if user.get("company_id") != company_id:
+        raise HTTPException(403, "Recurso fora do contexto de empresa do usuário.")
+
+
+def _require_asset_scope(user: dict[str, Any], asset_id: str) -> dict[str, Any]:
+    asset = store.get_asset(asset_id)
+    if not asset:
+        raise HTTPException(404, "Ativo não encontrado.")
+    _require_company_scope(user, asset["company_id"])
+    return asset
+
+
 def _seed(seed: str | None = Query(default=None, description="Semente para comportamento probabilístico")) -> str | None:
     return seed
 
@@ -83,8 +98,9 @@ def _mode_for(resource: str, category: str, seed: str | None) -> Mode:
 def _apply_mode(payload: dict[str, Any], mode: Mode, category: str) -> tuple[dict[str, Any], str | None]:
     """Degradou o payload conforme o modo. Retorna (data, notes).
 
-    Conhecimento e empresa são fontes estáveis: degradam só para `partial` (trunca o body)
-    e nunca somem por inteiro, para não confundir buscas que têm match real.
+    Conhecimento, empresa e listagem de ativos são fontes estáveis: o payload é
+    preservado nos modos degradados e a limitação aparece em ``notes`` ou na flag
+    de conflito, para não apagar um match real.
     """
     stable = category in ("knowledge", "company", "assets")
 
@@ -167,18 +183,29 @@ def get_asset(asset_id: str, seed: str | None = Depends(_seed)):
     return envelope(data, mode, notes)
 
 
-@app.patch("/assets/{asset_id}", tags=["Ativos"])
+@app.patch(
+    "/assets/{asset_id}",
+    tags=["Ativos"],
+    response_model=ActionResult,
+    responses={
+        400: {"model": Error, "description": "Parâmetros de alteração inválidos."},
+        401: {"model": Error, "description": "Contexto de usuário ausente ou inválido."},
+        403: {"model": Error, "description": "Sem permissão ou recurso fora da empresa."},
+        404: {"model": Error, "description": "Ativo não encontrado."},
+    },
+)
 def update_asset_config(
     asset_id: str,
-    body: dict[str, Any],
+    body: AssetConfigUpdate,
     user: dict[str, Any] = Depends(require_permission("action_high")),
 ):
-    if not store.get_asset(asset_id):
-        raise HTTPException(404, "Ativo não encontrado.")
-    _require_justification(body)
+    _require_asset_scope(user, asset_id)
     return ActionResult(
         action_id=f"act_{uuid.uuid4().hex[:8]}",
-        message=f"Configuração do ativo {asset_id} atualizada por {user['name']}.",
+        message=(
+            f"Solicitação de atualização do ativo {asset_id} aceita para "
+            f"{user['name']}."
+        ),
     ).model_dump()
 
 
@@ -208,6 +235,7 @@ def get_analysis(analysis_id: str, seed: str | None = Depends(_seed)):
 @app.post(
     "/analyses/{analysis_id}/reprocess",
     tags=["Análises"],
+    response_model=ActionResult,
     responses={
         400: {
             "model": Error,
@@ -287,6 +315,15 @@ def get_analysis(analysis_id: str, seed: str | None = Depends(_seed)):
                 }
             },
         },
+        401: {
+            "model": Error,
+            "description": "Contexto de usuário ausente ou inválido.",
+        },
+        403: {
+            "model": Error,
+            "description": "Sem permissão ou recurso fora da empresa.",
+        },
+        404: {"model": Error, "description": "Análise não encontrada."},
     },
 )
 def reprocess_analysis(
@@ -310,6 +347,7 @@ def reprocess_analysis(
     analysis = store.get_analysis(analysis_id)
     if not analysis:
         raise HTTPException(404, "Análise não encontrada.")
+    _require_asset_scope(user, analysis["asset_id"])
     _require_justification(body)
     payload_hash = canonical_payload_hash(body)
     reservation = idempotency_store.reserve(
@@ -390,7 +428,17 @@ def reprocess_analysis(
     return response_body
 
 
-@app.post("/analyses/{analysis_id}/request-specialist", tags=["Análises"])
+@app.post(
+    "/analyses/{analysis_id}/request-specialist",
+    tags=["Análises"],
+    response_model=ActionResult,
+    responses={
+        400: {"model": Error, "description": "Justificativa inválida."},
+        401: {"model": Error, "description": "Contexto de usuário inválido."},
+        403: {"model": Error, "description": "Sem permissão ou fora da empresa."},
+        404: {"model": Error, "description": "Análise não encontrada."},
+    },
+)
 def request_specialist_analysis(
     analysis_id: str,
     body: dict[str, Any],
@@ -399,6 +447,7 @@ def request_specialist_analysis(
     analysis = store.get_analysis(analysis_id)
     if not analysis:
         raise HTTPException(404, "Análise não encontrada.")
+    _require_asset_scope(user, analysis["asset_id"])
     _require_justification(body)
     return ActionResult(
         action_id=f"act_{uuid.uuid4().hex[:8]}",
@@ -498,7 +547,17 @@ def get_model(model_id: str, seed: str | None = Depends(_seed)):
     return envelope(data, mode, notes)
 
 
-@app.post("/models/{model_id}/request-retraining", tags=["Modelos"])
+@app.post(
+    "/models/{model_id}/request-retraining",
+    tags=["Modelos"],
+    response_model=ActionResult,
+    responses={
+        400: {"model": Error, "description": "Justificativa inválida."},
+        401: {"model": Error, "description": "Contexto de usuário inválido."},
+        403: {"model": Error, "description": "Sem permissão action_high."},
+        404: {"model": Error, "description": "Modelo não encontrado."},
+    },
+)
 def request_retraining(
     model_id: str,
     body: dict[str, Any],
@@ -537,7 +596,17 @@ def get_knowledge_doc(doc_id: str, seed: str | None = Depends(_seed)):
 # ---------------------------------------------------------------------------
 # Ações / Escalonamento
 # ---------------------------------------------------------------------------
-@app.post("/cases/{case_id}/escalate", tags=["Ações"])
+@app.post(
+    "/cases/{case_id}/escalate",
+    tags=["Ações"],
+    response_model=ActionResult,
+    responses={
+        400: {"model": Error, "description": "Justificativa inválida."},
+        401: {"model": Error, "description": "Contexto de usuário inválido."},
+        403: {"model": Error, "description": "Sem permissão ou fora da empresa."},
+        404: {"model": Error, "description": "Caso não encontrado."},
+    },
+)
 def escalate_case(
     case_id: str,
     body: dict[str, Any],
@@ -546,10 +615,14 @@ def escalate_case(
     case = store.get_case(case_id)
     if not case:
         raise HTTPException(404, "Caso não encontrado.")
+    _require_company_scope(user, case["company_id"])
     _require_justification(body)
     return ActionResult(
         action_id=f"act_{uuid.uuid4().hex[:8]}",
-        message=f"Caso {case_id} escalado para análise humana por {user['name']}.",
+        message=(
+            f"Solicitação de escalonamento do caso {case_id} aceita para "
+            f"{user['name']}."
+        ),
     ).model_dump()
 
 
@@ -602,6 +675,14 @@ async def _request_validation_handler(
                 "message": "Header Idempotency-Key ausente ou inválido.",
             },
         )
+    if request.method == "PATCH" and request.url.path.startswith("/assets/"):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "VALIDATION_ERROR",
+                "message": "Parâmetros de alteração inválidos.",
+            },
+        )
     return await request_validation_exception_handler(request, exc)
 
 
@@ -620,3 +701,21 @@ def _err_code(status: int) -> str:
     return {400: "VALIDATION_ERROR", 401: "UNAUTHORIZED", 403: "FORBIDDEN", 404: "NOT_FOUND"}.get(
         status, "ERROR"
     )
+
+
+def _openapi_schema() -> dict[str, Any]:
+    """Mantém o Swagger coerente com o handler que converte o PATCH inválido em 400."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema["paths"]["/assets/{asset_id}"]["patch"]["responses"].pop("422", None)
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _openapi_schema

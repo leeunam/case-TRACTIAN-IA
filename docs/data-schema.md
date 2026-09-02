@@ -1,12 +1,17 @@
 # Schema de dados (parquet)
 
 Dados sintéticos que populam a API. Tudo anonimizado, sem PII. Formato **parquet** (didático,
-compacto, leitura fácil com pandas/duckdb). Os arquivos ficam em `data/` e são carregados pela
-implementação da API (fase posterior). `seed.json` controla o comportamento probabilístico.
+compacto, leitura fácil com pandas/duckdb). Os arquivos ficam em `data/`; a API carrega apenas a
+allowlist de tabelas operacionais. `cases.parquet`, que contém o gabarito, fica fora do runtime, e
+os chamados entram somente pelo pacote sanitizado `agent-input/cases.json`. `seed.json` controla os
+modos de variação das respostas.
 
-Os dados são **coerentes entre si** e **cosenzados com os chamados**: cada chamado tem um ativo
-cujos dados de fato sustentam a pergunta raiz (ex.: o ativo que "quebrou sem aviso" tem janela de
-dados ausente antes da quebra e modelo sem cobertura para baixa rotação).
+Os dados foram desenhados para contextualizar os chamados, inclusive com observações conflitantes
+ou incompletas. M-605 não possui a banda necessária para concluir falha elétrica, e S-420 combina
+baseline invalidated com hipóteses espectrais divergentes; esses casos exigem incerteza, não uma
+conclusão categórica. Nos demais casos, o ativo reúne dados relacionados à pergunta raiz (ex.: o
+ativo que "quebrou sem aviso" tem uma janela ausente antes da quebra e um modelo sem cobertura
+para baixa rotação).
 
 ## Tabelas
 
@@ -21,7 +26,7 @@ dados ausente antes da quebra e modelo sem cobertura para baixa rotação).
 ### `users.parquet`
 | coluna        | tipo    | descrição                                          |
 | :------------ | :------ | :------------------------------------------------- |
-| id            | string  | `usr_001`                                          |
+| id            | string  | `usr_ana`                                          |
 | name          | string  | Ana Mantovani                                      |
 | role          | string  | operator/mechanic/reliability_analyst/...          |
 | permissions   | string  | JSON array (`["read","action_high","escalate"]`)   |
@@ -37,8 +42,8 @@ dados ausente antes da quebra e modelo sem cobertura para baixa rotação).
 | plant             | string  | Planta 1                                                        |
 | line              | string  | Linha de forjamento                                             |
 | parent_asset_id   | string  | nullable; hierarquia                                            |
-| machine_type      | string  | motor_induction/motor_dc/pump/compressor/gearbox/fan/spindle/conveyor |
-| rotation_rpm      | double  | 1780                                                            |
+| machine_type      | string  | compressor/fan/gearbox/mill/motor_dc/motor_induction/pump/spindle    |
+| rotation_rpm      | int64   | 1780                                                            |
 | bearing_pn        | string  | NU 310 (nullable)                                               |
 | bpfo_hz           | double  | frequência de defeito externo (nullable)                        |
 | bpfi_hz           | double  | interno (nullable)                                              |
@@ -105,7 +110,7 @@ dados ausente antes da quebra e modelo sem cobertura para baixa rotação).
 | point_id        | string | FK                                                |
 | collected_at    | string | ISO datetime                                      |
 | peaks           | string | JSON array de {freq_hz, amplitude_mm_s, note?}    |
-| bands_missing   | string | JSON array (vazio em modo complete)               |
+| bands_missing   | string | JSON array de bandas ausentes na medição; independente do modo do envelope |
 
 ### `data_quality.parquet`
 | coluna             | tipo    | descrição                              |
@@ -151,16 +156,16 @@ dados ausente antes da quebra e modelo sem cobertura para baixa rotação).
 | asset_id        | string  | FK (ativo central; nullable p/ chamados só de conhecimento) |
 | message         | string  | texto do cliente                                       |
 | root_question   | string  | pergunta raiz do analista                              |
-| mode            | string  | comportamento esperado do cenário (complete/partial/...)|
+| mode            | string  | rótulo esperado: cinco modos do envelope ou `pending`/`stale`, derivados do status do cenário |
 | expected_path   | string  | JSON array de passos (referência p/ cenários)          |
 
-## `seed.json` (comportamento probabilístico)
-Controla, por `asset_id`/`point_id` ou por chamado, qual `mode` cada GET retorna.
-Exemplo:
+## `seed.json` (modos de resposta)
+
+Controla overrides por recurso e categoria e os pesos usados pelo hash determinístico. Este é o
+conteúdo vigente:
 
 ```json
 {
-  "default": "complete",
   "overrides": {
     "asset_G501": {
       "analyses": "inconclusive",
@@ -169,13 +174,22 @@ Exemplo:
       "baseline": "partial"
     },
     "asset_C710": {
-      "analyses": "pending"
+      "rms": "complete"
     },
     "asset_S420": {
       "analyses": "conflict"
     },
     "asset_M208": {
       "analyses": "partial"
+    },
+    "asset_M605": {
+      "spectrum": "partial"
+    },
+    "asset_V301": {
+      "data_quality": "partial"
+    },
+    "asset_M205": {
+      "analyses": "conflict"
     }
   },
   "distribution": {
@@ -185,19 +199,24 @@ Exemplo:
 }
 ```
 
-Sem `seed` no query param, o servidor amostra por `distribution`. Com `seed=<x>`, o servidor deriva
-o modo deterministicamente (hash do seed + recurso) — reprodutível para a Parte 2 (avaliação).
+Sem `seed`, o servidor deriva um modo estável de `noseed + recurso + categoria` e dos pesos de
+`distribution`; ele não sorteia de novo a cada chamada. Uma semente comum (`seed=<x>`) troca
+`noseed` pelo valor informado e continua determinística. Duas sentinelas são exceções:
+`seed=complete` força o envelope completo e `seed=degraded` força o parcial. Os overrides fixos
+vencem qualquer seed. O modo altera o envelope ou omite campos definidos pela API, mas não cria
+outra linha, outro diagnóstico ou outra medição.
 
 ## Mapeamento chamado → dados (sanity check)
 
 | Ticket   | Ativo     | Por que os dados sustentam a pergunta raiz                                     |
 | :------- | :-------- | :------------------------------------------------------------------------------ |
-| INV-04   | G-501     | `rms` com gap antes da quebra; `baselines.state = learning` (histórico insuficiente) ou `invalidated`; `models` sem cobertura p/ baixa rotação; `analyses` inconclusive |
+| INV-04   | G-501     | `rms` indisponível e dados com gap; `baselines.state = learning`; gearbox tem suporte apenas sintomático (`can_learn_baseline=false`); `analyses` inconclusive |
 | INV-05   | C-710     | `rms` com tendência de subida; `baselines.state = established` mas `models.processing_state = delayed`; `analyses.status = pending` |
-| INV-06   | S-420     | `baselines.state = invalidated` (manutenção recente não reaprendida) → desvio sobre ref velha = falso positivo; `analyses` automática vs. especializada em conflito |
-| INV-08   | M-205     | duas `analyses` conflitantes em fontes diferentes                               |
-| INV-09   | B-204     | `analyses.created_at` antigo; `baselines.state = invalidated`; `data_quality.staleness_flag = true` |
+| INV-06   | S-420     | `baselines.state = invalidated` torna a referência antiga; ambas as análises ocorreram após essa invalidação e os picos espectrais sustentam hipóteses divergentes, sem provar falso positivo |
+| INV-07   | M-605     | série RMS aproximadamente estável (`max=2,158 < alarm_threshold=2,7`) não corrobora o salto relatado; `an_9910` registra RMS 2,7 e diverge da série; espectro parcial omite a banda elétrica de 2x f-linha |
+| INV-08   | M-205     | em 240 rpm, o pico de 8 Hz representa 2× e sustenta `misalignment`; o de 2 Hz representa 0,5× e sustenta `looseness`, preservando o conflito |
+| INV-09   | B-204     | a análise foi criada com `baseline_state_at_detection=established`, antes da manutenção, e ficou `stale`; o baseline atual está `invalidated`, a série pós-intervenção caiu abaixo da referência histórica e `data_quality.staleness_flag = false` |
 | INV-10   | V-301     | `data_quality` baixo + `analyses.confidence` alta (tensão)                     |
 | INV-11   | M-102     | `models.coverage` suporta tipo mas `can_learn_baseline=false` p/ motor DC       |
 | INV-11b  | M-208     | `baselines.state = learning` (ativo novo) mas `analyses.detection_mode = symptom` (lubrificação) válida |
-| EXE-12   | B-204     | pós-intervenção: `rms` caiu mas `analyses` stale e `baselines.invalidated` → gatilho de reprocesso/reaprendizado |
+| EXE-12   | B-204     | pós-intervenção: `rms` caiu, a análise anterior ficou stale e o baseline passou a invalidated → gatilho de reprocesso/reaprendizado |

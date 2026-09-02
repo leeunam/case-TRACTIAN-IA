@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner LLM opt-in e checkpointer SQLite de desenvolvimento. Após a correção do adapter Groq em 02/09/2026, `make test` passou com 59 testes da API e 1.445 do agente (1.504 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 6 estão concluídas. O grafo atual não é um agente de produção: writer, resposta gerada ao cliente, ledger completo, gate de liberação, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner LLM opt-in e checkpointer SQLite de desenvolvimento. Em 02/09/2026, `make test` passou com 99 testes da API e 1.445 do agente (1.544 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 6 estão concluídas. O grafo atual não é um agente de produção: writer, resposta gerada ao cliente, ledger completo, gate de liberação, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -59,6 +59,8 @@ Há dois armazenamentos SQLite independentes no desenvolvimento. A API usa `IDEM
 - Registros vencidos são removidos sob demanda depois de 7 dias; a mesma chave, após esse prazo, inicia uma nova execução. O horário de criação identifica cada geração e impede que um trabalho antigo altere a reserva nova.
 - Se a resposta se perde depois do commit, o retry recupera a resposta persistida sem repetir a ação.
 - Especialista, criticidade, retreinamento e escalonamento não usam chave nem retry automático: têm no máximo um despacho. Em retomada de uma intenção `prepared` por outro `execution_id`, terminam conservadoramente em `uncertain/0` sem tocar a rede. Isso pode produzir falso incerto e `attempts` pode subcontar um crash pós-efeito; o lock por `thread_id` é local ao processo/event loop e o preflight do especialista é opaco.
+- A API aplica uma segunda barreira de empresa nas ações ligadas a ativo, análise e chamado. Os cinco endpoints de ação retornam recibos sem reescrever os fixtures; o PATCH aceita somente o formulário técnico documentado e falha fechado para campos, tipos ou valores inválidos.
+- O processo da API abre somente uma allowlist de Parquets operacionais e lê chamados do pacote público sanitizado em `agent-input/`. O `data/cases.parquet`, o gabarito em `eval/` e os cenários de teste não entram no runtime.
 
 ### Modelos
 
@@ -208,9 +210,7 @@ Prompt curto recomendado:
 - Existe um grafo LangGraph com planner LLM opt-in, fluxos de escrita determinísticos e checkpointer. Ele ainda não possui writer, resposta gerada ao cliente, ledger completo, gate de segurança de liberação, Logfire nem runner Pydantic Evals; portanto não é um agente de produção.
 - As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
 - O simulador não representa todas as garantias transacionais de produção.
-- O OpenAPI repete `/assets/{assetId}` em blocos separados; alguns parsers podem perder uma operação.
-- Contrato e resposta atual de `Asset` não têm exatamente a mesma estrutura.
-- Os cenários M-605 e S-420 possuem divergências entre descrição e dados; isso deve gerar incerteza, não adaptação silenciosa do gabarito.
+- As rotas de ação do simulador devolvem recibos, mas não alteram os recursos Parquet; um novo GET não comprova a mutação solicitada.
 
 ## Autor
 

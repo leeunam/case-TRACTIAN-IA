@@ -24,7 +24,7 @@ from tractian_agent.planner import (
     PlannerStopReason,
     PlannerTerminalDecision,
 )
-from tractian_agent.state import AgentDecision, AgentState
+from tractian_agent.state import AgentDecision
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.write_policy import PolicyDecision, PolicyReason
 

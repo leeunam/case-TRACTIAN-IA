@@ -93,7 +93,7 @@
     "company_id": "comp_forja_br",
     "user_id": "usr_ana",
     "asset_id": "asset_M101",
-    "message": "Qual o procedimento pra trocar o rolamento do motor principal da forja? Tem alguma orientação de间隙 e torque?"
+    "message": "Qual o procedimento pra trocar o rolamento do motor principal da forja? Tem alguma orientação de folga e torque?"
   },
   {
     "id": "case_tkt_ctx_02",
@@ -131,7 +131,7 @@
     "id": "case_tkt_exe_15",
     "ticket_id": "TKT-EXE-15",
     "company_id": "comp_acme",
-    "user_id": "usr_carla",
+    "user_id": "usr_beatriz",
     "asset_id": "asset_S420",
     "message": "Esse insight nunca acerta pro spindle de alta rotação. Treina de novo com os dados daqui."
   }

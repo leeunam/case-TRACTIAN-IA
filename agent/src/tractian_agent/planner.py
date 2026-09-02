@@ -469,7 +469,6 @@ def _complete_content_matches_artifact(
     content: object,
     artifact: ToolArtifact,
 ) -> bool:
-    outcome = artifact.outcome
     if tool_name == "get_asset" and isinstance(artifact, AssetToolArtifact):
         asset = artifact.outcome.asset
         if asset is None or not _asset_artifact_is_concrete(artifact):

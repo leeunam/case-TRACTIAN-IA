@@ -57,7 +57,7 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 - Criar `api/app/idempotency.py` com `sqlite3`, separado do armazenamento Parquet e sem ORM.
 - Usar `IDEMPOTENCY_DB_PATH`; na ausência da variável, gravar em `.run/idempotency.sqlite3`. Testes usam um arquivo temporário isolado. SQLite continua sendo a opção de desenvolvimento; PostgreSQL permanece a evolução futura.
 - Manter registros por 7 dias desde a primeira solicitação e remover vencidos sob demanda, dentro de uma nova operação.
-- Aceitar chaves de 1 a 255 caracteres sem espaços e diferenciar maiúsculas de minúsculas. A futura camada de execução de escritas, não a pessoa usuária nem o LLM, gera e persiste antes da chamada uma chave no formato `tractian-agent:<uuid>`; o cliente HTTP apenas a valida e propaga.
+- Aceitar chaves de 1 a 255 caracteres sem espaços e diferenciar maiúsculas de minúsculas. A camada de execução de escritas, não a pessoa usuária nem o LLM, gera e persiste antes da chamada uma chave no formato `tractian-agent:<uuid>`; o cliente HTTP apenas a valida e propaga.
 - Tratar a chave como protocolo, não como credencial. Autenticação e permissão protegem a ação; no simulador, `x-user-id` continua sendo apenas uma aproximação da identidade de produção.
 - Identificar unicamente o pedido por pessoa autenticada, método, endpoint completo e chave idempotente, com restrição `UNIQUE` no SQLite sobre essa combinação.
 - Calcular `payload_hash` como `sha256:v1:<digest>` sobre JSON canônico com chaves ordenadas, sem alterar valores nem persistir o payload original.
@@ -93,7 +93,7 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 - Separar consultas envelopadas de respostas JSON diretas. Em `mode=complete`, validar `data` pelo modelo solicitado; em `partial`, `inconclusive`, `conflict` ou `unavailable`, preservar `mode`, `notes` e o JSON degradado sem fingir que o recurso completo existe.
 - Classificar erros como `api`, `server`, `timeout`, `transport` ou `invalid_response`, preservando status e códigos fornecidos pela API quando o payload é válido.
 - Usar timeouts configuráveis de 2 s para conexão, 10 s para leitura, 5 s para escrita e 2 s para obtenção de conexão do pool.
-- Não fazer retry nem decidir se um erro é repetível dentro do cliente. A criação e a persistência da chave pertencem à intenção de escrita e ao estado das fases posteriores; o cliente valida o protocolo e apenas propaga a chave recebida.
+- Não fazer retry nem decidir se um erro é repetível dentro do cliente. A criação e a persistência da chave pertencem à intenção de escrita e ao estado persistido do grafo; o cliente valida o protocolo e apenas propaga a chave recebida.
 - Recusar URLs externas antes de enviar identidade e não seguir redirects automaticamente.
 - Testar o transporte somente com `httpx.MockTransport`, sem servidor, porta, espera real ou chamada de modelo.
 
@@ -112,13 +112,13 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decisões implementadas:**
 
-- Expor tools LangChain reais por intenção de consulta, sem uma tool genérica que aceite URL, método ou caminho. O catálogo inicial terá `get_asset`, `list_asset_analyses`, `get_analysis`, `get_baseline`, `get_rms_series`, `get_spectrum`, `get_data_quality`, `get_model`, `search_knowledge` e `get_knowledge_document`.
+- Expor tools LangChain reais por intenção de consulta, sem uma tool genérica que aceite URL, método ou caminho. O catálogo inicial tem `get_asset`, `list_asset_analyses`, `get_analysis`, `get_baseline`, `get_rms_series`, `get_spectrum`, `get_data_quality`, `get_model`, `search_knowledge` e `get_knowledge_document`.
 - Manter cada adapter LangChain fino: nome, descrição, schema público, contexto injetado e conversão do retorno. A operação determinística em Python valida escopo e significado, chama o `IndustrialApiClient` e normaliza a observação; ela não recria transporte nem autorização da API.
 - Obter identidade, empresa, permissões, ativo central, cliente HTTP, `seed` de avaliação e modelo industrial configurado por contexto confiável. Esses dados não fazem parte dos argumentos visíveis ao modelo. `get_current_user` é uma consulta interna da fronteira de entrada, não uma tool do LLM.
 - Usar argumentos Pydantic específicos e restritos. IDs aceitam somente o prefixo e os caracteres esperados; filtros usam valores fechados. Paths, método, headers e modelo de resposta ficam fixos em código.
 - Aplicar menor acesso antes da chamada: consultas de ativo ficam limitadas ao ativo central; respostas completas também confirmam empresa e relação com o recurso pai antes de serem expostas. Conhecimento é global no escopo atual, e o modelo consultado é o configurado no runtime.
 - Retornar conteúdo JSON compacto e normalizado para o modelo e um artifact JSON serializável para código, trace, ledger e avaliações futuras. O artifact não contém headers, identidade, cliente ou resposta HTTP bruta. Qualquer redução declara `truncated=true` e a quantidade omitida; não há truncamento silencioso.
-- Não executar retry dentro das tools. Cada tentativa e cada falha permanecem explícitas para a futura política do LangGraph.
+- Não executar retry dentro das tools. Cada tentativa e cada falha permanecem explícitas para a política determinística do LangGraph.
 - Preservar `mode`, `notes` e todo `ApiError`; validação inválida impede HTTP e exceção inesperada de programação não é convertida em sucesso.
 - Construir em fatias verticais `RED → GREEN`, começando por `get_asset`, e testar contrato público, escopo, chamada fixa, modos, erros, conteúdo/artifact e integração mínima com `ToolNode` sem criar ainda o agente completo.
 - Para baseline, RMS, espectro e qualidade, expor somente `asset_id` e `point_id` opcional; identidade, permissões, ativo central, cliente e seed continuam exclusivamente no `ReadToolRuntime`.
@@ -175,13 +175,18 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decidir:** schema do estado, política de retenção, relação entre `request_id`, `thread_id` e execução e primeira fronteira de entrada do agente (função, CLI ou endpoint HTTP).
 
-**Decisões implementadas:**
+**Decisões implementadas na Fase 5 (registro histórico anterior à integração do
+planner na Fase 6):**
 
 - `thread_id` identifica a linha persistida e pode receber novos `request_id`; toda invocação ou retomada usa novo `execution_id`. Caso, empresa, pessoa usuária ou alvo confiável divergentes falham fechados. O estado tipado mantém somente valores JSON-safe e observáveis, incluindo mensagens, chamadas, evidências, proposta, decisão, intenções, passos, resultado e revisão.
 - A fronteira é a função Python assíncrona `invoke_agent`, que exige runtime autenticado e `thread_id`. Runtime, cliente, credenciais, seed, golden set, resposta HTTP bruta e raciocínio não são checkpointados.
 - O desenvolvimento usa `AsyncSqliteSaver` em `.run/agent-checkpoints.sqlite3`, serializer restrito e ciclo de vida fechado. Não há expiração ou remoção automática de threads; `adelete_thread(thread_id)` é explícito. Isso é distinto do SQLite idempotente da API e do TTL de sete dias da chave de reprocesso. PostgreSQL continua futuro.
 - Criação e retomada que podem escrever usam `durability="sync"`; `prepare_intent` e `execute_action` ocupam supersteps distintos. `interrupt()` estruturado e `Command` pelo ID retomam uma confirmação sem efeito anterior.
-- O grafo é determinístico e sem LLM: leitura percorre `ingest → route → finish`, e escritas passam por política, confirmação quando aplicável, preparação persistida e execução. Locks por `thread_id` são locais ao processo/event loop; não há lease distribuído.
+- Ao encerrar a Fase 5, o grafo era determinístico e sem LLM: leitura percorria
+  `ingest → route → finish`, e escritas passavam por política, confirmação quando
+  aplicável, preparação persistida e execução. A Fase 6 integrou depois o planner
+  opt-in sem retirar as fronteiras determinísticas de escrita. Locks por
+  `thread_id` continuam locais ao processo/event loop; não há lease distribuído.
 
 **Evidência final de aceite (30/08/2026):** a suíte focada de estado, checkpoint, entrada, reprocesso e ações não idempotentes passou com **389 testes**; `uv lock --check` resolveu 47 pacotes; `make test` passou com **59 testes da API + 1.053 do agente = 1.112 testes**, mantendo somente o `PendingDeprecationWarning` conhecido. A Task 6 provou SQLite temporário real, fechamento/reabertura do saver, `prepared` antes do HTTP, replay de recibo e ausência de segundo efeito; a Task 7, revisada sem achados Critical/Important, provou que a retomada de uma ação não idempotente por novo `execution_id` não toca a rede.
 
@@ -190,7 +195,10 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 - [x] Configurar checkpointer SQLite.
 - [x] Testar persistência e retomada após reinício.
 
-**Aceite verificado:** uma execução interrompida retoma seu estado persistido sem repetir uma ação confirmada; o grafo não implementa planner, writer, ledger completo, gate de liberação, Logfire nem avaliação.
+**Aceite verificado naquela fase:** uma execução interrompida retomava seu estado
+persistido sem repetir uma ação confirmada. Planner ainda não existia nesse
+marco e foi integrado na Fase 6; writer, ledger completo, gate de liberação,
+Logfire e avaliação continuam ausentes.
 
 ## Fase 6 — provider e planner
 
@@ -279,6 +287,23 @@ mede estabilidade nem fundamenta a escolha de modelo por desempenho.
 **Aceite verificado:** trocar o adapter não altera estado, tools ou regras de
 segurança; a prova de independência usa providers falsos, e o smoke ao vivo
 pós-correção aprovou os dois modelos Groq candidatos pelo mesmo contrato.
+
+**Auditoria de prontidão para push (02/09/2026):** os sete documentos Markdown
+não têm links locais quebrados; a superfície dos 18 pares método/caminho FastAPI
+coincide com a do OpenAPI após normalizar os nomes internos dos parâmetros de
+path, sem chave de rota duplicada. O formulário e as respostas do PATCH também
+coincidem com o Swagger dinâmico; operation IDs e nomes camelCase do contrato
+estático não são tratados como equivalência textual com os nomes Python. Os 15
+artefatos de dados regeneram de forma determinística, e `agent-input/cases.json`
+permanece sem campos do golden set.
+O runtime abre somente a allowlist operacional e o pacote público de chamados;
+um teste espiona os acessos e prova que o golden set não é lido. O gabarito passou
+a preservar incerteza em S-420/M-605, separar investigação de escrita e tratar as
+cinco ações do simulador como recibos sem mutação dos fixtures. Datas de análise e
+invalidação de baseline, harmônicos do M-205, isolamento por empresa e schema
+estrito do PATCH também têm regressões. Ruff e os dois locks passaram; `make test`
+confirmou 99 testes da API e 1.445 do agente (1.544 no total), mantendo somente o
+warning conhecido de `python_multipart`.
 
 ## Fase 7 — ledger de evidências
 
@@ -394,7 +419,11 @@ pós-correção aprovou os dois modelos Groq candidatos pelo mesmo contrato.
 
 **Aceite:** outra pessoa consegue reproduzir o experimento seguindo apenas o repositório.
 
-## Plano SDD — concluir as Fases 5 e 4
+## Registro histórico do plano SDD — Fases 5 e 4
+
+Esta seção preserva o plano executado e suas evidências. Afirmações sobre o
+grafo sem LLM descrevem o estado anterior à Fase 6 e não substituem o estado
+atual registrado na seção da Fase 6 acima.
 
 **Especificação vinculante:** `AGENTS.md`, as Fases 4 e 5 deste arquivo, as etapas 6, 8 e 10 do `LEARNING-GUIDE.md` e a decisão aprovada de persistir intenções somente no estado/checkpointer do LangGraph.
 
@@ -412,7 +441,9 @@ pós-correção aprovou os dois modelos Groq candidatos pelo mesmo contrato.
 - Propostas LangChain não produzem efeito. Somente o nó determinístico de execução, depois de `allow` e do checkpoint, recebe acesso à operação HTTP.
 - Não executar retry dentro de cliente, proposal tool ou operação. Preservar todo `ApiError`; `IN_PROGRESS`, `OUTCOME_UNKNOWN` e conflito de payload bloqueiam nova execução.
 - O checkpoint guarda somente valores observáveis e serializáveis. Não recebe cliente, transporte, resposta HTTP bruta, credencial, token, seed, golden set, trace de raciocínio ou arquivos restritos de avaliação.
-- O grafo desta entrega é determinístico e sem LLM. Planner, writer, ledger completo, Logfire e runner de avaliação continuam fora do escopo.
+- Naquela entrega, o grafo era determinístico e sem LLM. Planner ficou fora do
+  escopo e foi integrado posteriormente na Fase 6; writer, ledger completo,
+  Logfire e runner de avaliação continuam fora do estado atual.
 - O MVP declara processo local único por `thread_id`; não promete lease distribuído com SQLite.
 - Cada tarefa segue TDD em fatias verticais, executa testes focados e `make test`, recebe commit próprio e passa por revisão independente de especificação e qualidade.
 
@@ -647,12 +678,13 @@ globais.
 - README deve distinguir grafo determinístico/checkpointer e proposal tools reais de planner, writer, ledger, Logfire e avaliação ainda planejados.
 - Não ampliar o contrato da API com idempotência para os outros quatro endpoints nesta entrega.
 
-## Plano de implementação SDD — Fase 6
+## Registro histórico do plano de implementação SDD — Fase 6
 
-Este plano conclui somente provider e planner. Writer, resposta gerada ao
-cliente, ledger completo, porta de segurança, Logfire e avaliações permanecem
-fora do escopo. Cada tarefa segue uma fatia vertical `RED → GREEN → refactor`,
-recebe revisão independente e só avança depois de aprovada.
+Este plano executado é preservado como trilha das decisões da Fase 6. Ele
+concluiu somente provider e planner; writer, resposta gerada ao cliente, ledger
+completo, porta de segurança, Logfire e avaliações permanecem fora do escopo.
+Cada tarefa seguiu uma fatia vertical `RED → GREEN → refactor`, recebeu revisão
+independente e só avançou depois de aprovada.
 
 ### Task 9 — consolidar o provider comum e o adapter Groq
 

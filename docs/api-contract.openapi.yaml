@@ -15,15 +15,19 @@ info:
     - `unavailable` — indisponibilidade temporária
 
     O `seed` (query param) torna o comportamento determinístico para reprodutibilidade na
-    avaliação. Sem `seed`, o comportamento é amostrado por uma distribuição fixa.
+    avaliação. Sem `seed`, recurso e categoria são convertidos por hash em um modo estável usando
+    a distribuição configurada; chamadas iguais não são sorteadas novamente.
 
     ## Ações de alto impacto
     As operações de escrita (POST/PATCH de impacto) exigem **parâmetros válidos + `justification`**
-    (string ≥ 20 chars justificando a ação). Uma chamada aceita representa a execução e retorna
-    sucesso, **sem ciclo adicional de status**.
+    (string ≥ 20 chars justificando a ação). Uma chamada aceita retorna um recibo `ActionResult`,
+    **sem ciclo adicional de status**. Neste simulador, o recibo não altera os recursos Parquet e
+    não deve ser interpretado como confirmação de uma mutação consultável por GET.
 
     ## Autenticação
-    `x-user-id` header identifica a pessoa usuária (perfil/permissões) do contexto. Sem token.
+    `x-user-id` identifica a pessoa usuária nas rotas de ação e em `/users/me`; as consultas GET
+    industriais são anônimas neste simulador. Ações vinculadas a ativo/caso também exigem que o
+    recurso pertença à empresa dessa pessoa. Sem token.
   version: 0.1.0
   contact:
     name: TRACTIAN x Inteli — Challenge
@@ -33,7 +37,7 @@ servers:
 
 # ---------------------------------------------------------------------------
 # Convenções de resposta
-#   - Cada GET de consulta pode envolver o corpo em um envelope {status, data, mode, notes?}
+#   - Cada GET de consulta pode envolver o corpo em um envelope {mode, notes, data}
 #     onde `mode` ∈ complete|partial|inconclusive|conflict|unavailable reflete o comportamento.
 #   - `notes` descreve o que falta / o motivo do conflito / indisponibilidade.
 # ---------------------------------------------------------------------------
@@ -50,9 +54,31 @@ components:
     Seed:
       name: seed
       in: query
-      description: Semente para tornar o comportamento probabilístico determinístico.
+      description: "Semente para tornar o envelope determinístico. As sentinelas complete e degraded forçam, respectivamente, os modos completo e parcial; overrides fixos do cenário têm precedência."
       required: false
       schema: { type: string }
+
+  responses:
+    ValidationError:
+      description: Parâmetros ausentes ou inválidos.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Contexto de usuário ausente ou desconhecido.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Permissão insuficiente ou recurso fora da empresa da pessoa usuária.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Recurso não encontrado.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
 
   schemas:
 
@@ -74,7 +100,7 @@ components:
     User:
       type: object
       properties:
-        id: { type: string, examples: [usr_001] }
+        id: { type: string, examples: [usr_ana] }
         name: { type: string, examples: [Ana Mantovani] }
         role: { type: string, enum: [operator, mechanic, reliability_analyst, maintenance_manager, coordinator, engineer, electrician] }
         permissions:
@@ -85,18 +111,22 @@ components:
     AssetConfig:
       type: object
       description: Configuração técnica do ativo (usada em contexto de diagnóstico).
+      additionalProperties: false
+      minProperties: 1
       properties:
-        machine_type: { type: string, examples: [motor_induction, motor_dc, pump, compressor, gearbox, fan, spindle, conveyor] }
-        rotation_rpm: { type: number, examples: [1780] }
+        machine_type: { type: string, enum: [compressor, fan, gearbox, mill, motor_dc, motor_induction, pump, spindle] }
+        rotation_rpm: { type: number, exclusiveMinimum: 0, examples: [1780] }
         bearing_specs:
           type: object
+          additionalProperties: false
+          minProperties: 1
           properties:
             part_number: { type: string, examples: [NU 310] }
-            bpfo_hz: { type: number }
-            bpfi_hz: { type: number }
-            bsf_hz: { type: number }
-            ftf_hz: { type: number }
-        line_frequency_hz: { type: number, examples: [60] }
+            bpfo_hz: { type: number, minimum: 0 }
+            bpfi_hz: { type: number, minimum: 0 }
+            bsf_hz: { type: number, minimum: 0 }
+            ftf_hz: { type: number, minimum: 0 }
+        line_frequency_hz: { type: number, exclusiveMinimum: 0, examples: [60] }
 
     Baseline:
       type: object
@@ -105,13 +135,14 @@ components:
         falhas por desvio são detectadas comparando o sinal atual a este baseline). Não usa normas ISO.
         Falhas sintomáticas (ex.: lubrificação) não dependem de baseline.
       properties:
+        id: { type: string }
         asset_id: { type: string }
         point_id: { type: string }
         state: { type: string, enum: [learning, established, invalidated] }
         detection_mode: { type: string, enum: [baseline, symptom], description: "baseline = detecção por desvio; symptom = detecção sintomática (lubrificação)" }
-        established_at: { type: string, format: date-time, nullable: true }
-        invalidated_at: { type: string, format: date-time, nullable: true }
-        invalidation_reason: { type: string, nullable: true, examples: [maintenance_intervention, config_change] }
+        established_at: { type: [string, "null"], format: date-time }
+        invalidated_at: { type: [string, "null"], format: date-time }
+        invalidation_reason: { type: [string, "null"], examples: [maintenance_intervention, config_change] }
         features:
           type: array
           description: Bandas/métricas que compõem o baseline com seus valores de referência.
@@ -130,25 +161,31 @@ components:
         name: { type: string, examples: [Motor principal da forja] }
         company_id: { type: string }
         criticality: { type: string, enum: [low, medium, high, critical] }
-        hierarchy:
-          type: object
-          properties:
-            plant: { type: string }
-            line: { type: string }
-            parent_asset_id: { type: string, nullable: true }
+        plant: { type: string }
+        line: { type: string }
+        parent_asset_id: { type: [string, "null"] }
+        machine_type: { type: string, enum: [compressor, fan, gearbox, mill, motor_dc, motor_induction, pump, spindle] }
+        rotation_rpm: { type: number }
+        bearing_pn: { type: [string, "null"] }
+        bpfo_hz: { type: [number, "null"] }
+        bpfi_hz: { type: [number, "null"] }
+        bsf_hz: { type: [number, "null"] }
+        ftf_hz: { type: [number, "null"] }
+        line_frequency_hz: { type: [number, "null"] }
+        sensor_status: { type: string, enum: [online, offline, degraded] }
         points:
           type: array
           items:
             type: object
             properties:
               id: { type: string }
+              asset_id: { type: string }
               location: { type: string, examples: [DE, NDE, axial] }
               sensor_status: { type: string, enum: [online, offline, degraded] }
-        config: { $ref: '#/components/schemas/AssetConfig' }
 
     Analysis:
       type: object
-      description: Diagnóstico automático (insight) do modelo.
+      description: Diagnóstico (insight) produzido por modelo ou especialista.
       properties:
         id: { type: string, examples: [an_9901] }
         asset_id: { type: string }
@@ -165,7 +202,7 @@ components:
             properties:
               metric: { type: string, examples: [bpfo_amplitude] }
               value: { type: number }
-              reference: { type: number, nullable: true, description: "Valor de referência do baseline (null p/ detecção sintomática)" }
+              reference: { type: [number, "null"], description: "Valor de referência do baseline (null p/ detecção sintomática)" }
               note: { type: string }
         limitations:
           type: array
@@ -180,9 +217,9 @@ components:
         asset_id: { type: string }
         point_id: { type: string }
         unit: { type: string, examples: [mm/s] }
-        baseline_reference: { type: number, nullable: true, description: "RMS de referência do baseline aprendido (mm/s); null se baseline em learning ou falha sintomática" }
+        baseline_reference: { type: [number, "null"], description: "RMS de referência do baseline aprendido (mm/s); null se baseline em learning ou falha sintomática" }
         baseline_state: { type: string, enum: [learning, established, invalidated, not_applicable] }
-        alarm_threshold: { type: number, nullable: true, description: "Limiar de alarme derivado do baseline (reference + tolerância)" }
+        alarm_threshold: { type: [number, "null"], description: "Limiar de alarme derivado do baseline (reference + tolerância)" }
         samples:
           type: array
           items:
@@ -197,7 +234,6 @@ components:
       properties:
         asset_id: { type: string }
         point_id: { type: string }
-        frequency_resolution_hz: { type: number }
         peaks:
           type: array
           items:
@@ -205,10 +241,11 @@ components:
             properties:
               freq_hz: { type: number }
               amplitude_mm_s: { type: number }
-              note: { type: string, nullable: true } # ex.: "1x", "BPFO", "2x line"
+              note: { type: [string, "null"] } # ex.: "1x", "BPFO", "2x line"
         bands_missing:
           type: array
-          items: { type: string } # presente apenas em modo partial
+          description: Bandas ausentes na medição; pode ser não vazio em qualquer modo do envelope.
+          items: { type: string }
         collected_at: { type: string, format: date-time }
 
     DataQuality:
@@ -234,15 +271,15 @@ components:
               machine_type: { type: string }
               supported: { type: boolean, enum: [true, false] }
               can_learn_baseline: { type: boolean, description: "Se o modelo consegue aprender baseline para este tipo (false → só detecção sintomática)" }
-              note: { type: string, nullable: true }
+              note: { type: [string, "null"] }
         requirements:
           type: object
           properties:
             min_completeness: { type: number }
             min_snr_db: { type: number }
-            min_rotation_rpm: { type: number, nullable: true }
+            min_rotation_rpm: { type: [number, "null"] }
         processing_state: { type: string, enum: [idle, running, pending, delayed, failed] }
-        last_run_at: { type: string, format: date-time, nullable: true }
+        last_run_at: { type: [string, "null"], format: date-time }
 
     KnowledgeDoc:
       type: object
@@ -255,10 +292,10 @@ components:
 
     QueryEnvelope:
       type: object
-      description: Envelope de consulta com modo probabilístico.
+      description: Envelope de consulta com modo de variação controlado.
       properties:
         mode: { type: string, enum: [complete, partial, inconclusive, conflict, unavailable] }
-        notes: { type: string, nullable: true }
+        notes: { type: [string, "null"] }
         data: {} # payload específico do endpoint
 
     ActionRequest:
@@ -268,7 +305,7 @@ components:
         justification:
           type: string
           minLength: 20
-          description: Justificativa da ação (≥ 20 caracteres).
+          description: Justificativa da ação (≥ 20 caracteres após remover espaços das extremidades).
         params:
           type: object
           description: Parâmetros específicos da ação.
@@ -276,8 +313,9 @@ components:
 
     ActionResult:
       type: object
+      required: [action_id, message]
       properties:
-        accepted: { type: boolean }
+        accepted: { type: boolean, default: true }
         action_id: { type: string }
         message: { type: string }
 
@@ -300,7 +338,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/QueryEnvelope' }
-        '404': { description: Não encontrado. }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /companies/{companyId}/assets:
     get:
@@ -314,6 +352,7 @@ paths:
           schema: { type: string }
       responses:
         '200': { description: Lista de ativos da empresa. }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /users/me:
     get:
@@ -326,6 +365,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   # ---- Ativos -----------------------------------------------------------
   /assets/{assetId}:
@@ -340,16 +380,15 @@ paths:
           schema: { type: string }
       responses:
         '200':
-          description: Ativo com config técnica e hierarquia.
+          description: Cadastro plano do ativo com configuração técnica e pontos de medição.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/QueryEnvelope' }
-
-  /assets/{assetId}:
+        '404': { $ref: '#/components/responses/NotFound' }
     patch:
       tags: [Ativos]
       operationId: updateAssetConfig
-      description: Altera criticidade/configuração técnica. Ação de impacto.
+      description: Solicita alteração de criticidade/configuração técnica. Ação de impacto.
       security: [{ UserContext: [] }]
       parameters:
         - name: assetId
@@ -361,23 +400,31 @@ paths:
         content:
           application/json:
             schema:
-              allOf:
-                - $ref: '#/components/schemas/ActionRequest'
-                - type: object
+              type: object
+              additionalProperties: false
+              required: [justification, changes]
+              properties:
+                justification:
+                  type: string
+                  minLength: 20
+                  description: Mínimo de 20 caracteres após remover espaços das extremidades.
+                changes:
+                  type: object
+                  additionalProperties: false
+                  minProperties: 1
                   properties:
-                    changes:
-                      type: object
-                      properties:
-                        criticality: { type: string, enum: [low, medium, high, critical] }
-                        config: { $ref: '#/components/schemas/AssetConfig' }
+                    criticality: { type: string, enum: [low, medium, high, critical] }
+                    config: { $ref: '#/components/schemas/AssetConfig' }
       responses:
         '200':
-          description: Configuração atualizada.
+          description: Solicitação de atualização aceita; o recurso Parquet não é alterado pelo simulador.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ActionResult' }
-        '400': { description: Justificativa ausente/inválida. }
-        '403': { description: Sem permissão (action_high). }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   # ---- Análises ---------------------------------------------------------
   /assets/{assetId}/analyses:
@@ -392,9 +439,11 @@ paths:
           schema: { type: string }
         - name: status
           in: query
-          schema: { type: string, enum: [current, stale, pending, inconclusive] }
+          description: Filtro literal; valor desconhecido resulta em lista vazia.
+          schema: { type: string }
       responses:
         '200': { description: Lista de análises do ativo. }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /analyses/{analysisId}:
     get:
@@ -412,12 +461,13 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/QueryEnvelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /analyses/{analysisId}/reprocess:
     post:
       tags: [Análises]
       operationId: reprocessAnalysis
-      description: Reprocessa análise. Ação de impacto; exige justificativa. Sucesso sem ciclo de status.
+      description: Solicita o reprocesso. Ação de impacto; exige justificativa e retorna recibo sem alterar a análise em Parquet.
       security: [{ UserContext: [] }]
       parameters:
         - name: analysisId
@@ -455,6 +505,9 @@ paths:
                   value:
                     code: VALIDATION_ERROR
                     message: Header Idempotency-Key ausente ou inválido.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: Idempotency-Key reutilizada com payload diferente ou ainda em processamento; também indica resultado anterior incerto.
           content:
@@ -487,6 +540,7 @@ paths:
                   value:
                     code: INTERNAL_ERROR
                     message: Erro interno durante o processamento.
+        '422': { description: Corpo ausente ou não representado por um objeto JSON. }
 
   /analyses/{analysisId}/request-specialist:
     post:
@@ -510,6 +564,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ActionResult' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: Corpo ausente ou não representado por um objeto JSON. }
 
   # ---- Dados técnicos ---------------------------------------------------
   /assets/{assetId}/baseline:
@@ -536,6 +595,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/QueryEnvelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /assets/{assetId}/rms:
     get:
@@ -556,6 +616,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/QueryEnvelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /assets/{assetId}/spectrum:
     get:
@@ -576,6 +637,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/QueryEnvelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /assets/{assetId}/data-quality:
     get:
@@ -587,12 +649,16 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - name: point_id
+          in: query
+          schema: { type: string }
       responses:
         '200':
           description: Qualidade/frescor dos dados.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/QueryEnvelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   # ---- Modelos ----------------------------------------------------------
   /models/{modelId}:
@@ -611,6 +677,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/QueryEnvelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /models/{modelId}/request-retraining:
     post:
@@ -634,6 +701,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ActionResult' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: Corpo ausente ou não representado por um objeto JSON. }
 
   # ---- Conhecimento -----------------------------------------------------
   /knowledge/search:
@@ -648,9 +720,11 @@ paths:
           schema: { type: string }
         - name: type
           in: query
-          schema: { type: string, enum: [procedure, glossary, guidance] }
+          description: Filtro literal; valor desconhecido resulta em lista vazia.
+          schema: { type: string }
       responses:
         '200': { description: Documentos relevantes. }
+        '422': { description: Query obrigatória `q` ausente. }
 
   /knowledge/{docId}:
     get:
@@ -664,13 +738,14 @@ paths:
           schema: { type: string }
       responses:
         '200': { description: Documento de conhecimento. }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   # ---- Ações / Escalonamento -------------------------------------------
   /cases/{caseId}/escalate:
     post:
       tags: [Ações]
       operationId: escalateCase
-      description: Encaminha o caso para análise humana. Ação de impacto; exige justificativa.
+      description: Solicita encaminhamento do caso para análise humana. Ação de impacto; exige justificativa.
       security: [{ UserContext: [] }]
       parameters:
         - name: caseId
@@ -688,6 +763,8 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ActionResult' }
-
-security:
-  - UserContext: []
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: Corpo ausente ou não representado por um objeto JSON. }

@@ -9,7 +9,34 @@ from typing import Any
 
 import pandas as pd
 
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+DATA_DIR = ROOT_DIR / "data"
+AGENT_INPUT_DIR = ROOT_DIR / "agent-input"
+
+# Allowlist explícita: ``cases.parquet`` contém o gabarito de avaliação e jamais
+# deve ser aberto pelo processo da API. Chamados entram no runtime somente pelo
+# pacote público e sanitizado em ``agent-input/cases.json``.
+RUNTIME_PARQUET_TABLES = (
+    "companies",
+    "users",
+    "assets",
+    "points",
+    "baselines",
+    "analyses",
+    "models",
+    "knowledge",
+    "rms",
+    "spectra",
+    "data_quality",
+)
+CASE_INPUT_FIELDS = (
+    "id",
+    "ticket_id",
+    "company_id",
+    "user_id",
+    "asset_id",
+    "message",
+)
 
 
 def _normalize(s: str) -> str:
@@ -24,10 +51,35 @@ def _tables() -> dict[str, pd.DataFrame]:
         raise RuntimeError(
             "Dados não encontrados em data/. Rode `python -m seed_data` (em api/) primeiro."
         )
-    tables: dict[str, pd.DataFrame] = {}
-    for p in DATA_DIR.glob("*.parquet"):
-        tables[p.stem] = pd.read_parquet(p)
-    return tables
+    return {
+        table: pd.read_parquet(DATA_DIR / f"{table}.parquet")
+        for table in RUNTIME_PARQUET_TABLES
+    }
+
+
+@lru_cache(maxsize=1)
+def _runtime_cases() -> tuple[dict[str, Any], ...]:
+    path = AGENT_INPUT_DIR / "cases.json"
+    if not path.exists():
+        raise RuntimeError(
+            "Chamados públicos não encontrados em agent-input/. Rode `make data` primeiro."
+        )
+    raw_cases = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw_cases, list):
+        raise RuntimeError("agent-input/cases.json deve conter uma lista de chamados.")
+
+    cases: list[dict[str, Any]] = []
+    for raw_case in raw_cases:
+        cases.append(_validate_runtime_case(raw_case))
+    return tuple(cases)
+
+
+def _validate_runtime_case(raw_case: Any) -> dict[str, Any]:
+    if not isinstance(raw_case, dict) or set(raw_case) != set(CASE_INPUT_FIELDS):
+        raise RuntimeError(
+            "Chamado público inválido ou contaminado em agent-input/cases.json."
+        )
+    return {field: raw_case[field] for field in CASE_INPUT_FIELDS}
 
 
 def _json_col(row: Any, col: str) -> Any:
@@ -89,7 +141,6 @@ _JSON_COLS: dict[str, tuple[str, ...]] = {
     "models": ("coverage",),
     "knowledge": ("tags",),
     "spectra": ("peaks", "bands_missing"),
-    "cases": ("expected_path",),
 }
 
 
@@ -183,7 +234,7 @@ def get_knowledge_doc(doc_id: str) -> dict[str, Any] | None:
 
 # ---- Casos ----
 def get_case(case_id: str) -> dict[str, Any] | None:
-    return _find("cases", "id", case_id)
+    return next((case.copy() for case in _runtime_cases() if case["id"] == case_id), None)
 
 
 # ---- seed.json ----

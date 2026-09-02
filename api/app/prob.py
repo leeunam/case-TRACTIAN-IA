@@ -2,7 +2,7 @@
 
 GETs de consulta podem retornar variações: complete | partial | inconclusive |
 conflict | unavailable. O modo é controlado por `seed` (determinístico) ou, sem
-seed, amostrado por uma distribuição fixa derivada de data/seed.json.
+seed, derivado de um hash estável e da distribuição fixa de data/seed.json.
 """
 from __future__ import annotations
 
@@ -63,7 +63,6 @@ def resolve_mode(
         return Mode.COMPLETE
     if seed == "degraded":
         return Mode.PARTIAL
-        return Mode(ov[category])
 
     key = f"{seed or 'noseed'}|{resource}|{category}"
     r = _hash01(key)

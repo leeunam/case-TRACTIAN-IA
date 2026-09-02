@@ -1,13 +1,14 @@
 """Testes funcionais da API — espelham os cenários de docs/test-scenarios.md.
 
-Rodam com `pytest` (a partir de api/). Usam TestClient; dados já devem estar
-gerados em ../data (rodar `python -m seed_data` antes).
+Rodam com `pytest` (a partir de api/). Usam TestClient; dados e pacote público de
+chamados já devem estar gerados (`make data`, a partir da raiz).
 """
 from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from threading import Event, Lock
 from uuid import UUID
 
@@ -15,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main as main_module
+from app import store as runtime_store
 from app.idempotency import (
     IdempotencyStore,
     ReservationResult,
@@ -22,13 +24,23 @@ from app.idempotency import (
     get_idempotency_store,
 )
 from app.main import app
+from app.models import AssetConfigUpdate
 
 client = TestClient(app)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FIXTURE_ROOTS = (
+    REPO_ROOT / "data",
+    REPO_ROOT / "agent-input",
+    REPO_ROOT / "eval",
+)
 
 H_USER_LUCAS = {"x-user-id": "usr_lucas"}      # mechanic, action_low
 H_USER_PEDRO = {"x-user-id": "usr_pedro"}      # coordinator, escalate
 H_USER_BRUNO = {"x-user-id": "usr_bruno"}      # operator, read only
 H_USER_ANA = {"x-user-id": "usr_ana"}          # maintenance_manager, action_high
+H_USER_HELENA = {"x-user-id": "usr_helena"}    # maintenance_manager, action_high
+H_USER_SOFIA = {"x-user-id": "usr_sofia"}      # reliability_analyst, action_low
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +49,17 @@ def isolated_idempotency_store(tmp_path):
     app.dependency_overrides[get_idempotency_store] = lambda: test_store
     yield test_store
     app.dependency_overrides.pop(get_idempotency_store, None)
+
+
+def _fixture_bytes() -> dict[str, bytes]:
+    """Snapshot dos fixtures; recibos de ação não podem reescrevê-los."""
+    paths = sorted(
+        path
+        for root in FIXTURE_ROOTS
+        for path in root.rglob("*")
+        if path.is_file()
+    )
+    return {str(path.relative_to(REPO_ROOT)): path.read_bytes() for path in paths}
 
 
 def test_idempotency_store_uses_environment_configuration(tmp_path, monkeypatch):
@@ -148,18 +171,79 @@ def test_users_me_ok():
     assert r.json()["role"] == "mechanic"
 
 
+def test_runtime_cases_are_sanitized_and_company_scoped(monkeypatch):
+    """O runtime abre só fixtures permitidos; golden e cruzamento de tenant falham."""
+    parquet_reads: list[Path] = []
+    text_reads: list[Path] = []
+    original_read_parquet = runtime_store.pd.read_parquet
+    original_read_text = Path.read_text
+
+    def tracked_read_parquet(path, *args, **kwargs):
+        parquet_reads.append(Path(path).resolve())
+        return original_read_parquet(path, *args, **kwargs)
+
+    def tracked_read_text(path, *args, **kwargs):
+        text_reads.append(Path(path).resolve())
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_store.pd, "read_parquet", tracked_read_parquet)
+    monkeypatch.setattr(Path, "read_text", tracked_read_text)
+    runtime_store._tables.cache_clear()
+    runtime_store._runtime_cases.cache_clear()
+
+    try:
+        tables = runtime_store._tables()
+        cases = runtime_store._runtime_cases()
+
+        expected_parquet_reads = {
+            (runtime_store.DATA_DIR / f"{table}.parquet").resolve()
+            for table in runtime_store.RUNTIME_PARQUET_TABLES
+        }
+        assert set(parquet_reads) == expected_parquet_reads
+        assert text_reads == [(runtime_store.AGENT_INPUT_DIR / "cases.json").resolve()]
+        assert (runtime_store.DATA_DIR / "cases.parquet").resolve() not in parquet_reads
+        assert "cases" not in tables
+        assert cases
+        for case in cases:
+            assert set(case) == set(runtime_store.CASE_INPUT_FIELDS)
+            assert {"root_question", "mode", "expected_path"}.isdisjoint(case)
+            assert (
+                runtime_store.get_user(case["user_id"])["company_id"]
+                == case["company_id"]
+            )
+            assert (
+                runtime_store.get_asset(case["asset_id"])["company_id"]
+                == case["company_id"]
+            )
+    finally:
+        runtime_store._tables.cache_clear()
+        runtime_store._runtime_cases.cache_clear()
+
+
+def test_runtime_rejects_case_artifact_contaminated_with_golden_fields():
+    contaminated = {
+        field: f"value-{field}" for field in runtime_store.CASE_INPUT_FIELDS
+    }
+    contaminated["expected_path"] = [{"step": "secret"}]
+
+    with pytest.raises(RuntimeError, match="contaminado"):
+        runtime_store._validate_runtime_case(contaminated)
+
+
 # ---------------------------------------------------------------------------
 # Análises
 # ---------------------------------------------------------------------------
 def test_list_analyses_by_asset():
     r = client.get("/assets/asset_M205/analyses")
     assert r.status_code == 200
-    rows = r.json()["data"].get("analyses", [])
-    # pode estar degradado por mode, mas em complete há 2 análises conflitantes
-    assert r.json()["mode"] in {"complete", "conflict", "partial", "inconclusive", "unavailable"}
+    body = r.json()
+    rows = body["data"].get("analyses", [])
+    assert body["mode"] == "conflict"
+    assert {row["id"] for row in rows} == {"an_9907", "an_9908"}
+    assert body["data"]["conflict"] is True
 
 
-def test_get_analysis_s420_falso_positivo():
+def test_get_analysis_s420_with_invalidated_baseline():
     """CEN-03: análise de desbalanceamento com baseline invalidated."""
     r = client.get("/analyses/an_9903")
     assert r.status_code == 200
@@ -211,6 +295,30 @@ def test_baseline_symptom_not_learnable():
     assert data["state"] == "learning"
 
 
+@pytest.mark.parametrize(
+    ("analysis_id", "asset_id", "expected_state", "created_after_invalidation"),
+    [
+        ("an_9904", "asset_S420", "invalidated", True),
+        ("an_9906", "asset_B204", "established", False),
+    ],
+)
+def test_baseline_state_at_detection_matches_timeline(
+    analysis_id,
+    asset_id,
+    expected_state,
+    created_after_invalidation,
+):
+    analysis = runtime_store.get_analysis(analysis_id)
+    baseline = runtime_store.get_baseline(asset_id)
+
+    assert analysis is not None
+    assert baseline is not None
+    assert analysis["baseline_state_at_detection"] == expected_state
+    analysis_created_at = datetime.fromisoformat(analysis["created_at"])
+    baseline_invalidated_at = datetime.fromisoformat(baseline["invalidated_at"])
+    assert (analysis_created_at > baseline_invalidated_at) is created_after_invalidation
+
+
 def test_rms_has_alarm_threshold_from_baseline():
     r = client.get("/assets/asset_C710/rms")
     assert r.status_code == 200
@@ -219,6 +327,68 @@ def test_rms_has_alarm_threshold_from_baseline():
     if r.json()["mode"] in {"complete", "conflict"}:
         assert data["baseline_state"] == "established"
         assert data["alarm_threshold"] is not None
+
+
+def test_m605_preserves_conflict_between_rms_series_and_analysis():
+    """CEN-05: o relato/análise não é corroborado pela série RMS disponível."""
+    rms_response = client.get("/assets/asset_M605/rms?seed=complete")
+    analysis_response = client.get("/analyses/an_9910?seed=complete")
+
+    assert rms_response.status_code == 200
+    assert analysis_response.status_code == 200
+    rms = rms_response.json()["data"]
+    analysis = analysis_response.json()["data"]
+    series_max = max(sample["value"] for sample in rms["samples"])
+    analysis_rms = next(
+        item["value"] for item in analysis["evidence"] if item["metric"] == "rms_mm_s"
+    )
+
+    assert series_max < rms["alarm_threshold"]
+    assert analysis_rms > series_max
+    assert analysis["status"] == "inconclusive"
+    assert "band_2x_line_missing" in analysis["limitations"]
+
+
+def test_v301_series_does_not_corrob_reported_alarm():
+    """CEN-13: o relato não vira fato quando todas as amostras estão abaixo do limiar."""
+    response = client.get("/assets/asset_V301/rms?seed=complete")
+
+    assert response.status_code == 200
+    rms = response.json()["data"]
+    assert max(sample["value"] for sample in rms["samples"]) < rms["alarm_threshold"]
+
+
+def test_b204_current_spectrum_does_not_confirm_stale_bpfo_evidence():
+    """CEN-12: frequência presente não confirma a amplitude stale da análise."""
+    spectrum_response = client.get("/assets/asset_B204/spectrum?seed=complete")
+    analysis_response = client.get("/analyses/an_9906?seed=complete")
+
+    assert spectrum_response.status_code == 200
+    assert analysis_response.status_code == 200
+    spectrum = spectrum_response.json()["data"]
+    analysis = analysis_response.json()["data"]
+    bpfo_peak = next(peak for peak in spectrum["peaks"] if peak["note"] == "BPFO")
+    bpfo_evidence = next(
+        item for item in analysis["evidence"] if item["metric"] == "bpfo_amplitude"
+    )
+
+    assert bpfo_peak["amplitude_mm_s"] == bpfo_evidence["reference"]
+    assert bpfo_evidence["value"] > bpfo_peak["amplitude_mm_s"]
+    assert analysis["status"] == "stale"
+
+
+def test_m205_harmonic_labels_match_asset_rotation():
+    asset = runtime_store.get_asset("asset_M205")
+    spectrum = runtime_store.get_spectrum("asset_M205")
+
+    assert asset is not None
+    assert spectrum is not None
+    rotation_hz = asset["rotation_rpm"] / 60
+    peaks_by_note = {peak["note"]: peak for peak in spectrum["peaks"]}
+    assert peaks_by_note["2x"]["freq_hz"] == pytest.approx(2 * rotation_hz)
+    assert peaks_by_note["0.5x/subharmônico (looseness)"][
+        "freq_hz"
+    ] == pytest.approx(0.5 * rotation_hz)
 
 
 def test_spectrum_has_peaks():
@@ -377,6 +547,45 @@ def test_reprocess_openapi_documents_idempotency_errors():
     }
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/analyses/{analysis_id}/reprocess",
+        "/analyses/{analysis_id}/request-specialist",
+        "/models/{model_id}/request-retraining",
+        "/cases/{case_id}/escalate",
+    ],
+)
+def test_non_patch_action_openapi_documents_common_responses(path):
+    operation = app.openapi()["paths"][path]["post"]
+
+    assert {"200", "400", "401", "403", "404", "422"}.issubset(
+        operation["responses"]
+    )
+    for status in ("400", "401", "403", "404"):
+        assert operation["responses"][status]["content"]["application/json"][
+            "schema"
+        ] == {"$ref": "#/components/schemas/Error"}
+
+
+@pytest.mark.parametrize(
+    ("path", "headers"),
+    [
+        (
+            "/analyses/an_9906/reprocess",
+            {**H_USER_LUCAS, "Idempotency-Key": "missing-body-contract"},
+        ),
+        ("/analyses/an_9902/request-specialist", H_USER_SOFIA),
+        ("/models/mdl_vib_v3/request-retraining", H_USER_ANA),
+        ("/cases/case_tkt_exe_16/escalate", H_USER_PEDRO),
+    ],
+)
+def test_non_patch_action_missing_body_returns_422(path, headers):
+    response = client.post(path, headers=headers)
+
+    assert response.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # Ações de impacto — justificativa e permissões
 # ---------------------------------------------------------------------------
@@ -403,7 +612,8 @@ def test_reprocess_requires_user():
 
 
 def test_reprocess_success_no_status_cycle():
-    """§5.1: chamada aceita = sucesso, sem ciclo de status."""
+    """O recibo é sucesso no simulador, sem ciclo nem mutação do Parquet."""
+    before = client.get("/analyses/an_9906?seed=complete").json()
     r = client.post(
         "/analyses/an_9906/reprocess",
         json={"justification": "rolamento trocado na bomba B-204; baseline invalidated; RMS sadio"},
@@ -416,6 +626,7 @@ def test_reprocess_success_no_status_cycle():
     body = r.json()
     assert body["accepted"] is True
     assert body["action_id"].startswith("act_")
+    assert client.get("/analyses/an_9906?seed=complete").json() == before
 
 
 def test_reprocess_replays_original_response():
@@ -980,13 +1191,30 @@ def test_escalate_requires_permission():
 
 
 def test_escalate_success():
+    before = runtime_store.get_case("case_tkt_exe_16")
     r = client.post(
         "/cases/case_tkt_exe_16/escalate",
         json={"justification": "caso que ultrapassa suporte remoto e exige campo"},
         headers=H_USER_PEDRO,
     )
     assert r.status_code == 200
+    body = r.json()
+    assert body["accepted"] is True
+    assert set(body) == {"accepted", "action_id", "message"}
+    assert runtime_store.get_case("case_tkt_exe_16") == before
+
+
+def test_request_specialist_success_does_not_mutate_analysis():
+    before = client.get("/analyses/an_9902?seed=complete").json()
+    r = client.post(
+        "/analyses/an_9902/request-specialist",
+        json={"justification": "desvio persistente com processamento atrasado e análise pendente"},
+        headers=H_USER_SOFIA,
+    )
+
+    assert r.status_code == 200
     assert r.json()["accepted"] is True
+    assert client.get("/analyses/an_9902?seed=complete").json() == before
 
 
 def test_request_retraining_requires_action_high():
@@ -1000,12 +1228,15 @@ def test_request_retraining_requires_action_high():
 
 
 def test_request_retraining_success():
+    before = client.get("/models/mdl_vib_v3?seed=complete").json()
     r = client.post(
         "/models/mdl_vib_v3/request-retraining",
         json={"justification": "insights sistematicamente errados para spindle de alta rotação"},
         headers=H_USER_ANA,
     )
     assert r.status_code == 200
+    assert r.json()["accepted"] is True
+    assert client.get("/models/mdl_vib_v3?seed=complete").json() == before
 
 
 def test_update_asset_config_requires_action_high():
@@ -1017,13 +1248,215 @@ def test_update_asset_config_requires_action_high():
     assert r.status_code == 403
 
 
+def test_update_asset_config_openapi_exposes_structured_form():
+    operation = app.openapi()["paths"]["/assets/{asset_id}"]["patch"]
+    schema = operation["requestBody"]["content"]["application/json"]["schema"]
+
+    assert schema["$ref"].endswith("/AssetConfigUpdate")
+    components = app.openapi()["components"]["schemas"]
+    update_schema = components["AssetConfigUpdate"]
+    changes_schema = components["AssetChanges"]
+    config_schema = components["AssetTechnicalConfigUpdate"]
+    bearing_schema = components["BearingSpecsUpdate"]
+    assert set(update_schema["required"]) == {"justification", "changes"}
+    assert update_schema["properties"]["justification"]["minLength"] == 20
+    assert changes_schema["additionalProperties"] is False
+    assert changes_schema["minProperties"] == 1
+    assert changes_schema["properties"]["criticality"]["type"] == "string"
+    assert config_schema["additionalProperties"] is False
+    assert config_schema["minProperties"] == 1
+    assert config_schema["properties"]["rotation_rpm"]["exclusiveMinimum"] == 0
+    assert bearing_schema["additionalProperties"] is False
+    assert bearing_schema["minProperties"] == 1
+    assert bearing_schema["properties"]["bpfo_hz"]["minimum"] == 0
+    assert set(operation["responses"]) == {"200", "400", "401", "403", "404"}
+    for status in ("400", "401", "403", "404"):
+        assert operation["responses"][status]["content"]["application/json"][
+            "schema"
+        ] == {"$ref": "#/components/schemas/Error"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {
+            "justification": "criticidade fora do contrato deve ser rejeitada",
+            "changes": {"criticality": "banana"},
+        },
+        {"justification": "pedido sem qualquer alteração concreta deve falhar"},
+        {
+            "justification": "objeto de alterações vazio não descreve mudança concreta",
+            "changes": {},
+        },
+        {
+            "justification": "configuração vazia não descreve mudança concreta",
+            "changes": {"config": {}},
+        },
+        {
+            "justification": "campo desconhecido não pode entrar na configuração",
+            "changes": {"unknown": "value"},
+        },
+        {
+            "justification": "valor nulo não representa uma alteração concreta",
+            "changes": {"config": {"machine_type": None}},
+        },
+        {
+            "justification": "rolamento nulo não representa alteração concreta",
+            "changes": {"config": {"bearing_specs": {"part_number": None}}},
+        },
+        {
+            "justification": "número textual não satisfaz o contrato estrito",
+            "changes": {"config": {"rotation_rpm": "1200"}},
+        },
+        {
+            "justification": "booleano não pode ser aceito como rotação numérica",
+            "changes": {"config": {"rotation_rpm": True}},
+        },
+        {
+            "justification": "criticidade nula não representa uma alteração válida",
+            "changes": {"criticality": None, "config": {"rotation_rpm": 1200.0}},
+        },
+    ],
+)
+def test_update_asset_config_rejects_invalid_changes(body):
+    r = client.patch("/assets/asset_V301", json=body, headers=H_USER_HELENA)
+
+    assert r.status_code == 400
+    assert r.json()["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_update_asset_config_model_rejects_non_finite_numbers(value):
+    with pytest.raises(ValueError):
+        AssetConfigUpdate.model_validate(
+            {
+                "justification": "rotação não finita deve falhar antes do recibo",
+                "changes": {"config": {"rotation_rpm": value}},
+            }
+        )
+
+
 def test_update_asset_config_success():
+    before = client.get("/assets/asset_V301?seed=complete").json()
     r = client.patch(
         "/assets/asset_V301",
         json={"justification": "ventilador deixou de ser critico para producao, rebaixar criticidade", "changes": {"criticality": "medium"}},
-        headers=H_USER_ANA,  # action_high
+        headers=H_USER_HELENA,  # action_high e mesma empresa do ativo
     )
     assert r.status_code == 200
+    body = r.json()
+    assert body["accepted"] is True
+    assert "solicitação" in body["message"].lower()
+    assert "atualizada" not in body["message"].lower()
+    assert client.get("/assets/asset_V301?seed=complete").json() == before
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "headers", "body"),
+    [
+        (
+            "POST",
+            "/analyses/an_9902/reprocess",
+            {**H_USER_LUCAS, "Idempotency-Key": "cross-company-reprocess"},
+            {"justification": "tentativa de reprocesso fora da empresa do usuário"},
+        ),
+        (
+            "POST",
+            "/analyses/an_9902/request-specialist",
+            H_USER_LUCAS,
+            {"justification": "tentativa de especialista fora da empresa do usuário"},
+        ),
+        (
+            "PATCH",
+            "/assets/asset_V301",
+            H_USER_ANA,
+            {
+                "justification": "tentativa de alteração fora da empresa do usuário",
+                "changes": {"criticality": "medium"},
+            },
+        ),
+        (
+            "POST",
+            "/cases/case_tkt_exe_16/escalate",
+            H_USER_ANA,
+            {"justification": "tentativa de escalonamento fora da empresa do usuário"},
+        ),
+    ],
+)
+def test_resource_actions_reject_cross_company_scope(method, path, headers, body):
+    r = client.request(method, path, json=body, headers=headers)
+
+    assert r.status_code == 403
+    assert r.json()["code"] == "FORBIDDEN"
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "headers", "body"),
+    [
+        (
+            "POST",
+            "/analyses/an_9906/reprocess",
+            {
+                **H_USER_LUCAS,
+                "Idempotency-Key": "fixture-nonmutation-reprocess",
+            },
+            {
+                "justification": (
+                    "rolamento substituído; solicitar reprocessamento da análise stale"
+                )
+            },
+        ),
+        (
+            "POST",
+            "/analyses/an_9902/request-specialist",
+            H_USER_SOFIA,
+            {
+                "justification": (
+                    "processamento atrasado e desvio sustentam revisão especializada"
+                )
+            },
+        ),
+        (
+            "PATCH",
+            "/assets/asset_V301",
+            H_USER_HELENA,
+            {
+                "justification": (
+                    "revisão operacional solicita nova classificação de criticidade"
+                ),
+                "changes": {"criticality": "medium"},
+            },
+        ),
+        (
+            "POST",
+            "/models/mdl_vib_v3/request-retraining",
+            H_USER_ANA,
+            {
+                "justification": (
+                    "histórico revisado indica necessidade de avaliar novo treinamento"
+                )
+            },
+        ),
+        (
+            "POST",
+            "/cases/case_tkt_exe_16/escalate",
+            H_USER_PEDRO,
+            {
+                "justification": (
+                    "dados indisponíveis e quebra exigem atendimento humano em campo"
+                )
+            },
+        ),
+    ],
+)
+def test_action_receipts_do_not_mutate_fixture_files(method, path, headers, body):
+    before = _fixture_bytes()
+
+    response = client.request(method, path, json=body, headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is True
+    assert _fixture_bytes() == before
 
 
 # ---------------------------------------------------------------------------

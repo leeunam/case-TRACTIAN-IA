@@ -1,5 +1,4 @@
 {
-  "default": "complete",
   "overrides": {
     "asset_G501": {
       "analyses": "inconclusive",
