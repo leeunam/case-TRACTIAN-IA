@@ -1,9 +1,12 @@
+from unittest.mock import patch
+
 import pytest
 from langchain_groq import ChatGroq
 from pydantic import SecretStr
 
 from tractian_agent.groq_provider import GroqModelProvider
 from tractian_agent.model_provider import ModelConfig
+from tractian_agent.planner import PlannerTerminalDecision
 
 
 def test_groq_provider_masks_a_direct_string_key_in_its_state():
@@ -79,3 +82,25 @@ def test_groq_provider_maps_common_config_without_network():
     assert model.max_retries == 0
     assert model.groq_api_key == SecretStr("test-groq-key")
     assert "test-groq-key" not in repr(model)
+
+
+def test_groq_provider_uses_strict_json_schema_for_public_structured_output():
+    provider = GroqModelProvider(api_key=SecretStr("test-groq-key"))
+    model = provider.create_chat_model(
+        ModelConfig(
+            model_id="openai/gpt-oss-20b",
+            temperature=0.0,
+            timeout_seconds=10.0,
+            max_output_tokens=512,
+        )
+    )
+
+    with patch.object(ChatGroq, "with_structured_output", return_value=object()) as method:
+        model.with_structured_output(PlannerTerminalDecision, include_raw=False)
+
+    method.assert_called_once_with(
+        PlannerTerminalDecision,
+        method="json_schema",
+        strict=True,
+        include_raw=False,
+    )

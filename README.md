@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner LLM opt-in e checkpointer SQLite de desenvolvimento. O aceite de 01/09/2026 passou com 59 testes da API e 1.434 do agente (1.493 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 6 estão concluídas. O grafo atual não é um agente de produção: writer, resposta gerada ao cliente, ledger completo, gate de liberação, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner LLM opt-in e checkpointer SQLite de desenvolvimento. Após a correção do adapter Groq em 02/09/2026, `make test` passou com 59 testes da API e 1.437 do agente (1.496 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 6 estão concluídas. O grafo atual não é um agente de produção: writer, resposta gerada ao cliente, ledger completo, gate de liberação, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -66,11 +66,14 @@ Há dois armazenamentos SQLite independentes no desenvolvimento. A API usa `IDEM
 `ModelConfig` estrito. O adapter inicial é `GroqModelProvider`, com
 `openai/gpt-oss-120b`, temperatura zero, timeout de 30 segundos, no máximo 512
 tokens e sem retry oculto. O planner usa `bind_tools` para uma escolha por
-turno e uma chamada Pydantic separada para encerrar; o modelo, credenciais e
-respostas brutas não entram no estado. IDs persistidos de tool call são
-derivados pelo runtime de `request_id` e do ordinal, nunca do ID externo do
-provider. NVIDIA NIM continua alternativa futura; writer poderá usar outro
-modelo quando existir, sem mudar as regras de negócio.
+turno e uma chamada Pydantic separada para encerrar. No adapter Groq, essa
+finalização usa o JSON Schema nativo estrito (`method="json_schema"`,
+`strict=True`); a correção evita o `tool_use_failed` observado quando o default
+`function_calling` criava uma tool sintética que GPT-OSS podia não chamar. O
+modelo, credenciais e respostas brutas não entram no estado. IDs persistidos de
+tool call são derivados pelo runtime de `request_id` e do ordinal, nunca do ID
+externo do provider. NVIDIA NIM continua alternativa futura; writer poderá usar
+outro modelo quando existir, sem mudar as regras de negócio.
 
 O smoke opt-in `make smoke-groq` compara `openai/gpt-oss-120b` e
 `openai/gpt-oss-20b` com dados sintéticos e sem retry. Por padrão há uma rodada
@@ -79,8 +82,10 @@ por modelo e a estabilidade é declarada como `not_measured`; defina
 rodadas. Ele exige `GROQ_API_KEY` já disponível no ambiente, não lê `.env` e só
 imprime métricas agregadas seguras. Sem a chave, sai com código zero e
 `status=skipped reason=missing_groq_api_key`, sem tocar a rede. No aceite desta
-entrega, o smoke ao vivo ficou **skipped** porque a chave não estava disponível;
-a compatibilidade da conta Groq segue pendente de uma execução opt-in com chave.
+entrega, o smoke ao vivo ficou **skipped** porque a chave não estava disponível.
+A correção do JSON Schema estrito foi coberta sem rede; a repetição manual
+opt-in com chave continua pendente para confirmar a compatibilidade ao vivo da
+conta Groq após essa correção.
 
 ## Avaliação offline planejada
 

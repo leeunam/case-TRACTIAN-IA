@@ -146,6 +146,46 @@ def test_groq_smoke_rejects_english_tool_argument_without_exposing_it():
     assert "continue industrial support in English" not in output.getvalue()
 
 
+class _TerminalFailureSmokeModel(_FakeSmokeModel):
+    def with_structured_output(self, schema: object, **kwargs: Any) -> RunnableLambda:
+        raise RuntimeError("SENTINEL_SECRET raw response provider-only-id")
+
+
+class _TerminalFailureSmokeProvider(_FakeSmokeProvider):
+    def create_chat_model(self, config: ModelConfig) -> _TerminalFailureSmokeModel:
+        self.received_configs.append(config)
+        return _TerminalFailureSmokeModel()
+
+
+def test_groq_smoke_preserves_safe_selection_progress_when_finalization_fails():
+    _TerminalFailureSmokeProvider.received_configs = []
+    output = StringIO()
+
+    exit_code = run_smoke(
+        environment={"GROQ_API_KEY": "not-printed-test-key"},
+        output=output,
+        provider_factory=_TerminalFailureSmokeProvider,  # type: ignore[arg-type]
+    )
+
+    lines = output.getvalue().splitlines()
+    assert exit_code == 1
+    assert len(lines) == 2
+    assert all(
+        "status=failed" in line
+        and "portuguese=true" in line
+        and "tool=true" in line
+        and "arguments=true" in line
+        and "pydantic=false" in line
+        and "calls=1" in line
+        and "runs=1" in line
+        and "stable=not_measured" in line
+        for line in lines
+    )
+    assert "SENTINEL_SECRET" not in output.getvalue()
+    assert "raw response" not in output.getvalue()
+    assert "provider-only-id" not in output.getvalue()
+
+
 class _SequencedSmokeProvider(_FakeSmokeProvider):
     def __init__(self, *, diverges: bool) -> None:
         self._diverges = diverges
@@ -219,6 +259,56 @@ def test_groq_smoke_sanitizes_provider_initialization_failure(capsys):
     assert exit_code == 1
     assert captured.out == ""
     assert captured.err == ""
-    assert "status=failed" in output.getvalue()
+    lines = output.getvalue().splitlines()
+    assert len(lines) == 2
+    assert all(
+        "status=failed" in line
+        and "portuguese=false" in line
+        and "tool=false" in line
+        and "arguments=false" in line
+        and "pydantic=false" in line
+        and "calls=0" in line
+        for line in lines
+    )
     assert "SENTINEL_SECRET" not in output.getvalue()
     assert "traceback" not in output.getvalue()
+
+
+class _FirstCallFailureSmokeModel:
+    def bind_tools(self, tools: object) -> RunnableLambda:
+        async def fail(_: object) -> AIMessage:
+            raise RuntimeError("SENTINEL_SECRET raw response")
+
+        return RunnableLambda(fail)
+
+
+class _FirstCallFailureSmokeProvider(_FakeSmokeProvider):
+    def create_chat_model(self, config: ModelConfig) -> _FirstCallFailureSmokeModel:
+        self.received_configs.append(config)
+        return _FirstCallFailureSmokeModel()
+
+
+def test_groq_smoke_reports_no_progress_when_the_first_call_fails():
+    _FirstCallFailureSmokeProvider.received_configs = []
+    output = StringIO()
+
+    exit_code = run_smoke(
+        environment={"GROQ_API_KEY": "not-printed-test-key"},
+        output=output,
+        provider_factory=_FirstCallFailureSmokeProvider,  # type: ignore[arg-type]
+    )
+
+    lines = output.getvalue().splitlines()
+    assert exit_code == 1
+    assert len(lines) == 2
+    assert all(
+        "status=failed" in line
+        and "portuguese=false" in line
+        and "tool=false" in line
+        and "arguments=false" in line
+        and "pydantic=false" in line
+        and "calls=0" in line
+        for line in lines
+    )
+    assert "SENTINEL_SECRET" not in output.getvalue()
+    assert "raw response" not in output.getvalue()

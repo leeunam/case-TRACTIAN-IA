@@ -96,15 +96,23 @@ def _safe_result_line(
     )
 
 
-def _failed_result(model_id: str, *, latency_ms: int = 0) -> _SmokeResult:
+def _failed_result(
+    model_id: str,
+    *,
+    portuguese: bool = False,
+    tool: bool = False,
+    arguments: bool = False,
+    calls: int = 0,
+    latency_ms: int = 0,
+) -> _SmokeResult:
     return _SmokeResult(
         model_id=model_id,
         passed=False,
-        portuguese=False,
-        tool=False,
-        arguments=False,
+        portuguese=portuguese,
+        tool=tool,
+        arguments=arguments,
         pydantic=False,
-        calls=0,
+        calls=calls,
         latency_ms=latency_ms,
         signature=None,
     )
@@ -163,6 +171,10 @@ async def _run_model(provider: ModelProvider, model_id: str) -> _SmokeResult:
     except Exception:
         return _failed_result(
             model_id,
+            portuguese=portuguese,
+            tool=tool_selected,
+            arguments=arguments_valid,
+            calls=successful_calls,
             latency_ms=int((perf_counter() - started_at) * 1000),
         )
     latency_ms = int((perf_counter() - started_at) * 1000)

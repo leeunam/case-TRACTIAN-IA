@@ -1,12 +1,35 @@
 """Adapter Groq para o contrato comum de modelos."""
 
 from collections.abc import Mapping
+from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_groq import ChatGroq
 from pydantic import SecretStr
 
 from tractian_agent.model_provider import ModelConfig
+
+
+class _StrictJsonSchemaChatGroq(ChatGroq):
+    """ChatGroq que fixa o transporte de saída estruturada do adapter."""
+
+    def with_structured_output(
+        self,
+        schema: object = None,
+        *,
+        include_raw: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Usa o JSON Schema estrito nativo da Groq para contratos Pydantic."""
+        kwargs.pop("method", None)
+        kwargs.pop("strict", None)
+        return super().with_structured_output(
+            schema,
+            method="json_schema",
+            strict=True,
+            include_raw=include_raw,
+            **kwargs,
+        )
 
 
 class GroqModelProvider:
@@ -32,7 +55,7 @@ class GroqModelProvider:
 
     def create_chat_model(self, config: ModelConfig) -> BaseChatModel:
         """Traduz a configuração comum para o adapter oficial da Groq."""
-        return ChatGroq(
+        return _StrictJsonSchemaChatGroq(
             model=config.model_id,
             temperature=config.temperature,
             timeout=config.timeout_seconds,

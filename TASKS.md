@@ -204,9 +204,14 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
   primeiro adapter é `GroqModelProvider`, com `openai/gpt-oss-120b`, temperatura
   zero, timeout de 30 segundos, máximo de 512 tokens e `max_retries=0`.
 - O planner versionado usa uma seleção via `bind_tools` e uma finalização
-  Pydantic separada. O grafo só oferece catálogo autorizado pelo estado e
-  runtime, limita sete tools, oito seleções, uma finalização, 48 mil caracteres
-  e 20 passos; tool inválida, repetida ou fora de escopo falha fechada.
+  Pydantic separada. No adapter Groq, a finalização é traduzida para JSON Schema
+  estrito nativo (`method="json_schema"`, `strict=True`), em vez do default
+  `function_calling`: o smoke anterior observou `tool_use_failed` porque a tool
+  sintética desse default podia não ser chamada pelos GPT-OSS. A seleção continua
+  usando somente `bind_tools`, em requisição distinta e sem retry. O grafo só
+  oferece catálogo autorizado pelo estado e runtime, limita sete tools, oito
+  seleções, uma finalização, 48 mil caracteres e 20 passos; tool inválida,
+  repetida ou fora de escopo falha fechada.
 - O estado nunca recebe modelo, credencial, resposta HTTP bruta, texto livre do
   seletor nem ID externo de provider. Cada `PersistedToolCall` recebe
   `call_planner_<24 hex>` derivado por SHA-256 de
@@ -232,7 +237,20 @@ HTTP. A suíte completa do agente passou com **1.434 testes**; os
 locks offline resolveram 49 pacotes do agente e 55 da API. O smoke real
 `make smoke-groq` foi **skipped**, nunca passed, pois `GROQ_API_KEY` não estava
 disponível; isso não tocou a rede e deixa a compatibilidade ao vivo da conta
-como verificação futura opt-in.
+como verificação futura opt-in. Após a correção de JSON Schema estrito em
+02/09/2026, a repetição manual com chave continua pendente; o smoke não deve ser
+declarado aprovado antes dessa execução.
+
+**Evidência da correção de aceite (02/09/2026):** o teste RED/GREEN sem rede
+provou que a interface pública de saída estruturada do modelo devolvido pelo
+adapter usa `json_schema` estrito. Um segundo ciclo RED/GREEN comprovou que, se
+a seleção terminou e a finalização falha, o smoke emite somente métricas seguras
+com `tool=true`, `arguments=true`, `pydantic=false` e `calls=1`; falha de
+construção ou da primeira chamada mantém métricas falsas e zero chamadas. Os 18
+testes focados de provider e smoke passaram; os locks offline resolveram 49
+pacotes do agente e 55 da API; e `make test` passou com 59 testes da API e 1.437
+do agente (1.496 no total). O smoke pós-correção foi **skipped** sem chave, sem
+tocar a rede; a confirmação manual opt-in com `GROQ_API_KEY` continua pendente.
 
 - [x] Criar interface de modelo independente do provedor.
 - [x] Implementar adapter inicial do Groq.
