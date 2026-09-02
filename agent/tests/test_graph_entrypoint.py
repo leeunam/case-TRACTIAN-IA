@@ -227,6 +227,7 @@ def _terminal_execution_state() -> AgentState:
             message="Reprocesso concluído.",
         ),
     )
+    completed_data["scope"]["justification"] = proposal.justification
     completed = WriteIntent.model_validate(completed_data)
     values = state.model_dump(mode="python")
     values.update(

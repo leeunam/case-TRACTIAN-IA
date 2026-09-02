@@ -828,16 +828,24 @@ def _writer_node(writer: Writer):
                 ledger=advanced.ledger,
                 missing_information=missing_information,
             )
-        except WriterProtocolError:
+        except WriterProtocolError as error:
+            failure_code = (
+                WriterFailureCode.INVALID_STRUCTURED_OUTPUT
+                if error.code == "invalid_structured_output"
+                else WriterFailureCode.MODEL_FAILURE
+            )
             updated = _replace_state(
                 advanced,
                 resume_anchor=ResumeAnchor.WRITER,
                 writer_attempts=attempt,
                 writer_draft=None,
                 writer_failure=WriterFailureRecord(
-                    code=WriterFailureCode.INVALID_STRUCTURED_OUTPUT,
+                    code=failure_code,
                     attempts=attempt,
-                    repairable=True,
+                    repairable=(
+                        failure_code
+                        is WriterFailureCode.INVALID_STRUCTURED_OUTPUT
+                    ),
                 ),
                 release_gate=None,
             )
@@ -896,6 +904,8 @@ def _release_gate_context(state: AgentState) -> ReleaseGateContext:
         draft=state.writer_draft,
         permissions=state.permissions,
         intents=current_intents,
+        proposal=state.pending_proposal,
+        planner_terminal=state.planner_terminal,
         approval=state.approval,
         missing_information=(
             state.planner_terminal.missing_information

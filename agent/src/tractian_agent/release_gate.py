@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 
 from pydantic import ConfigDict, Field, model_validator
 
-from tractian_agent.contracts import StrictModel
-from tractian_agent.evidence import assess_evidence
+from tractian_agent.contracts import ResponseMode, StrictModel
+from tractian_agent.evidence import (
+    assess_evidence,
+    canonical_evidence_id,
+    compile_action_intents,
+    merge_ledgers,
+)
 from tractian_agent.state import (
     AgentDecision,
     EvidenceLedger,
     EvidenceQuality,
+    EvidenceSourceKind,
     EvidenceSufficiency,
     FinalResult,
+    PlannerTerminalRecord,
     ReleaseGateOutcome,
     ReleaseGateReason,
     ReleaseGateRecord,
@@ -28,14 +36,19 @@ from tractian_agent.write_contracts import (
     WriteIntent,
     intent_scope_material_parameters,
     intent_scope_target_id,
+    proposal_matches_intent_scope,
 )
 from tractian_agent.write_policy import (
-    ApprovalSource,
     PolicyDecision,
     PolicyReason,
     TrustedActionApproval,
+    WriteProposal,
 )
-from tractian_agent.writer import WriterContext, build_writer_context
+from tractian_agent.writer import (
+    WriterContext,
+    build_writer_context,
+    limitation_descriptions,
+)
 
 
 _NEXT_STEP_BY_DECISION = {
@@ -66,6 +79,8 @@ class ReleaseGateContext(StrictModel):
     draft: WriterDraft | None = None
     permissions: frozenset[Permission]
     intents: tuple[WriteIntent, ...] = ()
+    proposal: WriteProposal | None = None
+    planner_terminal: PlannerTerminalRecord | None = None
     approval: TrustedActionApproval | None = None
     missing_information: str | None = None
     writer_failure: WriterFailureRecord | None = None
@@ -121,7 +136,17 @@ def _record(
                     )
                 ],
                 "missing_information": context.missing_information,
+                "proposal": (
+                    context.proposal.model_dump(mode="json")
+                    if context.proposal is not None
+                    else None
+                ),
                 "permissions": sorted(context.permissions),
+                "planner_terminal": (
+                    context.planner_terminal.model_dump(mode="json")
+                    if context.planner_terminal is not None
+                    else None
+                ),
                 "request_id": context.request_id,
                 "writer_failure": (
                     context.writer_failure.model_dump(mode="json")
@@ -156,6 +181,175 @@ def _current_intent(context: ReleaseGateContext) -> WriteIntent | None:
     return context.intents[0] if len(context.intents) == 1 else None
 
 
+def _approval_matches_intent(
+    context: ReleaseGateContext,
+    intent: WriteIntent,
+) -> bool:
+    if context.approval is None:
+        return False
+    expected = TrustedActionApproval(
+        action=intent.scope.action,
+        target_id=intent_scope_target_id(intent.scope),
+        material_parameters=intent_scope_material_parameters(intent.scope),
+        source=context.approval.source,
+    )
+    return context.approval == expected
+
+
+def _action_decision_is_canonical(
+    context: ReleaseGateContext,
+) -> ReleaseGateReason | None:
+    intent = _current_intent(context)
+    if intent is None:
+        if context.intents or context.proposal is not None or context.decision in {
+            AgentDecision.ACT,
+            AgentDecision.ESCALATE,
+            AgentDecision.REQUEST_CONFIRMATION,
+        }:
+            return ReleaseGateReason.INTENT_MISSING
+        return None
+    if intent.status is IntentStatus.DENIED:
+        return ReleaseGateReason.INTENT_POLICY_MISMATCH
+    if intent.status is IntentStatus.UNCERTAIN:
+        return ReleaseGateReason.INTENT_UNCERTAIN
+    if intent.status in {
+        IntentStatus.PROPOSED,
+        IntentStatus.PREPARED,
+        IntentStatus.FAILED,
+    }:
+        return ReleaseGateReason.INTENT_NOT_COMPLETED
+    if intent.status is IntentStatus.AWAITING_CONFIRMATION:
+        if context.proposal is None or not proposal_matches_intent_scope(
+            context.proposal,
+            intent.scope,
+            payload_hash=intent.payload_hash,
+        ):
+            return ReleaseGateReason.INTENT_POLICY_MISMATCH
+        if context.decision is not AgentDecision.REQUEST_CONFIRMATION:
+            return ReleaseGateReason.DECISION_MISMATCH
+        if _ACTION_PERMISSION[intent.scope.action] not in context.permissions:
+            return ReleaseGateReason.PERMISSION_INCOMPATIBLE
+        if (
+            intent.decision.reason is PolicyReason.EXPLICIT_APPROVAL_REQUIRED
+            and context.approval is not None
+        ) or (
+            intent.decision.reason is PolicyReason.APPROVAL_SCOPE_MISMATCH
+            and (
+                context.approval is None
+                or _approval_matches_intent(context, intent)
+            )
+        ):
+            return ReleaseGateReason.INTENT_POLICY_MISMATCH
+        return None
+    if context.proposal is None or not proposal_matches_intent_scope(
+        context.proposal,
+        intent.scope,
+        payload_hash=intent.payload_hash,
+    ):
+        return ReleaseGateReason.INTENT_POLICY_MISMATCH
+    expected = (
+        AgentDecision.ESCALATE
+        if intent.scope.action == "escalate_case"
+        else AgentDecision.ACT
+    )
+    if context.decision is not expected:
+        return ReleaseGateReason.DECISION_MISMATCH
+    return None
+
+
+def _planner_decision_is_canonical(
+    context: ReleaseGateContext,
+) -> ReleaseGateReason | None:
+    if context.planner_terminal is None:
+        return None
+    if context.intents or context.proposal is not None:
+        return ReleaseGateReason.INTENT_POLICY_MISMATCH
+    if context.decision is not AgentDecision(context.planner_terminal.decision):
+        return ReleaseGateReason.DECISION_MISMATCH
+    if context.missing_information != context.planner_terminal.missing_information:
+        return ReleaseGateReason.MISSING_INFORMATION_INVALID
+    return None
+
+
+def _ledger_integrity_reason(
+    context: ReleaseGateContext,
+) -> ReleaseGateReason | None:
+    if any(item.request_id != context.request_id for item in context.ledger.items):
+        return ReleaseGateReason.REQUEST_MISMATCH
+    if any(
+        item.evidence_id != canonical_evidence_id(item)
+        for item in context.ledger.items
+    ):
+        return ReleaseGateReason.INSUFFICIENT_EVIDENCE
+    if any(
+        (
+            item.quality is EvidenceQuality.CLAIMABLE
+            and (
+                item.mode is not ResponseMode.COMPLETE
+                or bool(item.obsolescence)
+            )
+        )
+        or (
+            item.quality is EvidenceQuality.OBSOLETE
+            and not item.obsolescence
+        )
+        or (
+            bool(item.obsolescence)
+            and item.quality is not EvidenceQuality.OBSOLETE
+        )
+        for item in context.ledger.items
+    ):
+        return ReleaseGateReason.INSUFFICIENT_EVIDENCE
+    canonical_time = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    expected_actions = compile_action_intents(
+        context.intents,
+        recorded_at=canonical_time,
+    )
+    actual_action_items = tuple(
+        sorted(
+            (
+                item.model_copy(update={"recorded_at": canonical_time})
+                for item in context.ledger.items
+                if item.source_kind is EvidenceSourceKind.ACTION
+            ),
+            key=lambda item: item.evidence_id,
+        )
+    )
+    expected_action_items = tuple(
+        sorted(expected_actions.items, key=lambda item: item.evidence_id)
+    )
+    actual_action_gaps = tuple(
+        sorted(
+            (
+                gap
+                for gap in context.ledger.gaps
+                if gap.intent_id is not None
+            ),
+            key=lambda gap: gap.model_dump_json(),
+        )
+    )
+    expected_action_gaps = tuple(
+        sorted(
+            expected_actions.gaps,
+            key=lambda gap: gap.model_dump_json(),
+        )
+    )
+    if (
+        actual_action_items != expected_action_items
+        or actual_action_gaps != expected_action_gaps
+    ):
+        return ReleaseGateReason.ACTION_EVIDENCE_MISSING
+    expected_conflicts = merge_ledgers(
+        EvidenceLedger(
+            request_id=context.ledger.request_id,
+            items=context.ledger.items,
+        )
+    ).conflicts
+    if context.ledger.conflicts != expected_conflicts:
+        return ReleaseGateReason.INSUFFICIENT_EVIDENCE
+    return None
+
+
 def _action_is_trusted(context: ReleaseGateContext) -> ReleaseGateReason | None:
     intent = _current_intent(context)
     if intent is None:
@@ -172,17 +366,7 @@ def _action_is_trusted(context: ReleaseGateContext) -> ReleaseGateReason | None:
     required_permission = _ACTION_PERMISSION[intent.scope.action]
     if required_permission not in context.permissions:
         return ReleaseGateReason.PERMISSION_INCOMPATIBLE
-    expected_approval = TrustedActionApproval(
-        action=intent.scope.action,
-        target_id=intent_scope_target_id(intent.scope),
-        material_parameters=intent_scope_material_parameters(intent.scope),
-        source=(
-            context.approval.source
-            if context.approval is not None
-            else ApprovalSource.CONFIRMATION
-        ),
-    )
-    if context.approval != expected_approval:
+    if not _approval_matches_intent(context, intent):
         return ReleaseGateReason.APPROVAL_MISMATCH
     if not any(
         item.intent_id == intent.intent_id
@@ -209,6 +393,15 @@ def evaluate_release(context: ReleaseGateContext) -> ReleaseGateRecord:
         )
     ):
         return _review(context, ReleaseGateReason.REQUEST_MISMATCH)
+    ledger_reason = _ledger_integrity_reason(context)
+    if ledger_reason is not None:
+        return _review(context, ledger_reason)
+    action_decision_reason = _action_decision_is_canonical(context)
+    if action_decision_reason is not None:
+        return _review(context, action_decision_reason)
+    planner_decision_reason = _planner_decision_is_canonical(context)
+    if planner_decision_reason is not None:
+        return _review(context, planner_decision_reason)
     if context.draft.decision is not context.decision:
         return _review(context, ReleaseGateReason.DECISION_MISMATCH)
 
@@ -223,6 +416,11 @@ def evaluate_release(context: ReleaseGateContext) -> ReleaseGateRecord:
         return _review(context, ReleaseGateReason.LIMITATION_REFERENCE_MISMATCH)
     if context.draft.next_step is not _NEXT_STEP_BY_DECISION[context.decision]:
         return _review(context, ReleaseGateReason.NEXT_STEP_MISMATCH)
+    if any(
+        limitation.kind == "projection_overflow"
+        for limitation in expected.limitations
+    ):
+        return _review(context, ReleaseGateReason.INSUFFICIENT_EVIDENCE)
 
     if context.decision is AgentDecision.REQUEST_INFORMATION:
         if context.missing_information is None or not context.missing_information.strip():
@@ -303,14 +501,10 @@ def render_released_result(
             f"{item.fact_path} = {_canonical_value(item.value.to_python())} "
             f"(fonte {source}, recurso {item.resource})."
         )
-    limitations_by_ref = {
-        limitation.limitation_ref: limitation
-        for limitation in _expected_context(context).limitations
-    }
+    descriptions_by_ref = limitation_descriptions(context.ledger)
     limitation_messages = []
     for limitation_ref in context.draft.limitation_refs:
-        limitation = limitations_by_ref[limitation_ref]
-        description = limitation.detail or limitation.reason or limitation.kind
+        description = descriptions_by_ref[limitation_ref]
         limitation_messages.append(f"Limitação considerada: {description}.")
     next_step = {
         WriterNextStep.MONITOR: "Próximo passo: monitore a condição.",

@@ -1490,7 +1490,6 @@ def test_writer_graph_projection_excludes_every_non_allowlisted_state_sentinel(
     assert len(second.ledger_history) == 1
     assert "HISTORY_ARTIFACT_SENTINEL" in first.final_result.message
     current_writer_payload = writer_model._payloads[-1]
-    assert "act_allowlisted_sentinel" in current_writer_payload
     for forbidden in (
         "FIRST_REQUEST_SENTINEL",
         "REQUEST_SENTINEL",
@@ -1499,6 +1498,7 @@ def test_writer_graph_projection_excludes_every_non_allowlisted_state_sentinel(
         "action_high",
         "PROPOSAL_SENTINEL",
         "RECEIPT_SENTINEL",
+        "act_allowlisted_sentinel",
         "HISTORY_ARTIFACT_SENTINEL",
         "runtime-sentinel.invalid",
         "asset_G501",
@@ -1720,7 +1720,7 @@ def test_valid_writer_checkpoint_resumes_only_the_release_gate(tmp_path):
             2,
             "invalid_structured_output",
         ),
-        ((RuntimeError("provider indisponível"),), 1, "model_failure"),
+        ((RuntimeError("RAW_SECRET_OUTPUT"),), 1, "model_failure"),
     ],
 )
 def test_writer_failure_stops_safely_without_hidden_retry(
@@ -1783,7 +1783,9 @@ def test_writer_failure_stops_safely_without_hidden_retry(
     assert state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
     assert state.final_result is not None
     assert state.final_result.evidence_ids == ()
-    assert "inválido" not in state.model_dump_json()
+    state_wire = state.model_dump_json()
+    assert "inválido" not in state_wire
+    assert "RAW_SECRET_OUTPUT" not in state_wire
     assert len(writer_model._payloads) == expected_attempts
 
 

@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação e checkpointer SQLite de desenvolvimento. Em 02/09/2026, `make test` passou com 99 testes da API e 1.514 do agente (1.613 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 8 estão concluídas. O grafo atual ainda não é um agente de produção: revisão humana retomável, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação e checkpointer SQLite de desenvolvimento. Em 02/09/2026, `make test` passou com 99 testes da API e 1.535 do agente (1.634 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 8 estão concluídas. O grafo atual ainda não é um agente de produção: revisão humana retomável, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -44,12 +44,15 @@ Essa separação reduz contexto, facilita testes e impede que a redação altere
 No MVP, planner e writer podem usar o mesmo modelo com prompts e contratos diferentes. A separação é de responsabilidade, não uma obrigação de contratar dois modelos.
 
 O writer usa o prompt `writer-v1`, não recebe tools e devolve somente um draft
-estruturado com a decisão imutável, IDs ordenados e próximo passo enumerado. O
-gate recalcula em código as referências, suficiência, limitações, permissões e
-estado da intenção. Apenas um atestado `release` permite ao renderer buscar os
-valores no ledger; a mensagem técnica não vem do modelo e é revalidada ao
-restaurar o checkpoint. Uma saída de formato inválido admite somente um repair;
-duas falhas ou qualquer incerteza terminam em aviso seguro para futura revisão.
+estruturado com a decisão imutável, IDs ordenados e próximo passo enumerado. Seu
+contexto é limitado a 64 referências e usa somente IDs e categorias fechadas:
+alvos, valores, timestamps e caminhos técnicos permanecem no ledger. O gate
+deriva a decisão de ação da intenção, proposal e terminal do planner atuais,
+recompõe IDs e conflitos e recompila evidências de ação contra o recibo. Apenas
+um atestado `release` permite ao renderer buscar os valores no ledger; a mensagem
+técnica não vem do modelo e é revalidada ao restaurar o checkpoint. Uma saída de
+formato inválido admite somente um repair; duas falhas, erro de provider ou
+qualquer incerteza terminam em aviso sanitizado e seguro para futura revisão.
 
 O **ledger de evidências** associa fatos às fontes consultadas no estado da execução. Ele recebe somente observações de leitura validadas e recibos tipados de intenções terminais; texto livre de LLM, proposals e mensagens de recibo não viram fatos. O Logfire receberá traces e métricas para consulta humana e operação; ele não será o banco principal do ledger nem uma fonte que o agente consulta durante o atendimento. Logfire ainda não está implementado.
 

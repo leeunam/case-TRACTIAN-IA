@@ -52,6 +52,7 @@ from tractian_agent.write_contracts import (
     WriteIntentScope,
     intent_scope_material_parameters,
     intent_scope_target_id,
+    proposal_matches_intent_scope,
 )
 from tractian_agent.write_policy import (
     EscalateCaseProposal,
@@ -63,7 +64,6 @@ from tractian_agent.write_policy import (
     UpdateAssetCriticalityProposal,
     WriteMaterialParameters,
     WriteProposal,
-    canonical_write_payload_hash,
 )
 
 
@@ -79,9 +79,10 @@ def _proposal_matches_persisted_intent(
     payload_hash: str,
 ) -> bool:
     """Vincula o efeito terminal à proposal sem recuperar runtime no estado."""
-    if (
-        proposal.action != scope.action
-        or canonical_write_payload_hash(proposal) != payload_hash
+    if not proposal_matches_intent_scope(
+        proposal,
+        scope,
+        payload_hash=payload_hash,
     ):
         return False
     persisted_target = intent_scope_target_id(scope)
@@ -949,6 +950,23 @@ class EvidenceConflict(FrozenStateModel):
     evidence_ids: tuple[str, ...] = Field(min_length=2)
     blocking: Literal[True] = True
 
+    @field_validator("evidence_ids")
+    @classmethod
+    def _require_canonical_evidence_ids(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("IDs do conflito devem ser únicos")
+        if tuple(sorted(value)) != value:
+            raise ValueError("IDs do conflito devem ser ordenados")
+        if any(
+            not re.fullmatch(r"sha256:v1:[0-9a-f]{64}", item)
+            for item in value
+        ):
+            raise ValueError("ID de evidência inválido no conflito")
+        return value
+
 
 class EvidenceLedger(FrozenStateModel):
     """Ledger atual de uma request; histórico permanece em ``ledger_history``."""
@@ -1385,6 +1403,8 @@ class AgentState(FrozenStateModel):
                 for intent in self.intents
                 if intent.request_id == self.request_id
             ),
+            proposal=self.pending_proposal,
+            planner_terminal=self.planner_terminal,
             approval=self.approval,
             missing_information=(
                 self.planner_terminal.missing_information

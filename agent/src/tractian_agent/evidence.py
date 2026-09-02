@@ -66,6 +66,26 @@ def _evidence_id(
     return "sha256:v1:" + hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
 
 
+def canonical_evidence_id(item: EvidenceItem) -> str:
+    """Recompõe o ID público de um item sem confiar no ID persistido."""
+    return _evidence_id(
+        request_id=item.request_id,
+        source_kind=item.source_kind,
+        call_id=item.call_id,
+        intent_id=item.intent_id,
+        tool=item.tool,
+        action=item.action,
+        resource=item.resource,
+        fact_path=item.fact_path,
+        value=item.value.to_python(),
+        mode=item.mode,
+        source_at=item.source_at,
+        limitations=item.limitations,
+        quality=item.quality,
+        obsolescence=item.obsolescence,
+    )
+
+
 def _parse_source_time(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -263,7 +283,10 @@ def compile_observations(
     for item in unique_items:
         groups[item.canonical_key].append(item)
     conflicts = tuple(
-        EvidenceConflict(canonical_key=key, evidence_ids=tuple(item.evidence_id for item in group))
+        EvidenceConflict(
+            canonical_key=key,
+            evidence_ids=tuple(sorted({item.evidence_id for item in group})),
+        )
         for key, group in sorted(groups.items())
         if len({_canonical_json(item.value.to_python()) for item in group}) > 1
     )
@@ -372,7 +395,7 @@ def merge_ledgers(*ledgers: EvidenceLedger) -> EvidenceLedger:
     conflicts = tuple(
         EvidenceConflict(
             canonical_key=key,
-            evidence_ids=tuple(item.evidence_id for item in group),
+            evidence_ids=tuple(sorted({item.evidence_id for item in group})),
         )
         for key, group in sorted(groups.items())
         if len({_canonical_json(item.value.to_python()) for item in group}) > 1

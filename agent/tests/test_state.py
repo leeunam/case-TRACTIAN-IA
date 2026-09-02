@@ -962,6 +962,7 @@ def test_terminal_state_rejects_incompatible_write_intent_or_execution_result():
             message="Reprocesso concluído.",
         ),
     )
+    completed_data["scope"]["justification"] = proposal.justification
     completed = WriteIntent.model_validate(completed_data)
     execution_state = _state(
         pending_proposal=proposal,
@@ -1040,6 +1041,7 @@ def test_terminal_execution_rejects_adulterated_effect_binding(tamper: str):
             attempts=1,
             receipt=receipt,
         )
+        intent_data["scope"]["justification"] = proposal.justification
         state = _state(
             pending_proposal=proposal,
             intents=(WriteIntent.model_validate(intent_data),),

@@ -18,10 +18,17 @@ from tractian_agent.contracts import (
 from tractian_agent.tools.identifiers import AnalysisId, AssetId, ModelId
 from tractian_agent.write_policy import (
     AssetCriticality,
+    EscalateCaseProposal,
     PolicyDecision,
     PolicyReason,
+    ReprocessProposal,
+    RequestModelRetrainingProposal,
+    RequestSpecialistAnalysisProposal,
+    UpdateAssetCriticalityProposal,
     WriteMaterialParameters,
     WritePolicyResult,
+    WriteProposal,
+    canonical_write_payload_hash,
 )
 
 
@@ -148,6 +155,42 @@ def intent_scope_material_parameters(
     if isinstance(scope, UpdateAssetCriticalityIntentScope):
         return WriteMaterialParameters(criticality=scope.criticality)
     return WriteMaterialParameters()
+
+
+def proposal_matches_intent_scope(
+    proposal: WriteProposal,
+    scope: WriteIntentScope,
+    *,
+    payload_hash: str,
+) -> bool:
+    """Compara a proposal pública com todos os campos que ela originou."""
+    if (
+        proposal.action != scope.action
+        or proposal.justification != scope.justification
+        or canonical_write_payload_hash(proposal) != payload_hash
+    ):
+        return False
+    if isinstance(proposal, ReprocessProposal):
+        return (
+            isinstance(scope, ReprocessIntentScope)
+            and proposal.analysis_id == scope.analysis_id
+        )
+    if isinstance(proposal, RequestSpecialistAnalysisProposal):
+        return (
+            isinstance(scope, RequestSpecialistAnalysisIntentScope)
+            and proposal.analysis_id == scope.analysis_id
+        )
+    if isinstance(proposal, UpdateAssetCriticalityProposal):
+        return (
+            isinstance(scope, UpdateAssetCriticalityIntentScope)
+            and proposal.criticality == scope.criticality
+        )
+    if isinstance(proposal, RequestModelRetrainingProposal):
+        return isinstance(scope, RequestModelRetrainingIntentScope)
+    return isinstance(proposal, EscalateCaseProposal) and isinstance(
+        scope,
+        EscalateCaseIntentScope,
+    )
 
 
 class PersistedActionReceipt(StrictModel):
