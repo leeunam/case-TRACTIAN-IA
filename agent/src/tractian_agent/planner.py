@@ -132,18 +132,6 @@ _COMPANY_ID_ADAPTER: Final = TypeAdapter(CompanyId)
 _KNOWLEDGE_ID_ADAPTER: Final = TypeAdapter(KnowledgeDocumentId)
 _MODEL_ID_ADAPTER: Final = TypeAdapter(ModelId)
 _POINT_ID_ADAPTER: Final = TypeAdapter(PointId)
-_ANALYSIS_ID_PATTERN: Final = re.compile(
-    r"(?<![A-Za-z0-9_-])an_[A-Za-z0-9_-]{1,64}(?![A-Za-z0-9_-])"
-)
-_KNOWLEDGE_ID_PATTERN: Final = re.compile(
-    r"(?<![A-Za-z0-9_-])kb_[A-Za-z0-9_-]{1,64}(?![A-Za-z0-9_-])"
-)
-_MODEL_ID_PATTERN: Final = re.compile(
-    r"(?<![A-Za-z0-9_-])mdl_[A-Za-z0-9_-]{1,64}(?![A-Za-z0-9_-])"
-)
-_POINT_ID_PATTERN: Final = re.compile(
-    r"(?<![A-Za-z0-9_-])pt_[A-Za-z0-9_-]{1,64}(?![A-Za-z0-9_-])"
-)
 _ASSET_ARGUMENT_TOOL_NAMES: Final = frozenset(
     {
         "get_asset",
@@ -1564,22 +1552,6 @@ def _read_observation_is_semantically_valid(
         return False
 
 
-def _typed_ids(
-    texts: Sequence[str],
-    *,
-    pattern: re.Pattern[str],
-    adapter: TypeAdapter[str],
-) -> frozenset[str]:
-    validated: set[str] = set()
-    for text in texts:
-        for candidate in pattern.findall(text):
-            try:
-                validated.add(adapter.validate_python(candidate, strict=True))
-            except ValidationError:
-                continue
-    return frozenset(validated)
-
-
 @dataclass(frozen=True)
 class _PlannerAuthorizedTargets:
     analysis_ids: frozenset[str]
@@ -1696,37 +1668,12 @@ def _structured_observation_ids(
 
 
 def _authorized_targets(
-    request_message: str,
     interactions: Sequence[tuple[PersistedToolCall, ToolObservation]],
 ) -> _PlannerAuthorizedTargets:
-    analysis_ids = set(
-        _typed_ids(
-            (request_message,),
-            pattern=_ANALYSIS_ID_PATTERN,
-            adapter=_ANALYSIS_ID_ADAPTER,
-        )
-    )
-    knowledge_document_ids = set(
-        _typed_ids(
-            (request_message,),
-            pattern=_KNOWLEDGE_ID_PATTERN,
-            adapter=_KNOWLEDGE_ID_ADAPTER,
-        )
-    )
-    model_ids = set(
-        _typed_ids(
-            (request_message,),
-            pattern=_MODEL_ID_PATTERN,
-            adapter=_MODEL_ID_ADAPTER,
-        )
-    )
-    point_ids = set(
-        _typed_ids(
-            (request_message,),
-            pattern=_POINT_ID_PATTERN,
-            adapter=_POINT_ID_ADAPTER,
-        )
-    )
+    analysis_ids: set[str] = set()
+    knowledge_document_ids: set[str] = set()
+    model_ids: set[str] = set()
+    point_ids: set[str] = set()
     for call, observation in interactions:
         observed = _structured_observation_ids(call, observation)
         analysis_ids.update(observed.analysis_ids)
@@ -1829,7 +1776,7 @@ def _validated_current_interactions(
                 PlannerErrorCode.INVALID_HISTORY,
                 usage=usage,
             )
-        authorized = _authorized_targets(request.message, interactions)
+        authorized = _authorized_targets(interactions)
         if not _selected_targets_are_authorized(
             tool_name=canonical_call.name,
             arguments=canonical_call.arguments.to_python(),
@@ -1886,7 +1833,6 @@ def select_planner_tools(
     if not runtime_scope_matches:
         raise PlannerProtocolError(PlannerErrorCode.RUNTIME_SCOPE_MISMATCH)
     authorized = _authorized_targets(
-        state.request.message,
         _validated_current_interactions(
             state.request,
             state.request_id,
@@ -2251,10 +2197,7 @@ class Planner:
                     ),
                 )
             )
-        authorized_targets = _authorized_targets(
-            request.message,
-            authorized_interactions,
-        )
+        authorized_targets = _authorized_targets(authorized_interactions)
         messages, context_stats = _build_planner_context(
             request_content,
             interactions,
@@ -2339,7 +2282,7 @@ class Planner:
                         request_id=request_id,
                         call_id=_persisted_call_id(
                             request_id=request_id,
-                            ordinal=len(calls),
+                            ordinal=len(calls) + 1,
                         ),
                         name=selected_call["name"],
                         arguments=arguments,

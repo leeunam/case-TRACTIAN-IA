@@ -25,7 +25,7 @@ Só marque uma tarefa após executar seu critério de aceite. Registre decisões
 
 ## Estado atual
 
-Existem o simulador FastAPI, os dados, os contratos, os cenários, o cliente HTTP, dez tools LangChain de leitura, cinco proposal tools sem efeito, estado tipado, fronteira Python, checkpointer SQLite e um grafo LangGraph determinístico com cinco fluxos de escrita. As Fases 1 a 5 estão concluídas. Planner LLM, writer, resposta gerada ao cliente, ledger completo, gate de liberação, Logfire e runner Pydantic Evals continuam ausentes. Nunca descreva componente planejado como funcional.
+Existem o simulador FastAPI, os dados, os contratos, os cenários, o cliente HTTP, dez tools LangChain de leitura, cinco proposal tools sem efeito, estado tipado, fronteira Python, checkpointer SQLite, provider comum com adapter Groq e um grafo LangGraph determinístico com cinco fluxos de escrita e planner LLM opt-in integrado. As Fases 1 a 6 estão concluídas. Writer, resposta gerada ao cliente, ledger completo, gate de liberação, Logfire e runner Pydantic Evals continuam ausentes. Nunca descreva componente planejado como funcional.
 
 ## Invariantes
 

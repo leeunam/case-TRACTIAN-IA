@@ -181,8 +181,14 @@ def _state(
     request: SupportRequest | None = None,
     tool_calls: tuple[PersistedToolCall, ...] = (),
     tool_observations: tuple[ToolObservation, ...] = (),
+    with_trusted_target_artifacts: bool = False,
 ) -> AgentState:
     request = _request() if request is None else request
+    if with_trusted_target_artifacts:
+        tool_calls, tool_observations = _history_with_trusted_target_artifacts(
+            tool_calls,
+            tool_observations,
+        )
     return AgentState(
         request=request,
         identity=TrustedIdentity(
@@ -660,6 +666,133 @@ def _real_complete_observation(
     )
 
 
+def _history_with_trusted_target_artifacts(
+    calls: tuple[PersistedToolCall, ...],
+    observations: tuple[ToolObservation, ...],
+) -> tuple[tuple[PersistedToolCall, ...], tuple[ToolObservation, ...]]:
+    analysis_ids: set[str] = set()
+    document_ids: set[str] = set()
+    model_ids: set[str] = set()
+    point_ids: set[str] = set()
+    for call in calls:
+        arguments = call.arguments.to_python()
+        if isinstance(arguments.get("analysis_id"), str):
+            analysis_ids.add(arguments["analysis_id"])
+        if isinstance(arguments.get("document_id"), str):
+            document_ids.add(arguments["document_id"])
+        if isinstance(arguments.get("model_id"), str):
+            model_ids.add(arguments["model_id"])
+        if isinstance(arguments.get("point_id"), str):
+            point_ids.add(arguments["point_id"])
+
+    authority_calls: list[PersistedToolCall] = []
+    authority_observations: list[ToolObservation] = []
+    if analysis_ids:
+        analysis_call = PersistedToolCall(
+            request_id="req_planner_01",
+            call_id="call_authority_analysis_list",
+            name="list_asset_analyses",
+            arguments={"asset_id": "asset_G501"},
+        )
+        authority_calls.append(analysis_call)
+        authority_observations.append(
+            _analysis_list_observation(
+                analysis_call,
+                analysis_ids=tuple(sorted(analysis_ids)),
+            )
+        )
+    if point_ids:
+        if point_ids != {"pt_G501_de"}:
+            raise AssertionError(f"fixture sem artifact de pontos para {point_ids!r}")
+        point_call, point_observation, _ = _real_complete_observation("get_asset")
+        authority_calls.append(point_call)
+        authority_observations.append(point_observation)
+    if document_ids:
+        results = [
+            KnowledgeSearchItem(
+                id=document_id,
+                type="guidance",
+                title=f"Documento {document_id}",
+                tags=[],
+                snippet="Resultado validado.",
+            )
+            for document_id in sorted(document_ids)
+        ]
+        knowledge_call = PersistedToolCall(
+            request_id="req_planner_01",
+            call_id="call_authority_knowledge_search",
+            name="search_knowledge",
+            arguments={"query": "autoridade tipada"},
+        )
+        authority_calls.append(knowledge_call)
+        authority_observations.append(
+            ToolObservation(
+                request_id=knowledge_call.request_id,
+                call_id=knowledge_call.call_id,
+                content=KnowledgeSearchModelContent(
+                    results=results,
+                    total_results=len(results),
+                    returned_results=len(results),
+                    omitted_results=0,
+                    truncated=False,
+                ).model_dump(mode="json"),
+                artifact=KnowledgeSearchToolArtifact(
+                    tool_name=knowledge_call.name,
+                    arguments=knowledge_call.arguments.to_python(),
+                    source=ToolSource(
+                        kind="industrial_api",
+                        resource="/knowledge/search",
+                    ),
+                    outcome=KnowledgeSearchToolOutcome(
+                        mode=ResponseMode.COMPLETE,
+                        partial_data={},
+                        results=results,
+                        total_results=len(results),
+                        returned_results=len(results),
+                        omitted_results=0,
+                    ),
+                ),
+            )
+        )
+    if model_ids:
+        if model_ids != {"mdl_vib_v3"}:
+            raise AssertionError(f"fixture sem artifact de modelo para {model_ids!r}")
+        model_call, model_observation, _, _ = _observation_with_timestamp(
+            "get_model",
+            "2026-01-01T00:00:00Z",
+        )
+        authority_calls.append(model_call)
+        authority_observations.append(model_observation)
+    return (
+        (*authority_calls, *calls),
+        (*authority_observations, *observations),
+    )
+
+
+def _proposal_target_authority_history(
+) -> tuple[tuple[PersistedToolCall, ...], tuple[ToolObservation, ...]]:
+    analysis_call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_authority_proposal_analysis_list",
+        name="list_asset_analyses",
+        arguments={"asset_id": "asset_G501"},
+    )
+    model_call, model_observation, _, _ = _observation_with_timestamp(
+        "get_model",
+        "2026-01-01T00:00:00Z",
+    )
+    return (
+        (analysis_call, model_call),
+        (
+            _analysis_list_observation(
+                analysis_call,
+                analysis_ids=("an_diag_2026",),
+            ),
+            model_observation,
+        ),
+    )
+
+
 def _real_nullable_point_observation(
     tool_name: str,
 ) -> tuple[PersistedToolCall, ToolObservation, str]:
@@ -914,6 +1047,7 @@ def test_select_planner_tools_accepts_real_complete_outputs_after_json_round_tri
             request=request,
             tool_calls=(call,),
             tool_observations=(restored,),
+            with_trusted_target_artifacts=True,
         ),
         _read_runtime(),
     )
@@ -923,27 +1057,68 @@ def test_select_planner_tools_accepts_real_complete_outputs_after_json_round_tri
     assert restored.content == observation.content
 
 
-def test_select_planner_tools_requires_typed_analysis_and_knowledge_ids():
-    without_discovered_ids = select_planner_tools(_state(), _read_runtime())
-    names_without_ids = {tool.name for tool in without_discovered_ids}
+@pytest.mark.parametrize(
+    "message",
+    [
+        "O log incidental cita an_diag_2026 e mdl_vib_v3.",
+        "Não consulte an_diag_2026 nem kb_bearing_guidance.",
+        'Texto colado: {"analysis_id":"an_diag_2026",'
+        '"document_id":"kb_bearing_guidance","model_id":"mdl_vib_v3"}.',
+    ],
+    ids=["incidental", "negated", "pasted"],
+)
+def test_select_planner_tools_does_not_authorize_targets_from_free_text(message):
+    permissions = frozenset({"read", "action_low", "action_high", "escalate"})
+    request = _request().model_copy(update={"message": message})
 
-    request = _request().model_copy(
-        update={
-            "message": (
-                "Consulte an_diag_2026 e o documento kb_bearing_guidance."
+    offered_names = {
+        tool.name
+        for tool in select_planner_tools(
+            _state(permissions=permissions, request=request),
+            _write_runtime(permissions=permissions),
+        )
+    }
+
+    assert "get_analysis" not in offered_names
+    assert "get_knowledge_document" not in offered_names
+    assert "propose_reprocess_analysis" not in offered_names
+    assert "propose_request_specialist_analysis" not in offered_names
+    assert "propose_request_model_retraining" not in offered_names
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "message"),
+    [
+        ("get_analysis", "O log incidental cita an_valid_output."),
+        ("get_knowledge_document", "Não consulte kb_valid_output."),
+        ("get_baseline", 'Texto colado: {"point_id":"pt_G501_de"}.'),
+    ],
+    ids=["incidental-analysis", "negated-document", "pasted-point"],
+)
+def test_planner_rejects_free_text_only_target_history_before_model(
+    tool_name,
+    message,
+):
+    call, observation, _ = _real_complete_observation(tool_name)
+    model = _RecordingPlannerModel(selector_response=AIMessage(content=""))
+
+    with pytest.raises(PlannerProtocolError) as exc_info:
+        asyncio.run(
+            Planner(model).ainvoke(
+                _request().model_copy(update={"message": message}),
+                request_id="req_planner_01",
+                usage=PlannerUsage(
+                    request_id="req_planner_01",
+                    selection_count=1,
+                ),
+                offered_tools=(get_asset,),
+                tool_calls=(call,),
+                tool_observations=(observation,),
             )
-        }
-    )
-    with_discovered_ids = select_planner_tools(
-        _state(request=request),
-        _read_runtime(),
-    )
-    names_with_ids = {tool.name for tool in with_discovered_ids}
+        )
 
-    assert "get_analysis" not in names_without_ids
-    assert "get_knowledge_document" not in names_without_ids
-    assert "get_analysis" in names_with_ids
-    assert "get_knowledge_document" in names_with_ids
+    assert exc_info.value.code is PlannerErrorCode.INVALID_HISTORY
+    assert model._events == []
 
 
 def test_select_planner_tools_hides_asset_argument_tools_without_request_asset():
@@ -1226,6 +1401,7 @@ def test_select_planner_tools_accepts_sanitized_error_from_each_read_tool(
             request=request,
             tool_calls=(call,),
             tool_observations=(restored,),
+            with_trusted_target_artifacts=True,
         ),
         _read_runtime(),
     )
@@ -1302,6 +1478,7 @@ def test_select_planner_tools_accepts_generic_degraded_read_artifacts(
             tool_observations=(
                 ToolObservation.model_validate_json(observation.model_dump_json()),
             ),
+            with_trusted_target_artifacts=True,
         ),
         _read_runtime(),
     )
@@ -1382,6 +1559,7 @@ def test_select_planner_tools_accepts_specialized_degraded_knowledge_artifacts(
             tool_observations=(
                 ToolObservation.model_validate_json(observation.model_dump_json()),
             ),
+            with_trusted_target_artifacts=True,
         ),
         _read_runtime(),
     )
@@ -1530,6 +1708,7 @@ def test_select_planner_tools_accepts_real_bounded_projection_at_cut_boundaries(
             request=request,
             tool_calls=(call,),
             tool_observations=(restored,),
+            with_trusted_target_artifacts=True,
         ),
         _read_runtime(),
     )
@@ -1855,12 +2034,16 @@ def test_select_planner_tools_accepts_nullable_point_only_in_permitted_degraded_
         observation.model_dump_json()
     )
     request = _request().model_copy(update={"message": request_message})
+    tool_calls, tool_observations = _history_with_trusted_target_artifacts(
+        (call,),
+        (observation,),
+    )
 
     offered = select_planner_tools(
         _state(
             request=request,
-            tool_calls=(call,),
-            tool_observations=(observation,),
+            tool_calls=tool_calls,
+            tool_observations=tool_observations,
         ),
         _read_runtime(),
     )
@@ -1880,11 +2063,11 @@ def test_select_planner_tools_accepts_nullable_point_only_in_permitted_degraded_
             request_id="req_planner_01",
             usage=PlannerUsage(
                 request_id="req_planner_01",
-                selection_count=1,
+                selection_count=len(tool_calls),
             ),
             offered_tools=(offered_tool,),
-            tool_calls=(call,),
-            tool_observations=(observation,),
+            tool_calls=tool_calls,
+            tool_observations=tool_observations,
         )
     )
 
@@ -2421,6 +2604,7 @@ def test_select_planner_tools_accepts_canonical_timestamp_forms(
             request=request,
             tool_calls=(call,),
             tool_observations=(observation,),
+            with_trusted_target_artifacts=True,
         ),
         _read_runtime(),
     )
@@ -2809,7 +2993,13 @@ def test_select_planner_tools_offers_proposals_only_with_write_runtime():
             )
         }
     )
-    state = _state(permissions=permissions, request=request)
+    tool_calls, tool_observations = _proposal_target_authority_history()
+    state = _state(
+        permissions=permissions,
+        request=request,
+        tool_calls=tool_calls,
+        tool_observations=tool_observations,
+    )
 
     read_only_names = {
         tool.name
@@ -2857,11 +3047,17 @@ def test_select_planner_tools_applies_each_proposal_permission(
     request = _request().model_copy(
         update={"message": "Alvos an_diag_2026 e mdl_vib_v3."}
     )
+    tool_calls, tool_observations = _proposal_target_authority_history()
 
     offered_names = {
         tool.name
         for tool in select_planner_tools(
-            _state(permissions=permissions, request=request),
+            _state(
+                permissions=permissions,
+                request=request,
+                tool_calls=tool_calls,
+                tool_observations=tool_observations,
+            ),
             _write_runtime(permissions=permissions),
         )
         if tool.name.startswith("propose_")
@@ -3009,7 +3205,8 @@ def test_planner_rejects_explicit_null_usage_before_calling_the_model():
     assert model._events == []
 
 
-def test_planner_selects_one_offered_tool_without_executing_it():
+@pytest.mark.parametrize("prior_count", [0, 1], ids=["first", "second"])
+def test_planner_uses_one_based_sequence_for_persisted_call_ids(prior_count):
     model = _RecordingPlannerModel(
         selector_response=AIMessage(
             content="",
@@ -3023,19 +3220,27 @@ def test_planner_selects_one_offered_tool_without_executing_it():
             ],
         )
     )
+    prior_calls, prior_observations = _planner_history(prior_count)
 
     result = asyncio.run(
         Planner(model).ainvoke(
             _request(),
             request_id="req_planner_01",
-            usage=PlannerUsage(request_id="req_planner_01"),
+            usage=PlannerUsage(
+                request_id="req_planner_01",
+                selection_count=prior_count,
+            ),
             offered_tools=(get_asset,),
+            tool_calls=prior_calls,
+            tool_observations=prior_observations,
         )
     )
 
     assert isinstance(result, PlannerToolTurn)
     expected_id = hashlib.sha256(
-        ("planner-v1\0req_planner_01\0" + "0").encode("utf-8")
+        (
+            "planner-v1\0req_planner_01\0" + str(prior_count + 1)
+        ).encode("utf-8")
     ).hexdigest()[:24]
     assert result.tool_call.call_id == f"call_planner_{expected_id}"
     assert result.tool_call.name == "get_asset"
@@ -5121,11 +5326,12 @@ def test_bounded_technical_projections_survive_sqlite_reopen(
         request=request,
         tool_calls=(rms_call, spectrum_call),
         tool_observations=(rms_observation, spectrum_observation),
+        with_trusted_target_artifacts=True,
     ).model_copy(
         update={
             "planner_usage": PlannerUsage(
                 request_id="req_planner_01",
-                selection_count=2,
+                selection_count=3,
             )
         }
     )
@@ -5168,10 +5374,11 @@ def test_bounded_technical_projections_survive_sqlite_reopen(
     for observation in restored_state.tool_observations:
         artifact = observation.artifact.validated_read_artifact()
         assert artifact is not None
-        assert artifact.model_content is not None
-        assert artifact.model_content.model_dump(mode="json") == (
-            observation.content.to_python()
-        )
+        if isinstance(artifact, (RmsToolArtifact, SpectrumToolArtifact)):
+            assert artifact.model_content is not None
+            assert artifact.model_content.model_dump(mode="json") == (
+                observation.content.to_python()
+            )
     assert select_planner_tools(restored_state, _read_runtime())
 
 

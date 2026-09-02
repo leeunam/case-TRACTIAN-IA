@@ -17,7 +17,7 @@ from pydantic import PrivateAttr
 
 from tractian_agent.checkpoint import open_checkpointer
 from tractian_agent.client import IndustrialApiClient
-from tractian_agent.contracts import Identity, SupportRequest
+from tractian_agent.contracts import Identity, ResponseMode, SupportRequest
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
 from tractian_agent.graph import build_agent_graph
 from tractian_agent.planner import (
@@ -29,10 +29,24 @@ from tractian_agent.planner import (
 from tractian_agent.state import (
     AgentDecision,
     AgentState,
+    PersistedToolCall,
+    PlannerUsage,
     ResumeAnchor,
     ThreadScope,
+    ToolObservation,
+)
+from tractian_agent.tools.analyses import (
+    AnalysisListToolArtifact,
+    AnalysisListToolOutcome,
+    DegradedAnalysisListModelContent,
 )
 from tractian_agent.tools.assets import AssetToolArtifact, execute_get_asset
+from tractian_agent.tools.knowledge import (
+    ModelArtifact,
+    ModelToolArtifact,
+    ModelToolOutcome,
+)
+from tractian_agent.tools.observations import ToolSource
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.write_contracts import (
     IntentStatus,
@@ -148,6 +162,95 @@ def _asset_payload() -> dict[str, object]:
     }
 
 
+def _trusted_proposal_history(
+    tool_name: str,
+    request_id: str,
+) -> tuple[tuple[PersistedToolCall, ...], tuple[ToolObservation, ...]]:
+    if tool_name in {
+        "propose_reprocess_analysis",
+        "propose_request_specialist_analysis",
+    }:
+        call = PersistedToolCall(
+            request_id=request_id,
+            call_id="call_typed_analysis_authority",
+            name="list_asset_analyses",
+            arguments={"asset_id": "asset_G501"},
+        )
+        analyses = [{"id": "an_9906", "asset_id": "asset_G501"}]
+        return (call,), (
+            ToolObservation(
+                request_id=request_id,
+                call_id=call.call_id,
+                content=DegradedAnalysisListModelContent(
+                    mode=ResponseMode.PARTIAL,
+                    notes="Descoberta tipada da solicitação.",
+                    analyses=analyses,
+                    total_analyses=1,
+                    returned_analyses=1,
+                    omitted_analyses=0,
+                    truncated=False,
+                    partial_data={},
+                ).model_dump(mode="json"),
+                artifact=AnalysisListToolArtifact(
+                    tool_name=call.name,
+                    arguments=call.arguments.to_python(),
+                    source=ToolSource(
+                        kind="industrial_api",
+                        resource="/assets/asset_G501/analyses",
+                    ),
+                    outcome=AnalysisListToolOutcome(
+                        mode=ResponseMode.PARTIAL,
+                        notes="Descoberta tipada da solicitação.",
+                        partial_data={},
+                        analyses=analyses,
+                        total_analyses=1,
+                        returned_analyses=1,
+                        omitted_analyses=0,
+                    ),
+                ),
+            ),
+        )
+    if tool_name == "propose_request_model_retraining":
+        call = PersistedToolCall(
+            request_id=request_id,
+            call_id="call_typed_model_authority",
+            name="get_model",
+            arguments={},
+        )
+        model = ModelArtifact(
+            id="mdl_vib_v3",
+            version="3.2.1",
+            coverage=[],
+            requirements={
+                "min_completeness": 0.8,
+                "min_snr_db": 12.0,
+                "min_rotation_rpm": None,
+            },
+            processing_state="idle",
+            last_run_at="2026-01-01T00:00:00Z",
+        )
+        return (call,), (
+            ToolObservation(
+                request_id=request_id,
+                call_id=call.call_id,
+                content=model.model_dump(mode="json"),
+                artifact=ModelToolArtifact(
+                    tool_name=call.name,
+                    arguments={},
+                    source=ToolSource(
+                        kind="industrial_api",
+                        resource="/models/mdl_vib_v3",
+                    ),
+                    outcome=ModelToolOutcome(
+                        mode=ResponseMode.COMPLETE,
+                        model=model,
+                    ),
+                ),
+            ),
+        )
+    return (), ()
+
+
 def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path):
     requests: list[httpx.Request] = []
 
@@ -224,7 +327,7 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
     assert len(state.tool_observations) == 1
     observation = state.tool_observations[0]
     expected_id = hashlib.sha256(
-        ("planner-v1\0req_planner_read\0" + "0").encode("utf-8")
+        ("planner-v1\0req_planner_read\0" + "1").encode("utf-8")
     ).hexdigest()[:24]
     assert observation.call_id == f"call_planner_{expected_id}"
     assert type(observation.artifact.validated_read_artifact()) is AssetToolArtifact
@@ -452,6 +555,11 @@ def test_each_planner_proposal_runs_through_tool_node_without_effect(
         )
     )
     request = _request(message=message)
+    request_id = f"req_{tool_name}"
+    trusted_calls, trusted_observations = _trusted_proposal_history(
+        tool_name,
+        request_id,
+    )
 
     async def scenario():
         client = IndustrialApiClient(
@@ -471,7 +579,7 @@ def test_each_planner_proposal_runs_through_tool_node_without_effect(
             request=request,
             identity=runtime.identity,
             permissions=runtime.permissions,
-            request_id=f"req_{tool_name}",
+            request_id=request_id,
             thread_id=f"thread_{tool_name}",
             execution_id=f"exec_{tool_name}",
             thread_scope=ThreadScope(
@@ -479,6 +587,12 @@ def test_each_planner_proposal_runs_through_tool_node_without_effect(
                 case_id=request.case_id,
                 company_id=runtime.identity.company_id,
                 user_id=runtime.identity.user_id,
+            ),
+            tool_calls=trusted_calls,
+            tool_observations=trusted_observations,
+            planner_usage=PlannerUsage(
+                request_id=request_id,
+                selection_count=len(trusted_calls),
             ),
             step_limit=20,
         )
@@ -507,7 +621,7 @@ def test_each_planner_proposal_runs_through_tool_node_without_effect(
     assert persisted.step_count == 3
     assert persisted.pending_proposal == expected
     assert persisted.tool_calls[-1].name == tool_name
-    assert persisted.tool_observations == ()
+    assert persisted.tool_observations == trusted_observations
     checkpoint_text = repr(snapshot.values)
     assert "ToolMessage" not in checkpoint_text
     assert "effect_executed" not in checkpoint_text

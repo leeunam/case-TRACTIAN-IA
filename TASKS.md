@@ -210,7 +210,7 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 - O estado nunca recebe modelo, credencial, resposta HTTP bruta, texto livre do
   seletor nem ID externo de provider. Cada `PersistedToolCall` recebe
   `call_planner_<24 hex>` derivado por SHA-256 de
-  `planner-v1\0<request_id>\0<ordinal>`; repetição continua definida pelo
+  `planner-v1\0<request_id>\0<ordinal>` com ordinal one-based; repetição continua definida pelo
   fingerprint canônico de tool e argumentos.
 - A proposal escolhida pelo planner continua indo para a política determinística
   antes de confirmação, checkpoint e qualquer HTTP. O provider não pode criar
@@ -228,7 +228,7 @@ caminho público `create_chat_model → Planner → build_agent_graph → invoke
 Eles receberam IDs externos distintos e produziram os mesmos schemas e ordem
 de catálogo, tool e argumentos persistidos, decisão `request_confirmation` e
 resultado de política `require_confirmation/explicit_approval_required`, sem
-HTTP. A suíte completa do agente passou com **1.428 testes**; os
+HTTP. A suíte completa do agente passou com **1.434 testes**; os
 locks offline resolveram 49 pacotes do agente e 55 da API. O smoke real
 `make smoke-groq` foi **skipped**, nunca passed, pois `GROQ_API_KEY` não estava
 disponível; isso não tocou a rede e deixa a compatibilidade ao vivo da conta
