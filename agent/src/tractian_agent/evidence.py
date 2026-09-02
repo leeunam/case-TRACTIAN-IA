@@ -9,113 +9,27 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
-from enum import Enum
 import hashlib
 import json
 import re
-from typing import Literal
-
-from pydantic import Field, JsonValue, field_validator
+from pydantic import JsonValue
 
 from tractian_agent.contracts import ResponseMode
-from tractian_agent.state import FrozenStateModel, JsonSnapshot, ToolObservation
-
-
-class EvidenceQuality(str, Enum):
-    CLAIMABLE = "claimable"
-    PARTIAL = "partial"
-    OBSOLETE = "obsolete"
-
-
-class EvidenceGapReason(str, Enum):
-    ERROR = "error"
-    MISSING_PROVENANCE = "missing_provenance"
-    UNVALIDATED_ARTIFACT = "unvalidated_artifact"
-    MISSING_RESPONSE_MODE = "missing_response_mode"
-    PARTIAL = "partial"
-    TRUNCATED = "truncated"
-    UNAVAILABLE = "unavailable"
-    INCONCLUSIVE = "inconclusive"
-    CONFLICT = "conflict"
-    OBSOLETE = "obsolete"
-    NO_CLAIMABLE_FACT = "no_claimable_fact"
-
-
-class EvidenceObsolescenceReason(str, Enum):
-    ANALYSIS_STALE = "analysis_status_stale"
-    BASELINE_INVALIDATED = "baseline_state_invalidated"
-    DATA_QUALITY_STALE = "data_quality_staleness_flag"
-    RECEIPT_OR_INTENT_EXPIRED = "receipt_or_intent_expired"
-
-
-class EvidenceSufficiency(str, Enum):
-    SUFFICIENT = "sufficient"
-    INSUFFICIENT = "insufficient"
-
-
-class EvidenceItem(FrozenStateModel):
-    """Um fato atômico com a proveniência necessária para auditá-lo."""
-
-    evidence_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
-    request_id: str = Field(min_length=1, pattern=r"^\S+$")
-    call_id: str = Field(min_length=1, pattern=r"^\S+$")
-    tool: str = Field(min_length=1, pattern=r"^\S+$")
-    resource: str = Field(min_length=1, pattern=r"^/")
-    fact_path: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$")
-    value: JsonSnapshot
-    mode: ResponseMode
-    source_at: datetime | None = None
-    recorded_at: datetime
-    limitations: tuple[str, ...] = ()
-    quality: EvidenceQuality
-    obsolescence: tuple[EvidenceObsolescenceReason, ...] = ()
-
-    @field_validator("source_at", "recorded_at")
-    @classmethod
-    def _require_aware_time(cls, value: datetime | None) -> datetime | None:
-        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
-            raise ValueError("instantes do ledger exigem timezone")
-        return value
-
-    @property
-    def canonical_key(self) -> str:
-        return f"{self.tool}:{self.resource}:{self.fact_path}"
-
-    @property
-    def claimable(self) -> bool:
-        return self.quality is EvidenceQuality.CLAIMABLE
-
-
-class EvidenceGap(FrozenStateModel):
-    reason: EvidenceGapReason
-    request_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
-    call_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
-    fact_path: str | None = Field(
-        default=None,
-        pattern=r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$",
-    )
-    blocking: Literal[True] = True
-
-
-class EvidenceConflict(FrozenStateModel):
-    canonical_key: str = Field(min_length=1)
-    evidence_ids: tuple[str, ...] = Field(min_length=2)
-    blocking: Literal[True] = True
-
-
-class EvidenceLedger(FrozenStateModel):
-    items: tuple[EvidenceItem, ...] = ()
-    gaps: tuple[EvidenceGap, ...] = ()
-    conflicts: tuple[EvidenceConflict, ...] = ()
-
-
-class EvidenceAssessment(FrozenStateModel):
-    status: EvidenceSufficiency
-    causes: tuple[EvidenceGapReason, ...] = ()
-
-    @property
-    def sufficient(self) -> bool:
-        return self.status is EvidenceSufficiency.SUFFICIENT
+from tractian_agent.state import (
+    EvidenceAssessment,
+    EvidenceConflict,
+    EvidenceGap,
+    EvidenceGapReason,
+    EvidenceItem,
+    EvidenceLedger,
+    EvidenceObsolescenceReason,
+    EvidenceQuality,
+    EvidenceSourceKind,
+    EvidenceSufficiency,
+    JsonSnapshot,
+    ToolObservation,
+)
+from tractian_agent.write_contracts import IntentStatus, WriteIntent
 
 
 _OUTCOME_METADATA = frozenset({"mode", "notes", "partial_data", "error"})
@@ -134,13 +48,16 @@ def _canonical_json(value: JsonValue) -> str:
 
 
 def _evidence_id(
-    *, request_id: str, call_id: str, tool: str, resource: str, fact_path: str,
+    *, request_id: str, source_kind: EvidenceSourceKind, call_id: str | None = None,
+    intent_id: str | None = None, tool: str | None = None, action: str | None = None,
+    resource: str, fact_path: str,
     value: JsonValue, mode: ResponseMode, source_at: datetime | None,
     limitations: tuple[str, ...], quality: EvidenceQuality,
     obsolescence: tuple[EvidenceObsolescenceReason, ...],
 ) -> str:
     payload: JsonValue = {
-        "request_id": request_id, "call_id": call_id, "tool": tool,
+        "request_id": request_id, "source_kind": source_kind.value,
+        "call_id": call_id, "intent_id": intent_id, "tool": tool, "action": action,
         "resource": resource, "fact_path": fact_path, "value": value,
         "mode": mode.value, "source_at": source_at.isoformat() if source_at else None,
         "limitations": list(limitations), "quality": quality.value,
@@ -325,7 +242,8 @@ def compile_observations(
             for fact_path, value in _leaves(payload, root):
                 evidence_id = _evidence_id(
                     request_id=observation.request_id, call_id=observation.call_id,
-                    tool=artifact.tool_name, resource=artifact.source.resource,
+                    source_kind=EvidenceSourceKind.TOOL, tool=artifact.tool_name,
+                    resource=artifact.source.resource,
                     fact_path=fact_path, value=value, mode=mode, source_at=source_at,
                     limitations=limitations, quality=quality, obsolescence=obsolete,
                 )
@@ -349,7 +267,125 @@ def compile_observations(
         for key, group in sorted(groups.items())
         if len({_canonical_json(item.value.to_python()) for item in group}) > 1
     )
-    return EvidenceLedger(items=unique_items, gaps=unique_gaps, conflicts=conflicts)
+    request_ids = {
+        value
+        for value in (
+            *(item.request_id for item in unique_items),
+            *(gap.request_id for gap in unique_gaps),
+        )
+        if value is not None
+    }
+    return EvidenceLedger(
+        request_id=next(iter(request_ids)) if len(request_ids) == 1 else None,
+        items=unique_items,
+        gaps=unique_gaps,
+        conflicts=conflicts,
+    )
+
+
+def compile_action_intents(
+    intents: Sequence[WriteIntent], *, recorded_at: datetime,
+) -> EvidenceLedger:
+    """Projeta somente o efeito terminal tipado; proposal e mensagem são excluídos."""
+    if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
+        raise ValueError("recorded_at exige timezone")
+    items: list[EvidenceItem] = []
+    gaps: list[EvidenceGap] = []
+    for intent in intents:
+        if intent.request_id is None or intent.status not in {
+            IntentStatus.COMPLETED,
+            IntentStatus.FAILED,
+            IntentStatus.UNCERTAIN,
+        }:
+            continue
+        if intent.status is IntentStatus.COMPLETED and intent.receipt is not None:
+            action = intent.scope.action
+            resource = f"/actions/{intent.receipt.action_id}"
+            evidence_id = _evidence_id(
+                request_id=intent.request_id,
+                source_kind=EvidenceSourceKind.ACTION,
+                intent_id=intent.intent_id,
+                action=action,
+                resource=resource,
+                fact_path="accepted",
+                value=True,
+                mode=ResponseMode.COMPLETE,
+                source_at=None,
+                limitations=(),
+                quality=EvidenceQuality.CLAIMABLE,
+                obsolescence=(),
+            )
+            items.append(
+                EvidenceItem(
+                    evidence_id=evidence_id,
+                    request_id=intent.request_id,
+                    source_kind=EvidenceSourceKind.ACTION,
+                    intent_id=intent.intent_id,
+                    action=action,
+                    resource=resource,
+                    fact_path="accepted",
+                    value=JsonSnapshot.capture(True, forbidden_names=frozenset()),
+                    mode=ResponseMode.COMPLETE,
+                    recorded_at=recorded_at,
+                    quality=EvidenceQuality.CLAIMABLE,
+                )
+            )
+            continue
+        gaps.append(
+            EvidenceGap(
+                reason=(
+                    EvidenceGapReason.UNAVAILABLE
+                    if intent.status is IntentStatus.UNCERTAIN
+                    else EvidenceGapReason.ERROR
+                ),
+                request_id=intent.request_id,
+                intent_id=intent.intent_id,
+            )
+        )
+    request_ids = {
+        value
+        for value in (
+            *(item.request_id for item in items),
+            *(gap.request_id for gap in gaps),
+        )
+        if value is not None
+    }
+    return EvidenceLedger(
+        request_id=next(iter(request_ids)) if len(request_ids) == 1 else None,
+        items=tuple(items),
+        gaps=tuple(gaps),
+    )
+
+
+def merge_ledgers(*ledgers: EvidenceLedger) -> EvidenceLedger:
+    """Une deltas determinísticos, preservando o primeiro instante registrado."""
+    items: dict[str, EvidenceItem] = {}
+    gaps: dict[str, EvidenceGap] = {}
+    for ledger in ledgers:
+        for item in ledger.items:
+            items.setdefault(item.evidence_id, item)
+        for gap in ledger.gaps:
+            gaps.setdefault(gap.model_dump_json(), gap)
+    groups: dict[str, list[EvidenceItem]] = defaultdict(list)
+    for item in items.values():
+        groups[item.canonical_key].append(item)
+    conflicts = tuple(
+        EvidenceConflict(
+            canonical_key=key,
+            evidence_ids=tuple(item.evidence_id for item in group),
+        )
+        for key, group in sorted(groups.items())
+        if len({_canonical_json(item.value.to_python()) for item in group}) > 1
+    )
+    request_ids = {
+        item.request_id for item in items.values()
+    } | {gap.request_id for gap in gaps.values() if gap.request_id is not None}
+    return EvidenceLedger(
+        request_id=next(iter(request_ids)) if len(request_ids) == 1 else None,
+        items=tuple(items.values()),
+        gaps=tuple(gaps.values()),
+        conflicts=conflicts,
+    )
 
 
 def assess_evidence(ledger: EvidenceLedger) -> EvidenceAssessment:

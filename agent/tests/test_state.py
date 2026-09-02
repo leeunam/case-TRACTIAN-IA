@@ -13,6 +13,7 @@ from tractian_agent.contracts import (
     SupportRequest,
     ToolCall,
 )
+from tractian_agent.evidence import compile_observations
 from tractian_agent.state import (
     AgentDecision,
     AgentState,
@@ -54,6 +55,7 @@ from tractian_agent.tools.runtime import TrustedIdentity
 from tractian_agent.tools.technical import (
     BaselineToolArtifact,
     BaselineToolOutcome,
+    DataQualityArtifact,
     DataQualityToolArtifact,
     DataQualityToolOutcome,
     RmsToolArtifact,
@@ -246,6 +248,75 @@ def test_agent_state_contains_the_complete_persistable_contract():
     assert state.intents[0].intent_id == "intent_018f3a"
     assert state.final_result.message == "Reprocesso preparado."
     assert state.review.status is ReviewStatus.NOT_REQUIRED
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("request_id", "req_other"),
+        ("call_id", "call_other"),
+        ("resource", "/assets/asset_other/data-quality"),
+        ("value", {"encoded": "0.01"}),
+    ],
+)
+def test_ledger_rejects_tampered_tool_provenance(field, replacement):
+    call = PersistedToolCall(
+        request_id="req_01",
+        call_id="call_ledger_01",
+        name="get_data_quality",
+        arguments={"asset_id": "asset_G501", "point_id": None},
+    )
+    observation = ToolObservation(
+        request_id="req_01",
+        call_id=call.call_id,
+        artifact=DataQualityToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=DataQualityArtifact(
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=0.98,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=False,
+                ),
+            ),
+        ),
+    )
+    ledger = compile_observations(
+        (observation,),
+        recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    valid = _state(
+        tool_calls=(call,),
+        tool_observations=(observation,),
+        ledger=ledger,
+    )
+    next_request = _request().model_copy(update={"message": "Nova solicitação."})
+    continued = valid.continue_with(
+        request=next_request,
+        identity=_identity(),
+        permissions=frozenset({"read"}),
+        request_id="req_02",
+        execution_id="exec_02",
+    )
+    assert continued.ledger.items == ()
+    assert continued.ledger_history == (ledger,)
+    wire = ledger.model_dump(mode="json")
+    wire["items"][0][field] = replacement
+
+    with pytest.raises(ValidationError, match="ledger"):
+        _state(
+            tool_calls=(call,),
+            tool_observations=(observation,),
+            ledger=wire,
+        )
 
 
 def test_new_state_starts_with_empty_typed_evidence_and_observable_collections():

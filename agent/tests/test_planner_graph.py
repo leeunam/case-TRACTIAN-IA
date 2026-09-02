@@ -285,6 +285,7 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
     )
 
     async def scenario():
+        checkpoint_path = tmp_path / "planner.sqlite3"
         client = IndustrialApiClient(
             "https://industrial.test",
             transport=httpx.MockTransport(handler),
@@ -297,7 +298,7 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
             client=client,
         )
         try:
-            async with open_checkpointer(tmp_path / "planner.sqlite3") as saver:
+            async with open_checkpointer(checkpoint_path) as saver:
                 graph = build_agent_graph(saver, planner=Planner(model))
                 state = await invoke_agent(
                     graph,
@@ -310,11 +311,22 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
                 snapshot = await graph.aget_state(
                     {"configurable": {"thread_id": "thread_planner_read"}}
                 )
-            return state, snapshot
+            async with open_checkpointer(checkpoint_path) as reopened_saver:
+                reopened = AgentState.model_validate(
+                    (
+                        await build_agent_graph(
+                            reopened_saver,
+                            planner=Planner(model),
+                        ).aget_state(
+                            {"configurable": {"thread_id": "thread_planner_read"}}
+                        )
+                    ).values
+                )
+            return state, snapshot, reopened
         finally:
             await client.aclose()
 
-    state, snapshot = asyncio.run(scenario())
+    state, snapshot, reopened = asyncio.run(scenario())
 
     assert len(requests) == 1
     assert requests[0].url.path == "/assets/asset_G501"
@@ -333,6 +345,15 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
     assert type(observation.artifact.validated_read_artifact()) is AssetToolArtifact
     assert observation.content is not None
     assert observation.content.to_python()["id"] == "asset_G501"
+    assert state.ledger.items
+    assert state.ledger.gaps == ()
+    assert reopened.ledger == state.ledger
+    assert all(item.request_id == "req_planner_read" for item in state.ledger.items)
+    assert all(item.call_id == observation.call_id for item in state.ledger.items)
+    assert any(
+        item.fact_path == "asset.criticality" and item.value.to_python() == "critical"
+        for item in state.ledger.items
+    )
     assert state.planner_terminal is not None
     assert state.planner_terminal.stop_reason == "sufficient_evidence"
     assert state.planner_failure is None
@@ -1318,6 +1339,9 @@ def test_read_transport_error_is_observed_and_never_retried(tmp_path):
     observation = state.tool_observations[0]
     assert observation.artifact.outcome.error is not None
     assert observation.artifact.outcome.error.category.value == "transport"
+    assert state.ledger.items == ()
+    assert {gap.reason.value for gap in state.ledger.gaps} == {"error"}
+    assert state.ledger.gaps[0].call_id == observation.call_id
     assert state.planner_failure is None
     assert state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
     assert state.resume_anchor is ResumeAnchor.PLANNER_FINALIZE
@@ -1408,6 +1432,9 @@ def test_degraded_read_is_persisted_and_reaches_structured_terminal(tmp_path):
     assert isinstance(artifact, AssetToolArtifact)
     assert artifact.outcome.mode is not None
     assert artifact.outcome.mode.value == "partial"
+    assert state.ledger.items
+    assert all(item.quality.value == "partial" for item in state.ledger.items)
+    assert {gap.reason.value for gap in state.ledger.gaps} == {"partial"}
 
 
 def test_unexpected_tool_failure_terminates_safely_without_retry(tmp_path):

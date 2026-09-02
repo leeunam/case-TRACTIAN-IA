@@ -22,6 +22,11 @@ from langgraph.types import StateSnapshot, interrupt
 from tractian_agent.checkpoint import get_checkpoint_owner
 from tractian_agent.client import IndustrialApiClient
 from tractian_agent.contracts import ActionReceipt, ApiError, ApiErrorCategory
+from tractian_agent.evidence import (
+    compile_action_intents,
+    compile_observations,
+    merge_ledgers,
+)
 from tractian_agent.planner import (
     Planner,
     PlannerDecisionKind,
@@ -174,6 +179,25 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _record_ledger(state: AgentState) -> AgentState:
+    """Acrescenta somente fontes tipadas da request atual ao ledger persistível."""
+    observations = tuple(
+        observation
+        for observation in state.tool_observations
+        if observation.request_id == state.request_id
+    )
+    intents = tuple(
+        intent for intent in state.intents if intent.request_id == state.request_id
+    )
+    recorded_at = datetime.now(timezone.utc)
+    ledger = merge_ledgers(
+        state.ledger,
+        compile_observations(observations, recorded_at=recorded_at),
+        compile_action_intents(intents, recorded_at=recorded_at),
+    )
+    return _replace_state(state, ledger=ledger)
+
+
 def _canonical_payload_hash(proposal: WriteProposal) -> str:
     return canonical_write_payload_hash(proposal)
 
@@ -283,10 +307,12 @@ def _terminal_result(
     decision: AgentDecision,
     message: str,
 ) -> AgentState:
-    return _replace_state(
-        state,
-        decision=decision,
-        final_result=FinalResult(decision=decision, message=message),
+    return _record_ledger(
+        _replace_state(
+            state,
+            decision=decision,
+            final_result=FinalResult(decision=decision, message=message),
+        )
     )
 
 
@@ -684,6 +710,7 @@ async def _planner_tool(
             planner_failure=None,
             resume_anchor=ResumeAnchor.PLANNER_TOOL,
         )
+        updated = _record_ledger(updated)
         if updated.step_count >= updated.step_limit:
             return _planner_failure_update(
                 updated,

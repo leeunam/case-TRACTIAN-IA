@@ -311,12 +311,20 @@ warning conhecido de `python_multipart`.
 
 **Decidir:** schema de `EvidenceItem`, regras mínimas de suficiência e representação de conflitos.
 
-- [ ] Preencher o ledger em código com fonte, valor, instante, limitações e referência ao retorno.
-- [ ] Impedir que texto livre do LLM seja registrado como fato da API.
-- [ ] Detectar evidência ausente, parcial, vencida ou conflitante.
-- [ ] Testar fundamentação e suficiência por cenário representativo.
+- [x] Preencher o ledger em código com fonte, valor, instante, limitações e referência ao retorno.
+- [x] Impedir que texto livre do LLM seja registrado como fato da API.
+- [x] Detectar evidência ausente, parcial, vencida ou conflitante.
+- [x] Testar fundamentação e suficiência por cenário representativo.
 
-**Aceite:** toda afirmação crítica liberada pode ser ligada a evidência real.
+**Aceite verificado (02/09/2026):** o `AgentState` persiste um `ledger`
+tipado da solicitação atual e mantém `ledger_history` por `request_id`. O nó de
+tool só o atualiza após `validate_planner_read_observation`; recibos de escrita
+aceitos viram fatos vinculados exclusivamente à intenção terminal, enquanto
+falhas e resultado incerto viram lacunas sanitizadas. A validação do estado
+recusa adulteração de request, call, recurso e valor. A reabertura do SQLite
+preserva o ledger e a suíte focada passou com 598 testes; a suíte completa do
+agente passou com 1.463 testes e `uv lock --check --offline` resolveu 49
+pacotes. Writer e gate continuam pendentes na Fase 8.
 
 ## Fase 8 — writer e gate de segurança
 

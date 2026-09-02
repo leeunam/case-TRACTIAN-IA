@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
 from enum import Enum
 import json
 import math
@@ -731,6 +732,135 @@ class StateEvidence(FrozenStateModel):
         )
 
 
+class EvidenceQuality(str, Enum):
+    CLAIMABLE = "claimable"
+    PARTIAL = "partial"
+    OBSOLETE = "obsolete"
+
+
+class EvidenceGapReason(str, Enum):
+    ERROR = "error"
+    MISSING_PROVENANCE = "missing_provenance"
+    UNVALIDATED_ARTIFACT = "unvalidated_artifact"
+    MISSING_RESPONSE_MODE = "missing_response_mode"
+    PARTIAL = "partial"
+    TRUNCATED = "truncated"
+    UNAVAILABLE = "unavailable"
+    INCONCLUSIVE = "inconclusive"
+    CONFLICT = "conflict"
+    OBSOLETE = "obsolete"
+    NO_CLAIMABLE_FACT = "no_claimable_fact"
+
+
+class EvidenceObsolescenceReason(str, Enum):
+    ANALYSIS_STALE = "analysis_status_stale"
+    BASELINE_INVALIDATED = "baseline_state_invalidated"
+    DATA_QUALITY_STALE = "data_quality_staleness_flag"
+    RECEIPT_OR_INTENT_EXPIRED = "receipt_or_intent_expired"
+
+
+class EvidenceSufficiency(str, Enum):
+    SUFFICIENT = "sufficient"
+    INSUFFICIENT = "insufficient"
+
+
+class EvidenceSourceKind(str, Enum):
+    TOOL = "tool"
+    ACTION = "action"
+
+
+class EvidenceItem(FrozenStateModel):
+    """Fato persistível, ligado exclusivamente a uma tool ou intenção terminal."""
+
+    evidence_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    request_id: str = Field(min_length=1, pattern=r"^\S+$")
+    source_kind: EvidenceSourceKind = EvidenceSourceKind.TOOL
+    call_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
+    intent_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
+    tool: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
+    action: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
+    resource: str = Field(min_length=1, pattern=r"^/")
+    fact_path: str = Field(
+        min_length=1,
+        pattern=r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$",
+    )
+    value: JsonSnapshot
+    mode: ResponseMode
+    source_at: datetime | None = None
+    recorded_at: datetime
+    limitations: tuple[str, ...] = ()
+    quality: EvidenceQuality
+    obsolescence: tuple[EvidenceObsolescenceReason, ...] = ()
+
+    @field_validator("source_at", "recorded_at")
+    @classmethod
+    def _require_aware_time(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("instantes do ledger exigem timezone")
+        return value
+
+    @model_validator(mode="after")
+    def _require_exclusive_provenance(self) -> EvidenceItem:
+        if self.source_kind is EvidenceSourceKind.TOOL:
+            if self.call_id is None or self.intent_id is not None or self.tool is None or self.action is not None:
+                raise ValueError("evidência de tool exige somente call_id e tool")
+        elif self.intent_id is None or self.call_id is not None or self.action is None or self.tool is not None:
+            raise ValueError("evidência de ação exige somente intent_id e action")
+        return self
+
+    @property
+    def canonical_key(self) -> str:
+        source = self.tool if self.source_kind is EvidenceSourceKind.TOOL else self.action
+        assert source is not None
+        return f"{self.source_kind.value}:{source}:{self.resource}:{self.fact_path}"
+
+    @property
+    def claimable(self) -> bool:
+        return self.quality is EvidenceQuality.CLAIMABLE
+
+
+class EvidenceGap(FrozenStateModel):
+    reason: EvidenceGapReason
+    request_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
+    call_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
+    intent_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
+    fact_path: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$",
+    )
+    blocking: Literal[True] = True
+
+    @model_validator(mode="after")
+    def _require_exclusive_provenance(self) -> EvidenceGap:
+        if self.call_id is not None and self.intent_id is not None:
+            raise ValueError("lacuna não pode referenciar tool e intenção")
+        return self
+
+
+class EvidenceConflict(FrozenStateModel):
+    canonical_key: str = Field(min_length=1)
+    evidence_ids: tuple[str, ...] = Field(min_length=2)
+    blocking: Literal[True] = True
+
+
+class EvidenceLedger(FrozenStateModel):
+    """Ledger atual de uma request; histórico permanece em ``ledger_history``."""
+
+    request_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
+    items: tuple[EvidenceItem, ...] = ()
+    gaps: tuple[EvidenceGap, ...] = ()
+    conflicts: tuple[EvidenceConflict, ...] = ()
+
+
+class EvidenceAssessment(FrozenStateModel):
+    status: EvidenceSufficiency
+    causes: tuple[EvidenceGapReason, ...] = ()
+
+    @property
+    def sufficient(self) -> bool:
+        return self.status is EvidenceSufficiency.SUFFICIENT
+
+
 class FinalResult(FrozenStateModel):
     decision: AgentDecision
     message: str = Field(min_length=1, pattern=r"\S")
@@ -810,6 +940,8 @@ class AgentState(FrozenStateModel):
     tool_calls: tuple[PersistedToolCall, ...] = ()
     tool_observations: tuple[ToolObservation, ...] = ()
     evidence: tuple[StateEvidence, ...] = ()
+    ledger: EvidenceLedger = Field(default_factory=EvidenceLedger)
+    ledger_history: tuple[EvidenceLedger, ...] = ()
     decision: AgentDecision | None = None
     step_count: int = Field(default=0, ge=0)
     step_limit: int = Field(gt=0)
@@ -1022,6 +1154,7 @@ class AgentState(FrozenStateModel):
             or len(current_observation_ids) != len(set(current_observation_ids))
         ):
             raise ValueError("IDs de tool call devem ser únicos por request_id")
+        self._validate_current_ledger()
         if self.planner_terminal is not None and self.planner_failure is not None:
             raise ValueError(
                 "decisão terminal e falha do planner são mutuamente exclusivos"
@@ -1052,6 +1185,79 @@ class AgentState(FrozenStateModel):
             raise ValueError("resultado terminal diverge da âncora persistida")
         return self
 
+    def _validate_current_ledger(self) -> None:
+        """Falha fechada se um fato persistido não vier da fonte tipada atual."""
+        ledger = self.ledger
+        for historic in self.ledger_history:
+            if historic.request_id is None:
+                raise ValueError("histórico do ledger exige request_id")
+            if any(item.request_id != historic.request_id for item in historic.items):
+                raise ValueError("fato histórico diverge da request_id")
+            if any(gap.request_id != historic.request_id for gap in historic.gaps):
+                raise ValueError("lacuna histórica diverge da request_id")
+        if not (ledger.items or ledger.gaps or ledger.conflicts):
+            if ledger.request_id is not None:
+                raise ValueError("ledger vazio não pode declarar request_id")
+            return
+        if ledger.request_id != self.request_id:
+            raise ValueError("ledger atual pertence a outra request_id")
+        if any(item.request_id != self.request_id for item in ledger.items):
+            raise ValueError("fato do ledger pertence a outra request_id")
+        if any(gap.request_id != self.request_id for gap in ledger.gaps):
+            raise ValueError("lacuna do ledger pertence a outra request_id")
+
+        # Import tardio preserva state -> evidence como fronteira sem ciclo.
+        from tractian_agent.evidence import compile_action_intents, compile_observations, merge_ledgers
+
+        observations = {
+            observation.call_id: observation
+            for observation in self.tool_observations
+            if observation.request_id == self.request_id
+        }
+        intents = {
+            intent.intent_id: intent
+            for intent in self.intents
+            if intent.request_id == self.request_id
+        }
+        for item in ledger.items:
+            if item.source_kind is EvidenceSourceKind.TOOL:
+                observation = observations.get(item.call_id)
+                if observation is None:
+                    raise ValueError("fato do ledger referencia tool ausente")
+                expected = compile_observations(
+                    (observation,), recorded_at=item.recorded_at
+                )
+            else:
+                intent = intents.get(item.intent_id)
+                if intent is None:
+                    raise ValueError("fato do ledger referencia intenção ausente")
+                expected = compile_action_intents((intent,), recorded_at=item.recorded_at)
+            if item not in expected.items:
+                raise ValueError("fato do ledger diverge da fonte tipada")
+        for gap in ledger.gaps:
+            if gap.call_id is not None:
+                observation = observations.get(gap.call_id)
+                if observation is None:
+                    raise ValueError("lacuna do ledger referencia tool ausente")
+                expected = compile_observations(
+                    (observation,), recorded_at=datetime.now().astimezone()
+                )
+            elif gap.intent_id is not None:
+                intent = intents.get(gap.intent_id)
+                if intent is None:
+                    raise ValueError("lacuna do ledger referencia intenção ausente")
+                expected = compile_action_intents(
+                    (intent,), recorded_at=datetime.now().astimezone()
+                )
+            else:
+                raise ValueError("lacuna do ledger exige proveniência")
+            if gap not in expected.gaps:
+                raise ValueError("lacuna do ledger diverge da fonte tipada")
+        expected_conflicts = merge_ledgers(ledger).conflicts
+        if ledger.conflicts != expected_conflicts:
+            raise ValueError("conflitos do ledger divergem dos fatos persistidos")
+
+
     def continue_with(
         self,
         *,
@@ -1081,6 +1287,9 @@ class AgentState(FrozenStateModel):
             execution_id=execution_id,
         )
         if not same_request:
+            history = self.ledger_history
+            if self.ledger.request_id is not None:
+                history = (*history, self.ledger)
             data.update(
                 decision=None,
                 step_count=0,
@@ -1093,6 +1302,8 @@ class AgentState(FrozenStateModel):
                 resume_anchor=ResumeAnchor.START,
                 planner_terminal=None,
                 planner_failure=None,
+                ledger=EvidenceLedger(),
+                ledger_history=history,
             )
         return type(self).model_validate(data)
 
