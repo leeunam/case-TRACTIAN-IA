@@ -1,4 +1,4 @@
-"""Fronteira Python assíncrona do grafo determinístico."""
+"""Fronteira Python assíncrona do grafo de atendimento."""
 
 from __future__ import annotations
 
@@ -10,8 +10,12 @@ from langgraph.graph import START
 from langgraph.types import Command
 
 from tractian_agent.contracts import SupportRequest
-from tractian_agent.graph import MINIMAL_GRAPH_STEP_COUNT, REPROCESS_GRAPH_STEP_COUNT
-from tractian_agent.state import AgentState, ThreadScope
+from tractian_agent.graph import (
+    MINIMAL_GRAPH_STEP_COUNT,
+    PLANNER_GRAPH_STEP_LIMIT,
+    REPROCESS_GRAPH_STEP_COUNT,
+)
+from tractian_agent.state import AgentState, ResumeAnchor, ThreadScope
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.write_contracts import (
     ConfirmationReply,
@@ -44,6 +48,9 @@ class GraphStateSnapshot(Protocol):
 
 
 class AgentGraph(Protocol):
+    @property
+    def planner_enabled(self) -> bool: ...
+
     def thread_lock(self, thread_id: str) -> AbstractAsyncContextManager[None]: ...
 
     async def aget_state(
@@ -69,15 +76,28 @@ class AgentGraph(Protocol):
     ) -> dict[str, object]: ...
 
 
-_PENDING_PREDECESSORS = {
-    "ingest": START,
-    "route": "ingest",
-    "finish": "route",
-    "write_policy": "ingest",
-    "confirmation_gate": "write_policy",
-    "prepare_intent": "confirmation_gate",
-    "execute_action": "prepare_intent",
+_COMMON_RESUME_PAIRS = {
+    (ResumeAnchor.START, "ingest"),
+    (ResumeAnchor.INGEST, "write_policy"),
+    (ResumeAnchor.WRITE_POLICY, "confirmation_gate"),
+    (ResumeAnchor.CONFIRMATION_GATE, "prepare_intent"),
+    (ResumeAnchor.PREPARE_INTENT, "execute_action"),
 }
+_FALLBACK_RESUME_PAIRS = {
+    (ResumeAnchor.INGEST, "route"),
+    (ResumeAnchor.ROUTE, "finish"),
+}
+_PLANNER_RESUME_PAIRS = {
+    (ResumeAnchor.INGEST, "planner_select"),
+    (ResumeAnchor.PLANNER_SELECT, "planner_tool"),
+    (ResumeAnchor.PLANNER_SELECT, "planner_finalize"),
+    (ResumeAnchor.PLANNER_TOOL, "planner_select"),
+    (ResumeAnchor.PLANNER_TOOL, "write_policy"),
+}
+_ALLOWED_RESUME_PAIRS = (
+    _COMMON_RESUME_PAIRS | _FALLBACK_RESUME_PAIRS | _PLANNER_RESUME_PAIRS
+)
+_KNOWN_PENDING_NODES = frozenset(node for _, node in _ALLOWED_RESUME_PAIRS)
 
 _ACTIVE_INTENT_STATUSES = frozenset(
     {
@@ -96,7 +116,7 @@ def _require_opaque_id(value: str, *, name: str) -> str:
     return value
 
 
-def _pending_predecessor(next_nodes: tuple[str, ...]) -> str:
+def _pending_node(next_nodes: tuple[str, ...]) -> str:
     if not next_nodes:
         raise AgentInvocationProtocolError(
             "NON_TERMINAL_WITHOUT_PENDING_WORK",
@@ -108,13 +128,66 @@ def _pending_predecessor(next_nodes: tuple[str, ...]) -> str:
             "checkpoint possui múltiplos nós pendentes",
         )
     pending_node = next_nodes[0]
-    try:
-        return _PENDING_PREDECESSORS[pending_node]
-    except KeyError as error:
+    if pending_node not in _KNOWN_PENDING_NODES:
         raise AgentInvocationProtocolError(
             "UNKNOWN_PENDING_NODE",
             f"checkpoint possui nó pendente desconhecido: {pending_node}",
+        )
+    return pending_node
+
+
+def _required_resume_anchor(
+    persisted_values: Mapping[str, object],
+) -> ResumeAnchor:
+    if "resume_anchor" not in persisted_values or persisted_values.get(
+        "resume_anchor"
+    ) is None:
+        raise AgentInvocationProtocolError(
+            "MISSING_RESUME_ANCHOR",
+            "checkpoint não registra o último nó concluído",
+        )
+    raw_anchor = persisted_values["resume_anchor"]
+    try:
+        return ResumeAnchor(raw_anchor)
+    except (TypeError, ValueError) as error:
+        raise AgentInvocationProtocolError(
+            "UNKNOWN_RESUME_ANCHOR",
+            "checkpoint registra uma âncora desconhecida",
         ) from error
+
+
+def _resume_predecessor(
+    anchor: ResumeAnchor,
+    next_nodes: tuple[str, ...],
+    *,
+    planner_enabled: bool,
+) -> str:
+    pending_node = _pending_node(next_nodes)
+    if (anchor, pending_node) not in _ALLOWED_RESUME_PAIRS:
+        raise AgentInvocationProtocolError(
+            "RESUME_ANCHOR_MISMATCH",
+            "a âncora persistida diverge do próximo nó",
+        )
+    topology_pairs = _COMMON_RESUME_PAIRS | (
+        _PLANNER_RESUME_PAIRS if planner_enabled else _FALLBACK_RESUME_PAIRS
+    )
+    if (anchor, pending_node) not in topology_pairs:
+        raise AgentInvocationProtocolError(
+            "RESUME_TOPOLOGY_MISMATCH",
+            "checkpoint parcial pertence a outra topologia de grafo",
+        )
+    return anchor.value
+
+
+def _validate_terminal_resume_anchor(
+    state: AgentState,
+    anchor: ResumeAnchor,
+) -> None:
+    if anchor is not state.resume_anchor or not state.has_coherent_terminal_result():
+        raise AgentInvocationProtocolError(
+            "RESUME_ANCHOR_MISMATCH",
+            "a âncora terminal diverge do resultado persistido",
+        )
 
 
 def _replace_state(state: AgentState, **changes: object) -> AgentState:
@@ -134,6 +207,17 @@ def _required_step_count(state: AgentState) -> int:
 def _current_request_intents(state: AgentState) -> tuple[WriteIntent, ...]:
     return tuple(
         intent for intent in state.intents if intent.request_id == state.request_id
+    )
+
+
+def _request_id_has_history(state: AgentState, request_id: str) -> bool:
+    return (
+        any(intent.request_id == request_id for intent in state.intents)
+        or any(call.request_id == request_id for call in state.tool_calls)
+        or any(
+            observation.request_id == request_id
+            for observation in state.tool_observations
+        )
     )
 
 
@@ -189,6 +273,7 @@ def _validate_write_boundary(
     proposal: WriteProposal | None,
     confirmation: ConfirmationReply | None,
     original_approval: TrustedActionApproval | None,
+    planner_enabled: bool = False,
 ) -> None:
     write_requested = (
         proposal is not None
@@ -202,7 +287,11 @@ def _validate_write_boundary(
             "WRITE_RUNTIME_REQUIRED",
             "o fluxo de escrita exige contexto confiável de escrita",
         )
-    if original_approval is not None and proposal is None:
+    if (
+        original_approval is not None
+        and proposal is None
+        and not planner_enabled
+    ):
         raise AgentInvocationProtocolError(
             "ORIGINAL_APPROVAL_WITHOUT_PROPOSAL",
             "aprovação original exige proposta na mesma entrada",
@@ -232,6 +321,52 @@ def _validate_write_boundary(
         raise AgentInvocationProtocolError(
             "WRITE_ASSET_SCOPE_MISMATCH",
             "o ativo central do runtime diverge da solicitação",
+        )
+
+
+def _validate_runtime_request_scope(
+    request: SupportRequest,
+    runtime: ReadToolRuntime,
+) -> None:
+    if runtime.identity.model_dump() != request.identity.model_dump():
+        raise AgentInvocationProtocolError(
+            "RUNTIME_IDENTITY_SCOPE_MISMATCH",
+            "a identidade confiável diverge da solicitação",
+        )
+    if (
+        request.asset_id is not None
+        and runtime.central_asset_id != request.asset_id
+    ):
+        raise AgentInvocationProtocolError(
+            "RUNTIME_ASSET_SCOPE_MISMATCH",
+            "o ativo central do runtime diverge da solicitação",
+        )
+
+
+def _validate_current_read_access(
+    state: AgentState,
+    runtime: ReadToolRuntime,
+    *,
+    planner_enabled: bool,
+    include_current_flow: bool,
+) -> None:
+    if "read" in runtime.permissions:
+        return
+    contains_read_artifact = bool(state.tool_observations)
+    current_intents = _current_request_intents(state)
+    fallback_read_result = include_current_flow and (
+        state.resume_anchor is ResumeAnchor.FINISH
+        or (
+            not planner_enabled
+            and state.pending_proposal is None
+            and state.approval is None
+            and not current_intents
+        )
+    )
+    if contains_read_artifact or fallback_read_result:
+        raise AgentInvocationProtocolError(
+            "READ_PERMISSION_REQUIRED",
+            "o runtime atual não pode acessar resultado de leitura",
         )
 
 
@@ -310,19 +445,34 @@ async def invoke_agent(
     thread_id = _require_opaque_id(thread_id, name="thread_id")
     request_id = _require_opaque_id(request_id, name="request_id")
     execution_id = _require_opaque_id(execution_id, name="execution_id")
+    planner_enabled = bool(getattr(graph, "planner_enabled", False))
     _validate_write_boundary(
         request=request,
         runtime=runtime,
         proposal=proposal,
         confirmation=confirmation,
         original_approval=original_approval,
+        planner_enabled=planner_enabled,
     )
+    _validate_runtime_request_scope(request, runtime)
     resolved_step_limit = step_limit
     if resolved_step_limit is None:
-        resolved_step_limit = (
-            REPROCESS_GRAPH_STEP_COUNT
-            if proposal is not None or confirmation is not None
-            else MINIMAL_GRAPH_STEP_COUNT
+        if planner_enabled:
+            resolved_step_limit = PLANNER_GRAPH_STEP_LIMIT
+        else:
+            resolved_step_limit = (
+                REPROCESS_GRAPH_STEP_COUNT
+                if proposal is not None or confirmation is not None
+                else MINIMAL_GRAPH_STEP_COUNT
+            )
+    if planner_enabled and (
+        isinstance(resolved_step_limit, bool)
+        or not isinstance(resolved_step_limit, int)
+        or resolved_step_limit > PLANNER_GRAPH_STEP_LIMIT
+    ):
+        raise AgentInvocationProtocolError(
+            "PLANNER_STEP_LIMIT_EXCEEDED",
+            "o caminho do planner aceita no máximo 20 passos",
         )
     config: dict[str, object] = {"configurable": {"thread_id": thread_id}}
 
@@ -330,12 +480,57 @@ async def invoke_agent(
         snapshot = await graph.aget_state(config)
         persisted_values = snapshot.values
         if persisted_values:
+            checkpoint_anchor = _required_resume_anchor(persisted_values)
             persisted = AgentState.model_validate(persisted_values)
             new_request = request_id != persisted.request_id
+            if persisted.final_result is not None:
+                _validate_terminal_resume_anchor(persisted, checkpoint_anchor)
+                if snapshot.next:
+                    raise AgentInvocationProtocolError(
+                        "TERMINAL_WITH_PENDING_WORK",
+                        "checkpoint terminal ainda possui trabalho pendente",
+                    )
+                resume_predecessor = None
+            else:
+                resume_predecessor = (
+                    _resume_predecessor(
+                        checkpoint_anchor,
+                        snapshot.next,
+                        planner_enabled=planner_enabled,
+                    )
+                    if snapshot.next
+                    else None
+                )
+            _validate_current_read_access(
+                persisted,
+                runtime,
+                planner_enabled=planner_enabled,
+                include_current_flow=not new_request,
+            )
+            if (
+                planner_enabled
+                and not new_request
+                and persisted.step_limit > PLANNER_GRAPH_STEP_LIMIT
+            ):
+                raise AgentInvocationProtocolError(
+                    "PLANNER_STEP_LIMIT_EXCEEDED",
+                    "checkpoint do planner excede o teto de 20 passos",
+                )
+            persisted_original_approval = (
+                persisted.approval
+                if (
+                    not new_request
+                    and persisted.approval is not None
+                    and persisted.approval.source
+                    is ApprovalSource.ORIGINAL_REQUEST
+                )
+                else None
+            )
             write_flow = (
                 proposal is not None
                 or confirmation is not None
                 or original_approval is not None
+                or persisted_original_approval is not None
                 or (
                     not new_request
                     and persisted.pending_proposal is not None
@@ -351,7 +546,8 @@ async def invoke_agent(
                         else persisted.pending_proposal
                     ),
                     confirmation=confirmation,
-                    original_approval=None,
+                    original_approval=persisted_original_approval,
+                    planner_enabled=planner_enabled,
                 )
                 _validate_legacy_intents_for_write(persisted)
             state = persisted.continue_with(
@@ -369,11 +565,6 @@ async def invoke_agent(
                     original_approval=original_approval,
                 )
             if not new_request and persisted.final_result is not None:
-                if snapshot.next:
-                    raise AgentInvocationProtocolError(
-                        "TERMINAL_WITH_PENDING_WORK",
-                        "checkpoint terminal ainda possui trabalho pendente",
-                    )
                 if confirmation is not None and not _terminal_confirmation_replay(
                     persisted,
                     confirmation,
@@ -389,13 +580,10 @@ async def invoke_agent(
                         "STALE_CONFIRMATION",
                         "confirmação não pode iniciar uma nova solicitação",
                     )
-                if proposal is not None and any(
-                    intent.request_id == request_id
-                    for intent in persisted.intents
-                ):
+                if _request_id_has_history(persisted, request_id):
                     raise AgentInvocationProtocolError(
                         "REQUEST_ID_ALREADY_USED",
-                        "request_id de escrita já pertence ao histórico do thread",
+                        "request_id já pertence ao histórico do thread",
                     )
                 if any(
                     intent.status in _ACTIVE_INTENT_STATUSES
@@ -409,6 +597,12 @@ async def invoke_agent(
                     state,
                     pending_proposal=proposal,
                     approval=original_approval,
+                )
+                _validate_current_read_access(
+                    state,
+                    runtime,
+                    planner_enabled=planner_enabled,
+                    include_current_flow=True,
                 )
                 if (
                     state.pending_proposal is not None
@@ -443,7 +637,15 @@ async def invoke_agent(
                             "CONFIRMATION_REQUIRED",
                             "o fluxo aguarda uma confirmação estruturada",
                         )
-                    predecessor = _pending_predecessor(snapshot.next)
+                    predecessor = (
+                        resume_predecessor
+                        if resume_predecessor is not None
+                        else _resume_predecessor(
+                            checkpoint_anchor,
+                            snapshot.next,
+                            planner_enabled=planner_enabled,
+                        )
+                    )
                     config = await graph.aupdate_state(
                         snapshot.config,
                         state.model_dump(mode="json"),
@@ -481,6 +683,12 @@ async def invoke_agent(
                 pending_proposal=proposal,
                 approval=original_approval,
             )
+            _validate_current_read_access(
+                state,
+                runtime,
+                planner_enabled=planner_enabled,
+                include_current_flow=True,
+            )
             invocation_input = state.model_dump(mode="json")
 
         await graph.ainvoke(
@@ -495,4 +703,10 @@ async def invoke_agent(
         if not final_snapshot.values:
             raise TypeError("o grafo não persistiu estado após a execução")
         final_state = AgentState.model_validate(final_snapshot.values)
+        _validate_current_read_access(
+            final_state,
+            runtime,
+            planner_enabled=planner_enabled,
+            include_current_flow=True,
+        )
     return final_state

@@ -371,6 +371,7 @@ class RmsToolOutcome(ToolOutcome):
 
 class RmsToolArtifact(ToolArtifact):
     outcome: RmsToolOutcome
+    model_content: RmsModelContent | None = None
 
 
 class GetRmsSeriesResult(StrictModel):
@@ -474,6 +475,7 @@ async def execute_get_rms_series(
                 outcome=RmsToolOutcome(
                     mode=result.mode, notes=result.notes, rms=normalized
                 ),
+                model_content=content,
                 truncated=artifact_omitted > 0,
                 omitted_items=artifact_omitted,
             ),
@@ -562,6 +564,7 @@ class SpectrumToolOutcome(ToolOutcome):
 
 class SpectrumToolArtifact(ToolArtifact):
     outcome: SpectrumToolOutcome
+    model_content: SpectrumModelContent | None = None
 
 
 class GetSpectrumResult(StrictModel):
@@ -601,7 +604,10 @@ def _normalize_spectrum(
             peaks=prompt_peaks,
             omitted_peaks=len(peaks) - len(prompt_peaks),
         ),
-        SpectrumArtifact(**base, peaks=artifact_peaks),
+        SpectrumArtifact(
+            **base,
+            peaks=artifact_peaks,
+        ),
         artifact_omitted,
     )
 
@@ -651,6 +657,7 @@ async def execute_get_spectrum(
                 outcome=SpectrumToolOutcome(
                     mode=result.mode, notes=result.notes, spectrum=normalized
                 ),
+                model_content=content,
                 truncated=artifact_omitted > 0,
                 omitted_items=artifact_omitted,
             ),

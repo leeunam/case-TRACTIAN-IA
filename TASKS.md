@@ -198,13 +198,51 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decidir:** modelo Groq inicial, temperatura, timeout, limites e contrato comum de provider.
 
-- [ ] Criar interface de modelo independente do provedor.
-- [ ] Implementar adapter inicial do Groq.
-- [ ] Criar prompt e saída estruturada do planner.
-- [ ] Expor apenas tools pertinentes ao estado atual.
-- [ ] Limitar passos, repetição e consumo de contexto.
+**Decisões implementadas:**
 
-**Aceite:** trocar o adapter não altera estado, tools ou regras de segurança.
+- `ModelProvider.create_chat_model(ModelConfig)` isola o adapter do domínio. O
+  primeiro adapter é `GroqModelProvider`, com `openai/gpt-oss-120b`, temperatura
+  zero, timeout de 30 segundos, máximo de 512 tokens e `max_retries=0`.
+- O planner versionado usa uma seleção via `bind_tools` e uma finalização
+  Pydantic separada. O grafo só oferece catálogo autorizado pelo estado e
+  runtime, limita sete tools, oito seleções, uma finalização, 48 mil caracteres
+  e 20 passos; tool inválida, repetida ou fora de escopo falha fechada.
+- O estado nunca recebe modelo, credencial, resposta HTTP bruta, texto livre do
+  seletor nem ID externo de provider. Cada `PersistedToolCall` recebe
+  `call_planner_<24 hex>` derivado por SHA-256 de
+  `planner-v1\0<request_id>\0<ordinal>` com ordinal one-based; repetição continua definida pelo
+  fingerprint canônico de tool e argumentos.
+- A proposal escolhida pelo planner continua indo para a política determinística
+  antes de confirmação, checkpoint e qualquer HTTP. O provider não pode criar
+  aprovação, identidade, permissão ou efeito de escrita.
+- `make smoke-groq` é opt-in e fica fora de `make test`: compara os dois modelos
+  Groq com dados sintéticos e sem retry, emitindo apenas status e métricas
+  agregadas. Uma rodada declara estabilidade `not_measured`; com
+  `GROQ_SMOKE_RUNS>=2`, compara assinaturas de contratos entre rodadas. Sem
+  `GROQ_API_KEY`, não constrói provider nem toca a rede, imprime
+  `status=skipped reason=missing_groq_api_key` e sai com zero.
+
+**Evidência final de aceite (01/09/2026):** os testes focados de provider,
+planner, grafo e smoke passaram, incluindo dois `ModelProvider` falsos pelo
+caminho público `create_chat_model → Planner → build_agent_graph → invoke_agent`.
+Eles receberam IDs externos distintos e produziram os mesmos schemas e ordem
+de catálogo, tool e argumentos persistidos, decisão `request_confirmation` e
+resultado de política `require_confirmation/explicit_approval_required`, sem
+HTTP. A suíte completa do agente passou com **1.434 testes**; os
+locks offline resolveram 49 pacotes do agente e 55 da API. O smoke real
+`make smoke-groq` foi **skipped**, nunca passed, pois `GROQ_API_KEY` não estava
+disponível; isso não tocou a rede e deixa a compatibilidade ao vivo da conta
+como verificação futura opt-in.
+
+- [x] Criar interface de modelo independente do provedor.
+- [x] Implementar adapter inicial do Groq.
+- [x] Criar prompt e saída estruturada do planner.
+- [x] Expor apenas tools pertinentes ao estado atual.
+- [x] Limitar passos, repetição e consumo de contexto.
+
+**Aceite verificado:** trocar o adapter não altera estado, tools ou regras de
+segurança; a prova usa providers falsos e o smoke ao vivo permanece skipped até
+existir uma chave Groq no ambiente.
 
 ## Fase 7 — ledger de evidências
 
@@ -572,3 +610,233 @@ globais.
 - Marcar Fases 4 e 5 somente se todos os itens e aceites estiverem demonstrados.
 - README deve distinguir grafo determinístico/checkpointer e proposal tools reais de planner, writer, ledger, Logfire e avaliação ainda planejados.
 - Não ampliar o contrato da API com idempotência para os outros quatro endpoints nesta entrega.
+
+## Plano de implementação SDD — Fase 6
+
+Este plano conclui somente provider e planner. Writer, resposta gerada ao
+cliente, ledger completo, porta de segurança, Logfire e avaliações permanecem
+fora do escopo. Cada tarefa segue uma fatia vertical `RED → GREEN → refactor`,
+recebe revisão independente e só avança depois de aprovada.
+
+### Task 9 — consolidar o provider comum e o adapter Groq
+
+**Objetivo:** transformar a base local já iniciada em uma fronteira completa,
+testável e sem credenciais no contrato comum.
+
+**Decisões:** usar `openai/gpt-oss-120b` como modelo inicial do planner,
+`temperature=0`, timeout de 30 segundos, no máximo 512 tokens de saída e
+`max_retries=0`. A escolha privilegia qualidade multilíngue e tool use; o
+`openai/gpt-oss-20b` permanece candidato de menor latência. A chave vem somente
+de `GROQ_API_KEY`; `.env` pode fornecê-la ao processo, mas nunca é lido pelo
+runtime do agente nem persistido. NVIDIA NIM continua comparação futura.
+
+**Arquivos:** consolidar `agent/src/tractian_agent/model_provider.py`,
+`agent/src/tractian_agent/groq_provider.py`, `agent/pyproject.toml`,
+`agent/uv.lock` e seus testes; adicionar apenas uma amostra segura de ambiente
+se ela for necessária para tornar o uso inequívoco.
+
+**Contrato e testes:**
+
+- `ModelConfig` é estrito, congelado e contém somente ID, temperatura, timeout e limite de saída; não contém provider, chave ou segredo.
+- `model_id` é um identificador opaco sem espaços; limites rejeitam bool, string, zero, negativos, NaN, infinito e campos extras.
+- `ModelProvider.create_chat_model(config)` devolve `BaseChatModel` e aceita implementações estruturais falsas.
+- `GroqModelProvider` traduz o contrato para `ChatGroq`, desativa retries ocultos e oferece construção explícita a partir de `GROQ_API_KEY` com erro claro quando ausente ou vazia.
+- Testes não acessam a rede e demonstram que a chave não aparece em `repr`, configuração comum, estado ou mensagens de erro.
+- Executar testes focados, `uv lock --check`, self-review e commit próprio.
+
+### Task 10 — primeira fatia vertical do planner
+
+**Objetivo:** provar, fora do grafo de produção, o ciclo tipado
+`pedido → seleção de tool → observação → decisão`.
+
+**Decisões:** a Groq não combina tool calling e JSON Schema estrito na mesma
+requisição. O planner primeiro usa `bind_tools`; se não houver tool, descarta o
+texto livre e faz uma segunda requisição sem tools com saída Pydantic. A saída
+terminal aceita somente `guide`, `request_information` ou
+`require_human_review`, com motivo de parada enumerado e informação ausente
+curta quando aplicável. `act`, `escalate` e `request_confirmation` continuam
+exclusivos da política determinística após uma proposal tool.
+
+**Decisões implementadas nesta fatia:** o prompt `planner-v1` e a classe
+`Planner` permanecem isolados do grafo. A seleção usa somente `bind_tools` com
+o catálogo recebido pelo chamador, valida no máximo uma chamada pelo schema
+público da tool e falha fechada para nome, argumentos ou forma inválidos. A
+ausência de chamada descarta o texto do seletor e inicia outra requisição no
+modelo original com `with_structured_output(PlannerTerminalDecision)`. A
+decisão terminal não contém resposta do writer; seu motivo é coerente com a
+decisão e `missing_information` é limitado a 300 caracteres e existe somente
+para `request_information`. `ToolObservation.content` guarda o JSON entregue
+ao próximo turno sem expor o artifact técnico, e o wire de `JsonSnapshot` é
+restaurável após fechar e reabrir o checkpointer SQLite. Nenhum `BaseChatModel`,
+`AIMessage`, runtime, segredo, resposta HTTP bruta ou texto livre do seletor
+entra no estado.
+
+**Arquivos:** criar `agent/src/tractian_agent/planner.py` e testes focados;
+evoluir `state.py` e seus testes somente para persistir valores observáveis e
+JSON-safe necessários ao ciclo.
+
+**Contrato e testes:**
+
+- O prompt de sistema versionado separa planner de writer, manda usar uma tool por turno, proíbe inventar evidência e esclarece que proposal tool não executa efeito.
+- Um modelo falso demonstra que seleção com `bind_tools` e finalização com `with_structured_output` acontecem em requisições distintas.
+- Exatamente uma tool oferecida é aceita por turno; tool desconhecida, múltiplas chamadas ou saída terminal inválida falham fechadas antes do HTTP.
+- Texto livre da chamada de seleção não vira decisão, resposta ao cliente, evidência ou raciocínio persistido.
+- Chamadas, conteúdo entregue ao próximo turno e artifact validado são persistíveis; runtime, `BaseChatModel`, `AIMessage`, segredo e resposta HTTP bruta não entram no estado.
+- Fechar e reabrir um SQLite temporário preserva chamada e observação sem implementar o futuro ledger.
+- Construir cada comportamento em um ciclo TDD vertical e fazer commit próprio.
+
+### Task 11 — catálogo pertinente e limites determinísticos
+
+**Objetivo:** limitar o que o modelo pode escolher e quanto trabalho uma
+solicitação pode consumir, sem classificador baseado em palavras-chave.
+
+**Decisões:** permitir no máximo sete tool calls, oito chamadas de seleção,
+uma finalização estruturada, nenhuma repetição da mesma combinação canônica
+`tool + argumentos`, 48 mil caracteres de contexto e 20 passos no caminho do
+planner. O orçamento em caracteres é deliberadamente independente do tokenizer
+do provider; excedê-lo corta contexto antigo de modo explícito ou encerra antes
+de nova chamada, nunca aumenta o limite silenciosamente.
+
+**Decisões implementadas nesta fatia:** `select_planner_tools` reutiliza os
+catálogos estáticos e filtra somente por escopo confiável, permissões, tipo do
+runtime e IDs tipados presentes no pedido ou em campos estruturais específicos
+das tools que realmente os produzem, sempre na mesma `request_id`; notas,
+erros, snippets e texto livre incidental não concedem acesso. A chamada
+selecionada é validada novamente contra esses conjuntos, o ativo central e os
+pontos explícitos ou observados; pares atuais que contradizem esses alvos são
+histórico inválido e falham antes do modelo. Chamadas, observações e
+`PlannerUsage` ficam
+vinculados à solicitação; histórico legado sem `request_id` permanece
+auditável como não atribuído e não entra no contexto, fingerprint ou orçamento
+atuais, enquanto uma nova solicitação zera somente os contadores transitórios.
+A fronteira exige `request_id` e `PlannerUsage` e bloqueia antes de `bind_tools`
+quando já há sete chamadas concluídas, oito seleções ou uma finalização; saídas
+inválidas
+do modelo consomem e devolvem o uso atualizado no erro de protocolo. O
+fingerprint canônico usa somente tool e argumentos, sem o `call_id` do provider.
+O preflight também rejeita como histórico inválido dois fingerprints canônicos
+já persistidos na solicitação atual, antes de expor qualquer payload ao modelo.
+Cada call atual precisa pertencer aos catálogos estáticos e ter argumentos
+equivalentes ao wire validado pelo schema público; o dump canônico validado é
+usado no fingerprint, na validação de alvo e no contexto.
+Antes de qualquer catálogo, fingerprint ou contexto, uma única validação
+sequencial compartilhada pelo seletor e pelo planner reidrata o artifact pelo
+modelo concreto de cada uma das dez read tools, confere `source.resource`,
+escopo, metadata e a projeção exata `outcome → content`. Erros aceitam somente
+o envelope sanitizado e não concedem IDs; resultados completos ou degradados
+só concedem IDs presentes nos campos tipados que a tool realmente projeta.
+Artifacts persistidos conservam essa projeção especializada de forma JSON-safe
+e a revalidam pelo modelo exato após reabertura do checkpoint, sem guardar HTTP
+bruto ou objetos de runtime.
+Para RMS e espectro truncados, o artifact especializado conserva ainda uma
+projeção limitada e tipada idêntica ao conteúdo do modelo (no máximo 100
+amostras ou 20 picos). O preflight compara todo o conteúdo contra essa forma
+autoritativa após JSON/SQLite, além de conferir os índices compartilhados com
+a projeção técnica principal; artifacts truncados antigos sem prova suficiente
+falham fechados. A validação semântica também reaplica as restrições reais dos
+wires normalizados de ativo, análise/lista, baseline, RMS, espectro, qualidade
+e documento. Em respostas degradadas, `point_id: null` significa somente
+ausência de evidência para cadastro de ativo, lista genérica de análises e
+detalhe de análise; não autoriza ponto e continua inválido nas quatro tools
+técnicas.
+O orçamento de contexto mede o wire OpenAI-compatible de mensagens e schemas
+das tools, remove apenas pares completos antigos com marcador explícito e não
+remove a observação mais recente nem erros/modos degradados; se o conjunto
+protegido não couber, falha antes do modelo. Antes da segunda requisição, o
+contexto é recalculado com o schema real de `PlannerTerminalDecision`; falha de
+espaço preserva a seleção consumida sem iniciar a finalização. O limite de 20
+passos permanece no `AgentState.step_limit` e será integrado ao caminho do
+planner somente na Task
+12, sem alterar grafo ou entrypoint nesta fatia.
+
+**Arquivos:** evoluir `planner.py`, contratos persistíveis estritamente
+necessários e testes; reutilizar `READ_TOOLS` e `WRITE_PROPOSAL_TOOLS` sem
+recriar catálogos paralelos.
+
+**Contrato e testes:**
+
+- `select_planner_tools(state, runtime)` é puro: leitura exige `read`; propostas exigem `WriteToolRuntime`, a permissão correspondente e os pré-requisitos observáveis.
+- Tools dependentes de IDs só aparecem depois que o ID está no pedido ou em uma observação validada; o runtime não lê cenários, golden set nem arquivos de avaliação.
+- Histórico de outra `request_id` não entra no prompt nem conta como repetição da solicitação atual.
+- Duas chamadas com argumentos distintos são possíveis; uma chamada canonicamente idêntica não executa uma segunda vez.
+- O oitavo tool call, a nona seleção, falta de espaço para o pedido atual ou contexto excedido param deterministicamente antes de LLM/HTTP.
+- Erros e modos degradados permanecem visíveis para a decisão seguinte, sem serem convertidos em sucesso.
+- Limites e fingerprints têm testes de fronteira e a tarefa termina em commit próprio.
+
+**Evidência desta fatia (01/09/2026):** os 339 testes focados de planner,
+estado e checkpoint passaram; `uv lock --check --offline` resolveu 49 pacotes;
+a suíte completa do agente passou com 1.184 testes; e `make test` passou com 59
+testes da API e 1.184 do agente (1.243 no total), mantendo somente o
+`PendingDeprecationWarning` conhecido de `python_multipart`.
+No quinto ciclo corretivo, os **395 testes** de planner e estado passaram
+(393 no sandbox e os dois casos SQLite em execução externa), incluindo a
+matriz dos dez artifacts, erros sanitizados, modos degradados e round-trip JSON;
+os locks offline de API e agente e `git diff --check` também passaram.
+No sexto ciclo corretivo, a suíte focada completa passou externamente com
+**752 testes**, incluindo a reabertura SQLite das projeções técnicas; dois
+casos adicionais de adulteração exatamente nos cortes passaram localmente,
+assim como **751 testes sem SQLite**. Os locks offline continuaram resolvendo
+49 pacotes no agente e 55 na API.
+No sétimo ciclo corretivo, a validação degradada de `get_asset` passou a
+reutilizar a mesma regra do executor para o `id` primário, aliases recursivos
+normalizados de ativo/empresa e estrutura de pontos, preservando
+`point_id: null` apenas como ausência de evidência. O planner eliminou seu
+parser divergente de timestamps e reutiliza `parse_aware_iso_timestamp` em
+análises, baseline, RMS, espectro e modelo. Passaram **782 testes sem SQLite**;
+o novo restore SQLite passou externamente, e os locks offline permaneceram em
+49 pacotes do agente e 55 da API.
+No oitavo ciclo corretivo, `CompanyId` tornou-se o tipo compartilhado entre o
+wire completo de ativo e o preflight do planner. Assim, um artifact correlato
+com empresa fora de `comp_*` falha como histórico inválido antes do catálogo ou
+modelo, mesmo quando pedido e runtime carregam o mesmo tenant amplo. O wire de
+ponto também reutiliza `PointId`; a auditoria dos identificadores confirmou
+que ativo, empresa, pai e ponto preservam a autoridade do wire, enquanto o
+`point.asset_id` descartado continua validado pelo executor antes da
+normalização. Passaram **784 testes focados sem SQLite**, e os locks offline
+permaneceram em 49 pacotes do agente e 55 da API.
+
+### Task 12 — integrar o planner ao LangGraph e preservar as escritas
+
+**Objetivo:** substituir o caminho de leitura fictício por um loop real do
+planner, mantendo intacta a fronteira determinística dos cinco efeitos.
+
+**Decisões:** o grafo recebe o planner/modelo como dependência de construção,
+nunca como estado. O caminho novo é
+`ingest → planner_select → planner_tool → planner_select`; ausência de tool
+leva a `planner_finalize`, e uma proposal tool leva imediatamente a
+`write_policy`. Um `resume_anchor` observável registra o último nó concluído e
+a fronteira valida pares permitidos `(anchor, next)` antes de retomar ciclos.
+O builder sem planner preserva o pequeno fluxo determinístico apenas para
+compatibilidade dos testes existentes; a construção Groq explícita habilita o
+planner real.
+
+**Arquivos:** evoluir `graph.py`, `entrypoint.py`, `state.py` e testes de grafo,
+checkpoint, reprocesso e ações não idempotentes.
+
+**Contrato e testes:**
+
+- Um caso simples de leitura faz uma tool real via `ToolNode`, retorna ao modelo, obtém decisão Pydantic e encerra sem loop infinito.
+- Cada proposal tool escolhida pelo planner somente preenche `pending_proposal`; política, confirmação, preparação, checkpoint e execução continuam em código.
+- Resultado do modelo nunca cria aprovação, idempotency key, identidade, permissão ou chamada HTTP de escrita diretamente.
+- Retomada após cada nó novo usa `resume_anchor` validado; anchor ausente, impossível ou divergente falha fechado sem inferir trace.
+- O limite usa passos restantes antes de entrar no trecho fixo de escrita; os fluxos diretos existentes mantêm o mesmo comportamento e não repetem efeitos.
+- Repetição, limite e falha de tool terminam com decisão segura e registro observável, sem retry oculto.
+- Rodar testes focados dos cinco fluxos e fazer commit próprio.
+
+### Task 13 — troca de adapter, smoke Groq e aceite documental
+
+**Objetivo:** demonstrar o aceite da Fase 6 no caminho público e alinhar a
+documentação ao estado real, sem promover componentes das fases seguintes.
+
+**Arquivos:** adicionar somente testes/runner de smoke necessários; atualizar
+`Makefile`, `README.md` e a Fase 6 deste arquivo depois das evidências.
+
+**Contrato e testes:**
+
+- Dois providers falsos, por meio do mesmo contrato, percorrem a mesma solicitação e produzem os mesmos schemas, catálogo oferecido, tool/argumentos, decisão e resultado de política.
+- IDs internos de chamada são gerados ou normalizados pelo runtime e não tornam o estado dependente do provider.
+- Um smoke opt-in, fora de `make test`, compara `openai/gpt-oss-120b` e `openai/gpt-oss-20b` na conta disponível quanto a português, tool, argumentos, Pydantic separado, latência e estabilidade; imprime somente métricas e status seguros.
+- O smoke lê `GROQ_API_KEY` do ambiente, não imprime prompt/resposta brutos, headers, trace ou segredo e não faz retry automático.
+- Executar testes focados, `uv lock --check` e `make test`; registrar totais e o resultado real do smoke.
+- Marcar a Fase 6 somente após todo o aceite. README passa a declarar provider/planner reais, mas mantém writer, resposta ao cliente, ledger completo, gate, Logfire e Pydantic Evals como ausentes.
+- Fazer self-review, commit próprio e uma revisão final independente de toda a faixa da Fase 6.

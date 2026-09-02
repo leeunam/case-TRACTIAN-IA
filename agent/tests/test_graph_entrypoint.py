@@ -10,25 +10,42 @@ from pydantic import ValidationError
 
 from tractian_agent.checkpoint import LocalCheckpointOwner, open_checkpointer
 from tractian_agent.client import IndustrialApiClient
-from tractian_agent.contracts import Identity, SupportRequest
+from tractian_agent.contracts import ActionReceipt, Identity, ResponseMode, SupportRequest
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
 from tractian_agent.graph import CompiledAgentGraph, build_agent_graph
 from tractian_agent.state import (
     AgentDecision,
     AgentState,
+    FinalResult,
     MessageRole,
+    PlannerFailureRecord,
+    PlannerTerminalRecord,
+    PersistedToolArtifact,
+    PersistedToolCall,
+    ResumeAnchor,
+    ReviewRecord,
+    ReviewStatus,
     ThreadScope,
+    ToolObservation,
 )
-from tractian_agent.tools.runtime import ReadToolRuntime, TrustedIdentity
+from tractian_agent.tools.runtime import (
+    ReadToolRuntime,
+    TrustedIdentity,
+    WriteToolRuntime,
+)
 from tractian_agent.write_contracts import (
     IntentStatus,
     ReprocessIntentScope,
     WriteIntent,
 )
 from tractian_agent.write_policy import (
+    ApprovalSource,
     PolicyDecision,
     PolicyReason,
+    ReprocessProposal,
+    TrustedActionApproval,
     WritePolicyResult,
+    canonical_write_payload_hash,
 )
 
 
@@ -56,12 +73,13 @@ def _runtime(
     user_id: str = "usr_pedro",
     company_id: str = "comp_mineracao_andes",
     permissions: frozenset[str] = frozenset({"read"}),
+    central_asset_id: str = "asset_G501",
 ) -> ReadToolRuntime:
     return ReadToolRuntime.create(
         user_id=user_id,
         company_id=company_id,
         permissions=permissions,
-        central_asset_id="asset_G501",
+        central_asset_id=central_asset_id,
         client=client,
     )
 
@@ -93,11 +111,148 @@ def _initial_state(
     )
 
 
+def _denied_historical_intent(request_id: str) -> WriteIntent:
+    return WriteIntent(
+        intent_id=f"intent_{request_id}",
+        request_id=request_id,
+        scope=ReprocessIntentScope(
+            action="reprocess_analysis",
+            case_id="case_tkt_inv_04",
+            company_id="comp_mineracao_andes",
+            user_id="usr_pedro",
+            analysis_id="an_historical",
+            justification="Histórico terminal usado apenas para proveniência.",
+        ),
+        payload_hash="sha256:v1:" + "a" * 64,
+        decision=WritePolicyResult(
+            decision=PolicyDecision.DENY,
+            reason=PolicyReason.MISSING_PERMISSION,
+        ),
+        status=IntentStatus.DENIED,
+    )
+
+
+def _historical_tool_artifact() -> PersistedToolArtifact:
+    return PersistedToolArtifact(
+        tool_name="historical_lookup",
+        arguments={},
+        source={"kind": "industrial_api", "resource": "/historical"},
+        outcome={"mode": ResponseMode.COMPLETE},
+    )
+
+
+def _terminal_read_state() -> AgentState:
+    state = _initial_state()
+    values = state.model_dump(mode="python")
+    values.update(
+        decision=AgentDecision.GUIDE,
+        final_result=FinalResult(
+            decision=AgentDecision.GUIDE,
+            message="Resultado de leitura já persistido.",
+        ),
+        resume_anchor=ResumeAnchor.FINISH,
+        tool_observations=(
+            ToolObservation(
+                request_id=state.request_id,
+                call_id="call_terminal_read",
+                content={"status": "ok"},
+                artifact=_historical_tool_artifact(),
+            ),
+        ),
+    )
+    return AgentState.model_validate(values)
+
+
+def _terminal_planner_state() -> AgentState:
+    state = _initial_state(step_limit=20)
+    values = state.model_dump(mode="python")
+    values.update(
+        decision=AgentDecision.GUIDE,
+        final_result=FinalResult(
+            decision=AgentDecision.GUIDE,
+            message="Resultado terminal validado do planner.",
+        ),
+        resume_anchor=ResumeAnchor.PLANNER_FINALIZE,
+        planner_terminal=PlannerTerminalRecord(
+            decision="guide",
+            stop_reason="sufficient_evidence",
+        ),
+    )
+    return AgentState.model_validate(values)
+
+
+def _terminal_denial_state() -> AgentState:
+    state = _initial_state(step_limit=5)
+    values = state.model_dump(mode="python")
+    values.update(
+        pending_proposal=ReprocessProposal(
+            analysis_id="an_historical",
+            justification="A política deve conservar a negação persistida.",
+        ),
+        intents=(_denied_historical_intent(state.request_id),),
+        decision=AgentDecision.GUIDE,
+        final_result=FinalResult(
+            decision=AgentDecision.GUIDE,
+            message="A política recusou a ação.",
+        ),
+        resume_anchor=ResumeAnchor.WRITE_POLICY,
+    )
+    return AgentState.model_validate(values)
+
+
+def _terminal_execution_state() -> AgentState:
+    state = _initial_state(step_limit=5)
+    proposal = ReprocessProposal(
+        analysis_id="an_historical",
+        justification="O reprocesso foi autorizado e concluído.",
+    )
+    completed_data = _denied_historical_intent(state.request_id).model_dump(
+        mode="python"
+    )
+    completed_data.update(
+        decision=WritePolicyResult(
+            decision=PolicyDecision.ALLOW,
+            reason=PolicyReason.AUTHORIZED,
+        ),
+        status=IntentStatus.COMPLETED,
+        payload_hash=canonical_write_payload_hash(proposal),
+        idempotency_key="tractian-agent:intent_req_01",
+        expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+        prepared_execution_id=state.execution_id,
+        attempts=1,
+        receipt=ActionReceipt(
+            accepted=True,
+            action_id="act_terminal_execution",
+            message="Reprocesso concluído.",
+        ),
+    )
+    values = state.model_dump(mode="python")
+    values.update(
+        pending_proposal=proposal,
+        intents=(WriteIntent.model_validate(completed_data),),
+        decision=AgentDecision.ACT,
+        final_result=FinalResult(
+            decision=AgentDecision.ACT,
+            message="Reprocesso concluído.",
+        ),
+        resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+    )
+    return AgentState.model_validate(values)
+
+
 class _RecordingGraph:
-    def __init__(self, values=None, *, next_nodes=(), interrupts=()):
+    def __init__(
+        self,
+        values=None,
+        *,
+        next_nodes=(),
+        interrupts=(),
+        planner_enabled=False,
+    ):
         self.values = values or {}
         self.next_nodes = next_nodes
         self.interrupts = interrupts
+        self.planner_enabled = planner_enabled
         self.state_config = None
         self.invoke_config = None
         self.durability = None
@@ -189,6 +344,152 @@ def test_continuation_also_uses_sync_durability_and_continue_with():
     assert continued.step_count == 0
 
 
+@pytest.mark.parametrize(
+    "provenance",
+    ["intent", "tool_call", "tool_observation"],
+)
+def test_new_request_rejects_any_historical_request_id_provenance(
+    provenance: str,
+):
+    reused_request_id = "req_historical_reused"
+    state = _initial_state()
+    if provenance == "intent":
+        state = state.model_copy(
+            update={"intents": (_denied_historical_intent(reused_request_id),)}
+        )
+    elif provenance == "tool_call":
+        state = state.model_copy(
+            update={
+                "tool_calls": (
+                    PersistedToolCall(
+                        request_id=reused_request_id,
+                        call_id="call_historical",
+                        name="historical_lookup",
+                        arguments={},
+                    ),
+                )
+            }
+        )
+    else:
+        state = state.model_copy(
+            update={
+                "tool_observations": (
+                    ToolObservation(
+                        request_id=reused_request_id,
+                        call_id="call_historical",
+                        content={"status": "ok"},
+                        artifact=_historical_tool_artifact(),
+                    ),
+                )
+            }
+        )
+    persisted_values = state.model_dump(mode="json")
+    graph = _RecordingGraph(persisted_values)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(message="Nova leitura com ID antigo."),
+                    runtime=_runtime(client),
+                    thread_id=state.thread_id,
+                    request_id=reused_request_id,
+                    execution_id="exec_reused_history",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == "REQUEST_ID_ALREADY_USED"
+    assert graph.values == persisted_values
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+@pytest.mark.parametrize(
+    ("drift", "expected_code"),
+    [
+        ("identity", "RUNTIME_IDENTITY_SCOPE_MISMATCH"),
+        ("asset_without_read", "RUNTIME_ASSET_SCOPE_MISMATCH"),
+        ("permission", "READ_PERMISSION_REQUIRED"),
+    ],
+)
+def test_terminal_read_replay_revalidates_current_runtime_before_return(
+    drift: str,
+    expected_code: str,
+):
+    state = _terminal_read_state()
+    persisted_values = state.model_dump(mode="json")
+    graph = _RecordingGraph(persisted_values)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = _runtime(
+                client,
+                user_id=("usr_other" if drift == "identity" else "usr_pedro"),
+                permissions=(
+                    frozenset({"read"})
+                    if drift == "identity"
+                    else frozenset({"action_high"})
+                ),
+                central_asset_id=(
+                    "asset_M101"
+                    if drift == "asset_without_read"
+                    else "asset_G501"
+                ),
+            )
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_terminal_scope_recheck",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == expected_code
+    assert graph.values == persisted_values
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+def test_partial_read_scope_mismatch_fails_before_checkpoint_update():
+    state = _initial_state().model_copy(
+        update={"resume_anchor": ResumeAnchor.INGEST}
+    )
+    persisted_values = state.model_dump(mode="json")
+    graph = _RecordingGraph(persisted_values, next_nodes=("route",))
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=_runtime(
+                        client,
+                        permissions=frozenset({"action_high"}),
+                        central_asset_id="asset_M101",
+                    ),
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_partial_scope_recheck",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == "RUNTIME_ASSET_SCOPE_MISMATCH"
+    assert graph.values == persisted_values
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
 @pytest.mark.parametrize("thread_id", ["", "thread com espaço"])
 def test_entrypoint_rejects_missing_or_non_opaque_thread_id(thread_id: str):
     async def scenario():
@@ -265,6 +566,484 @@ def test_nonterminal_resume_rejects_invalid_pending_work_shape(
     assert error.code == expected_code
     assert graph.as_node is None
     assert graph.invoke_config is None
+
+
+@pytest.mark.parametrize(
+    ("anchor", "next_node"),
+    [
+        (ResumeAnchor.INGEST, "planner_select"),
+        (ResumeAnchor.PLANNER_TOOL, "planner_select"),
+    ],
+)
+def test_planner_select_resume_accepts_both_explicit_predecessors(
+    anchor: ResumeAnchor,
+    next_node: str,
+):
+    state = _initial_state(step_limit=20).model_copy(
+        update={"resume_anchor": anchor}
+    )
+    graph = _RecordingGraph(
+        state.model_dump(mode="json"),
+        next_nodes=(next_node,),
+        planner_enabled=True,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            return await invoke_agent(
+                graph,
+                request=_request(),
+                runtime=_runtime(client),
+                thread_id=state.thread_id,
+                request_id=state.request_id,
+                execution_id="exec_resume",
+            )
+
+    asyncio.run(scenario())
+
+    assert graph.as_node == anchor.value
+
+
+@pytest.mark.parametrize(
+    ("raw_anchor", "next_node", "expected_code"),
+    [
+        (None, "route", "MISSING_RESUME_ANCHOR"),
+        ("invented_node", "route", "UNKNOWN_RESUME_ANCHOR"),
+        (ResumeAnchor.INGEST.value, "planner_tool", "RESUME_ANCHOR_MISMATCH"),
+    ],
+)
+def test_resume_anchor_fails_closed_before_checkpoint_update(
+    raw_anchor: str | None,
+    next_node: str,
+    expected_code: str,
+):
+    values = _initial_state(step_limit=20).model_dump(mode="json")
+    if raw_anchor is None:
+        values.pop("resume_anchor")
+    else:
+        values["resume_anchor"] = raw_anchor
+    graph = _RecordingGraph(
+        values,
+        next_nodes=(next_node,),
+        planner_enabled=True,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=_runtime(client),
+                    thread_id="thread_case_tkt_inv_04",
+                    request_id="req_01",
+                    execution_id="exec_resume",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == expected_code
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+@pytest.mark.parametrize("new_request", [False, True])
+@pytest.mark.parametrize(
+    ("raw_anchor", "expected_exception", "expected_code"),
+    [
+        (None, AgentInvocationProtocolError, "MISSING_RESUME_ANCHOR"),
+        ("invented_node", AgentInvocationProtocolError, "UNKNOWN_RESUME_ANCHOR"),
+        (ResumeAnchor.START.value, AgentInvocationProtocolError, "RESUME_ANCHOR_MISMATCH"),
+        (ResumeAnchor.PLANNER_FINALIZE.value, ValidationError, None),
+    ],
+)
+def test_terminal_resume_anchor_is_required_and_semantically_coherent(
+    raw_anchor: str | None,
+    expected_exception: type[Exception],
+    expected_code: str | None,
+    new_request: bool,
+):
+    state = _terminal_read_state()
+    persisted_values = state.model_dump(mode="json")
+    if raw_anchor is None:
+        persisted_values.pop("resume_anchor")
+    else:
+        persisted_values["resume_anchor"] = raw_anchor
+    graph = _RecordingGraph(persisted_values)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(expected_exception) as error:
+                await invoke_agent(
+                    graph,
+                    request=(
+                        _request(message="Nova solicitação.")
+                        if new_request
+                        else _request()
+                    ),
+                    runtime=_runtime(client),
+                    thread_id=state.thread_id,
+                    request_id=("req_new_after_terminal" if new_request else state.request_id),
+                    execution_id="exec_terminal_anchor_check",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    if expected_code is not None:
+        assert isinstance(error, AgentInvocationProtocolError)
+        assert error.code == expected_code
+    assert graph.values == persisted_values
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+@pytest.mark.parametrize(
+    ("planner_enabled", "anchor", "next_node"),
+    [
+        (False, ResumeAnchor.PLANNER_TOOL, "planner_select"),
+        (True, ResumeAnchor.INGEST, "route"),
+    ],
+)
+def test_partial_resume_rejects_checkpoint_from_other_graph_topology(
+    planner_enabled: bool,
+    anchor: ResumeAnchor,
+    next_node: str,
+):
+    state = _initial_state(step_limit=20).model_copy(
+        update={"resume_anchor": anchor}
+    )
+    persisted_values = state.model_dump(mode="json")
+    graph = _RecordingGraph(
+        persisted_values,
+        next_nodes=(next_node,),
+        planner_enabled=planner_enabled,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=_runtime(client),
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_topology_mismatch",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == "RESUME_TOPOLOGY_MISMATCH"
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+def test_new_request_can_migrate_from_valid_terminal_fallback_to_planner():
+    state = _terminal_read_state()
+    graph = _RecordingGraph(
+        state.model_dump(mode="json"),
+        planner_enabled=True,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            return await invoke_agent(
+                graph,
+                request=_request(message="Novo ciclo no planner."),
+                runtime=_runtime(client),
+                thread_id=state.thread_id,
+                request_id="req_migrated_to_planner",
+                execution_id="exec_migrated_to_planner",
+            )
+
+    migrated = asyncio.run(scenario())
+
+    assert graph.as_node == ResumeAnchor.START.value
+    assert migrated.request_id == "req_migrated_to_planner"
+    assert migrated.resume_anchor is ResumeAnchor.START
+    assert migrated.step_limit == 20
+
+
+def test_new_request_can_migrate_from_valid_terminal_planner_to_fallback():
+    state = _terminal_planner_state()
+    graph = _RecordingGraph(state.model_dump(mode="json"))
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            return await invoke_agent(
+                graph,
+                request=_request(message="Novo ciclo no fallback."),
+                runtime=_runtime(client),
+                thread_id=state.thread_id,
+                request_id="req_migrated_to_fallback",
+                execution_id="exec_migrated_to_fallback",
+            )
+
+    migrated = asyncio.run(scenario())
+
+    assert graph.as_node == ResumeAnchor.START.value
+    assert migrated.request_id == "req_migrated_to_fallback"
+    assert migrated.resume_anchor is ResumeAnchor.START
+    assert migrated.step_limit == 3
+
+
+@pytest.mark.parametrize("mismatch", ["finish_with_intent", "failure_stage"])
+def test_terminal_anchor_table_rejects_known_but_impossible_state(
+    mismatch: str,
+):
+    if mismatch == "finish_with_intent":
+        base = _terminal_read_state()
+        values = base.model_dump(mode="python")
+        values["intents"] = (_denied_historical_intent(base.request_id),)
+        graph = _RecordingGraph(values, planner_enabled=True)
+
+        async def scenario():
+            async with IndustrialApiClient("https://industrial.test") as client:
+                with pytest.raises(ValidationError, match="terminal diverge"):
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=_runtime(client),
+                        thread_id=base.thread_id,
+                        request_id=base.request_id,
+                        execution_id="exec_impossible_terminal_anchor",
+                    )
+
+        asyncio.run(scenario())
+    else:
+        base = _initial_state(step_limit=20)
+        values = base.model_dump(mode="python")
+        values.update(
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            final_result=FinalResult(
+                decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+                message="Falha segura do planner.",
+            ),
+            review=ReviewRecord(
+                status=ReviewStatus.REQUIRED,
+                reason="planner:planner_tool:invalid_tool_result",
+            ),
+            planner_failure=PlannerFailureRecord(
+                stage="planner_tool",
+                code="invalid_tool_result",
+            ),
+            resume_anchor=ResumeAnchor.PLANNER_SELECT,
+        )
+        state = AgentState.model_validate(values)
+        graph = _RecordingGraph(
+            state.model_dump(mode="json"),
+            planner_enabled=True,
+        )
+
+        async def scenario():
+            async with IndustrialApiClient("https://industrial.test") as client:
+                with pytest.raises(AgentInvocationProtocolError) as error:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=_runtime(client),
+                        thread_id=state.thread_id,
+                        request_id=state.request_id,
+                        execution_id="exec_impossible_terminal_anchor",
+                    )
+            return error.value
+
+        error = asyncio.run(scenario())
+        assert error.code == "RESUME_ANCHOR_MISMATCH"
+
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "planner_guide_as_action",
+        "fallback_finish_as_request_information",
+        "denial_as_active_intent",
+        "execution_as_guide",
+        "execution_with_other_target",
+        "execution_with_other_payload_hash",
+    ],
+)
+def test_adulterated_terminal_checkpoint_fails_closed_before_return(
+    tamper: str,
+):
+    if tamper == "planner_guide_as_action":
+        persisted_values = _terminal_planner_state().model_dump(mode="json")
+        persisted_values["decision"] = AgentDecision.ACT.value
+        persisted_values["final_result"]["decision"] = AgentDecision.ACT.value
+    elif tamper == "fallback_finish_as_request_information":
+        persisted_values = _terminal_read_state().model_dump(mode="json")
+        persisted_values["decision"] = AgentDecision.REQUEST_INFORMATION.value
+        persisted_values["final_result"]["decision"] = (
+            AgentDecision.REQUEST_INFORMATION.value
+        )
+    elif tamper == "denial_as_active_intent":
+        persisted_values = _terminal_denial_state().model_dump(mode="json")
+        persisted_values["intents"][0]["status"] = (
+            IntentStatus.AWAITING_CONFIRMATION.value
+        )
+        persisted_values["intents"][0]["decision"] = {
+            "decision": PolicyDecision.REQUIRE_CONFIRMATION.value,
+            "reason": PolicyReason.EXPLICIT_APPROVAL_REQUIRED.value,
+        }
+    else:
+        persisted_values = _terminal_execution_state().model_dump(mode="json")
+        if tamper == "execution_as_guide":
+            persisted_values["decision"] = AgentDecision.GUIDE.value
+            persisted_values["final_result"]["decision"] = AgentDecision.GUIDE.value
+        elif tamper == "execution_with_other_target":
+            persisted_values["pending_proposal"]["analysis_id"] = "an_other"
+        else:
+            persisted_values["intents"][0]["payload_hash"] = (
+                "sha256:v1:" + "b" * 64
+            )
+    graph = _RecordingGraph(persisted_values, planner_enabled=True)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(ValidationError, match="terminal diverge"):
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=_runtime(client),
+                    thread_id="thread_case_tkt_inv_04",
+                    request_id="req_01",
+                    execution_id="exec_adulterated_terminal",
+                )
+
+    asyncio.run(scenario())
+
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+def test_planner_step_limit_above_cap_only_blocks_same_request_resume():
+    state = _terminal_read_state().model_copy(update={"step_limit": 21})
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            same_request_graph = _RecordingGraph(
+                state.model_dump(mode="json"),
+                planner_enabled=True,
+            )
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    same_request_graph,
+                    request=_request(),
+                    runtime=_runtime(client),
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_same_over_cap",
+                )
+            new_request_graph = _RecordingGraph(
+                state.model_dump(mode="json"),
+                planner_enabled=True,
+            )
+            migrated = await invoke_agent(
+                new_request_graph,
+                request=_request(message="Novo ciclo com orçamento válido."),
+                runtime=_runtime(client),
+                thread_id=state.thread_id,
+                request_id="req_after_over_cap",
+                execution_id="exec_after_over_cap",
+            )
+        return error.value, same_request_graph, new_request_graph, migrated
+
+    error, same_graph, new_graph, migrated = asyncio.run(scenario())
+
+    assert error.code == "PLANNER_STEP_LIMIT_EXCEEDED"
+    assert same_graph.as_node is None
+    assert same_graph.invoke_config is None
+    assert new_graph.as_node == ResumeAnchor.START.value
+    assert migrated.step_limit == 20
+
+
+def test_planner_builder_defaults_to_20_and_rejects_21_before_checkpoint():
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            graph = _RecordingGraph(planner_enabled=True)
+            state = await invoke_agent(
+                graph,
+                request=_request(),
+                runtime=_runtime(client),
+                thread_id="thread_planner_budget",
+                request_id="req_planner_budget",
+                execution_id="exec_planner_budget",
+            )
+            rejected = _RecordingGraph(planner_enabled=True)
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    rejected,
+                    request=_request(),
+                    runtime=_runtime(client),
+                    thread_id="thread_planner_over_budget",
+                    request_id="req_planner_over_budget",
+                    execution_id="exec_planner_over_budget",
+                    step_limit=21,
+                )
+        return state, rejected, error.value
+
+    state, rejected, error = asyncio.run(scenario())
+
+    assert state.step_limit == 20
+    assert error.code == "PLANNER_STEP_LIMIT_EXCEEDED"
+    assert rejected.state_config is None
+    assert rejected.invoke_config is None
+
+
+def test_original_approval_without_proposal_is_only_accepted_with_planner():
+    approval = TrustedActionApproval(
+        action="update_asset_criticality",
+        target_id="asset_G501",
+        material_parameters={"criticality": "critical"},
+        source=ApprovalSource.ORIGINAL_REQUEST,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"action_high"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                client=client,
+            )
+            planner_graph = _RecordingGraph(planner_enabled=True)
+            accepted = await invoke_agent(
+                planner_graph,
+                request=_request(),
+                runtime=runtime,
+                thread_id="thread_planner_approval",
+                request_id="req_planner_approval",
+                execution_id="exec_planner_approval",
+                original_approval=approval,
+            )
+            fallback = _RecordingGraph()
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    fallback,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_fallback_approval",
+                    request_id="req_fallback_approval",
+                    execution_id="exec_fallback_approval",
+                    original_approval=approval,
+                )
+        return accepted, planner_graph, fallback, error.value
+
+    accepted, planner_graph, fallback, error = asyncio.run(scenario())
+
+    assert accepted.approval == approval
+    assert accepted.pending_proposal is None
+    assert planner_graph.state_config is not None
+    assert error.code == "ORIGINAL_APPROVAL_WITHOUT_PROPOSAL"
+    assert fallback.state_config is None
 
 
 def test_build_graph_rejects_checkpointer_outside_managed_lifecycle(

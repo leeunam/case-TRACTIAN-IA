@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph determinístico e checkpointer SQLite de desenvolvimento. A execução de aceite de 30/08/2026 passou com 59 testes da API e 1.053 do agente (1.112 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 5 estão concluídas. O grafo atual não é um agente de produção: planner LLM, writer, resposta gerada ao cliente, ledger completo, gate de liberação, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner LLM opt-in e checkpointer SQLite de desenvolvimento. O aceite de 01/09/2026 passou com 59 testes da API e 1.434 do agente (1.493 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 6 estão concluídas. O grafo atual não é um agente de produção: writer, resposta gerada ao cliente, ledger completo, gate de liberação, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -62,7 +62,25 @@ Há dois armazenamentos SQLite independentes no desenvolvimento. A API usa `IDEM
 
 ### Modelos
 
-O acesso aos modelos terá uma interface própria. Groq é o provedor inicial; NVIDIA NIM ficará como alternativa a comparar. Planner e writer poderão usar modelos distintos futuramente sem alterar a regra de negócio.
+`ModelProvider` é a interface comum para construir `BaseChatModel` a partir do
+`ModelConfig` estrito. O adapter inicial é `GroqModelProvider`, com
+`openai/gpt-oss-120b`, temperatura zero, timeout de 30 segundos, no máximo 512
+tokens e sem retry oculto. O planner usa `bind_tools` para uma escolha por
+turno e uma chamada Pydantic separada para encerrar; o modelo, credenciais e
+respostas brutas não entram no estado. IDs persistidos de tool call são
+derivados pelo runtime de `request_id` e do ordinal, nunca do ID externo do
+provider. NVIDIA NIM continua alternativa futura; writer poderá usar outro
+modelo quando existir, sem mudar as regras de negócio.
+
+O smoke opt-in `make smoke-groq` compara `openai/gpt-oss-120b` e
+`openai/gpt-oss-20b` com dados sintéticos e sem retry. Por padrão há uma rodada
+por modelo e a estabilidade é declarada como `not_measured`; defina
+`GROQ_SMOKE_RUNS=2` ou maior para comparar as assinaturas dos contratos entre
+rodadas. Ele exige `GROQ_API_KEY` já disponível no ambiente, não lê `.env` e só
+imprime métricas agregadas seguras. Sem a chave, sai com código zero e
+`status=skipped reason=missing_groq_api_key`, sem tocar a rede. No aceite desta
+entrega, o smoke ao vivo ficou **skipped** porque a chave não estava disponível;
+a compatibilidade da conta Groq segue pendente de uma execução opt-in com chave.
 
 ## Avaliação offline planejada
 
@@ -169,7 +187,7 @@ Prompt curto recomendado:
 
 ## Limitações atuais
 
-- Existe um grafo LangGraph determinístico com fluxos de escrita e checkpointer, mas sem LLM. Ele não possui planner, writer, resposta gerada ao cliente, ledger completo, gate de segurança de liberação, Logfire nem runner Pydantic Evals; portanto não é um agente de produção.
+- Existe um grafo LangGraph com planner LLM opt-in, fluxos de escrita determinísticos e checkpointer. Ele ainda não possui writer, resposta gerada ao cliente, ledger completo, gate de segurança de liberação, Logfire nem runner Pydantic Evals; portanto não é um agente de produção.
 - As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
 - O simulador não representa todas as garantias transacionais de produção.
 - O OpenAPI repete `/assets/{assetId}` em blocos separados; alguns parsers podem perder uma operação.

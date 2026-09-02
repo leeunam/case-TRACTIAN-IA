@@ -10,7 +10,7 @@ from pydantic import ConfigDict, Field, JsonValue
 
 from tractian_agent.contracts import ApiError, ResponseMode, StrictModel
 
-from .identifiers import AssetId
+from .identifiers import AssetId, CompanyId, PointId
 from .observations import (
     ToolArtifact,
     ToolOutcome,
@@ -23,7 +23,7 @@ from .runtime import ReadToolRuntime
 class _AssetPointWire(StrictModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    id: str = Field(min_length=1, pattern=r"^pt_[A-Za-z0-9_-]{1,64}$")
+    id: PointId
     asset_id: AssetId
     location: str = Field(min_length=1, pattern=r"\S")
     sensor_status: str = Field(min_length=1, pattern=r"\S")
@@ -36,7 +36,7 @@ class _AssetWire(StrictModel):
 
     id: AssetId
     name: str = Field(min_length=1, pattern=r"\S")
-    company_id: str = Field(min_length=1, pattern=r"^comp_[A-Za-z0-9_-]{1,64}$")
+    company_id: CompanyId
     criticality: Literal["low", "medium", "high", "critical"]
     plant: str = Field(min_length=1, pattern=r"\S")
     line: str = Field(min_length=1, pattern=r"\S")
@@ -197,21 +197,27 @@ def _assert_complete_point_scope(asset: _AssetWire, runtime: ReadToolRuntime) ->
             raise ValueError("A API retornou um ponto de outro ativo.")
 
 
-def _assert_degraded_scope(data: JsonValue, runtime: ReadToolRuntime) -> None:
+def validate_degraded_asset_scope(
+    data: JsonValue,
+    *,
+    asset_id: str,
+    company_id: str,
+) -> None:
+    """Valida o escopo parcial com a mesma regra usada pelo executor."""
     assert_safe_partial_json(data)
     if isinstance(data, Mapping):
         if "id" in data:
             if data["id"] is None:
                 raise ValueError("A resposta degradada contém um identificador nulo.")
-            _assert_returned_scope(
-                asset_id=data["id"], company_id=None, runtime=runtime
-            )
+            if data["id"] != asset_id:
+                raise ValueError(
+                    "A API retornou um identificador de ativo fora do escopo."
+                )
         if "company_id" in data:
             if data["company_id"] is None:
                 raise ValueError("A resposta degradada contém uma empresa nula.")
-            _assert_returned_scope(
-                asset_id=None, company_id=data["company_id"], runtime=runtime
-            )
+            if data["company_id"] != company_id:
+                raise ValueError("A API retornou um ativo de outra empresa.")
         if "points" in data:
             points = data["points"]
             if not isinstance(points, list):
@@ -220,7 +226,7 @@ def _assert_degraded_scope(data: JsonValue, runtime: ReadToolRuntime) -> None:
                 if not isinstance(point, Mapping):
                     raise ValueError("A resposta degradada contém um ponto inválido.")
                 if "asset_id" in point:
-                    if point["asset_id"] is None or point["asset_id"] != runtime.central_asset_id:
+                    if point["asset_id"] is None or point["asset_id"] != asset_id:
                         raise ValueError("A resposta degradada contém um ponto de outro ativo.")
 
     pending: list[JsonValue] = [data]
@@ -236,24 +242,28 @@ def _assert_degraded_scope(data: JsonValue, runtime: ReadToolRuntime) -> None:
                         raise ValueError(
                             "A resposta degradada contém um ativo não verificável."
                         )
-                    _assert_returned_scope(
-                        asset_id=nested_value,
-                        company_id=None,
-                        runtime=runtime,
-                    )
+                    if nested_value != asset_id:
+                        raise ValueError(
+                            "A API retornou um identificador de ativo fora do escopo."
+                        )
                 elif normalized_key == "companyid":
                     if nested_value is None:
                         raise ValueError(
                             "A resposta degradada contém uma empresa não verificável."
                         )
-                    _assert_returned_scope(
-                        asset_id=None,
-                        company_id=nested_value,
-                        runtime=runtime,
-                    )
+                    if nested_value != company_id:
+                        raise ValueError("A API retornou um ativo de outra empresa.")
                 pending.append(nested_value)
         elif isinstance(current, list):
             pending.extend(current)
+
+
+def _assert_degraded_scope(data: JsonValue, runtime: ReadToolRuntime) -> None:
+    validate_degraded_asset_scope(
+        data,
+        asset_id=runtime.central_asset_id,
+        company_id=runtime.identity.company_id,
+    )
 
 
 async def execute_get_asset(

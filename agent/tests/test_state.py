@@ -9,6 +9,7 @@ from tractian_agent.contracts import (
     ApiError,
     ApiErrorCategory,
     Identity,
+    ResponseMode,
     SupportRequest,
     ToolCall,
 )
@@ -20,6 +21,9 @@ from tractian_agent.state import (
     PersistedToolArtifact,
     PersistedToolCall,
     PersistedMessage,
+    PlannerFailureRecord,
+    PlannerTerminalRecord,
+    ResumeAnchor,
     ReviewRecord,
     ReviewStatus,
     StateEvidence,
@@ -31,12 +35,38 @@ from tractian_agent.tools.observations import (
     ToolOutcome,
     ToolSource,
 )
+from tractian_agent.tools.analyses import (
+    AnalysisDetailToolArtifact,
+    AnalysisDetailToolOutcome,
+    AnalysisListToolArtifact,
+    AnalysisListToolOutcome,
+)
+from tractian_agent.tools.assets import AssetToolArtifact, AssetToolOutcome
+from tractian_agent.tools.knowledge import (
+    KnowledgeDocumentToolArtifact,
+    KnowledgeDocumentToolOutcome,
+    KnowledgeSearchToolArtifact,
+    KnowledgeSearchToolOutcome,
+    ModelToolArtifact,
+    ModelToolOutcome,
+)
 from tractian_agent.tools.runtime import TrustedIdentity
+from tractian_agent.tools.technical import (
+    BaselineToolArtifact,
+    BaselineToolOutcome,
+    DataQualityToolArtifact,
+    DataQualityToolOutcome,
+    RmsToolArtifact,
+    RmsToolOutcome,
+    SpectrumToolArtifact,
+    SpectrumToolOutcome,
+)
 from tractian_agent.write_contracts import (
     IntentStatus,
     PersistedActionReceipt,
     PersistedApiError,
     ReprocessIntentScope,
+    UpdateAssetCriticalityIntentScope,
     WriteIntent,
 )
 from tractian_agent.write_policy import (
@@ -50,6 +80,7 @@ from tractian_agent.write_policy import (
     TrustedActionApproval,
     UpdateAssetCriticalityProposal,
     WritePolicyResult,
+    canonical_write_payload_hash,
 )
 
 
@@ -231,6 +262,291 @@ def test_new_state_starts_with_empty_typed_evidence_and_observable_collections()
     assert state.approval is None
     assert state.final_result is None
     assert state.review is None
+    assert state.resume_anchor is ResumeAnchor.START
+    assert state.planner_terminal is None
+    assert state.planner_failure is None
+
+
+def test_planner_progress_round_trips_as_typed_json_safe_state():
+    state = _state(
+        resume_anchor=ResumeAnchor.PLANNER_SELECT,
+        planner_terminal=PlannerTerminalRecord(
+            decision="request_information",
+            stop_reason="missing_information",
+            missing_information="Informe o ponto de medição.",
+        ),
+    )
+
+    restored = AgentState.model_validate_json(state.model_dump_json())
+
+    assert restored == state
+    assert restored.resume_anchor is ResumeAnchor.PLANNER_SELECT
+    assert restored.planner_terminal is not None
+    assert restored.planner_terminal.missing_information == (
+        "Informe o ponto de medição."
+    )
+    assert restored.planner_failure is None
+
+    failed = _state(
+        resume_anchor=ResumeAnchor.PLANNER_TOOL,
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+        final_result=FinalResult(
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            message="O ciclo terminou de forma segura.",
+        ),
+        review=ReviewRecord(
+            status=ReviewStatus.REQUIRED,
+            reason="planner:planner_tool:invalid_tool_result",
+        ),
+        planner_failure=PlannerFailureRecord(
+            stage="planner_tool", code="invalid_tool_result"
+        ),
+    )
+    assert AgentState.model_validate_json(failed.model_dump_json()) == failed
+
+
+def test_planner_failure_requires_a_coherent_safe_terminal_state():
+    failure = PlannerFailureRecord(
+        stage="planner_tool",
+        code="invalid_tool_result",
+    )
+
+    with pytest.raises(ValidationError, match="falha do planner exige"):
+        _state(planner_failure=failure)
+
+    with pytest.raises(ValidationError, match="mutuamente exclusivos"):
+        _state(
+            planner_failure=failure,
+            planner_terminal=PlannerTerminalRecord(
+                decision="guide",
+                stop_reason="sufficient_evidence",
+            ),
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            final_result=FinalResult(
+                decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+                message="O ciclo terminou de forma segura.",
+            ),
+            review=ReviewRecord(status=ReviewStatus.REQUIRED),
+        )
+
+
+@pytest.mark.parametrize(
+    ("anchor", "planner_terminal", "decision"),
+    [
+        (
+            ResumeAnchor.PLANNER_FINALIZE,
+            PlannerTerminalRecord(
+                decision="guide",
+                stop_reason="sufficient_evidence",
+            ),
+            AgentDecision.ACT,
+        ),
+        (ResumeAnchor.FINISH, None, AgentDecision.REQUEST_INFORMATION),
+    ],
+)
+def test_terminal_state_rejects_decision_that_diverges_from_anchor_contract(
+    anchor: ResumeAnchor,
+    planner_terminal: PlannerTerminalRecord | None,
+    decision: AgentDecision,
+):
+    with pytest.raises(ValidationError, match="terminal diverge"):
+        _state(
+            resume_anchor=anchor,
+            planner_terminal=planner_terminal,
+            decision=decision,
+            final_result=FinalResult(
+                decision=decision,
+                message="Checkpoint terminal adulterado.",
+            ),
+        )
+
+
+def test_terminal_state_rejects_incompatible_write_intent_or_execution_result():
+    proposal = ReprocessProposal(
+        analysis_id="an_9906",
+        justification="A intenção terminal deve manter seu status canônico.",
+    )
+    denied_data = _intent().model_dump(mode="python")
+    denied_data.update(
+        request_id="req_01",
+        status=IntentStatus.DENIED,
+        decision=WritePolicyResult(
+            decision=PolicyDecision.DENY,
+            reason=PolicyReason.MISSING_PERMISSION,
+        ),
+        idempotency_key=None,
+        expires_at=None,
+        prepared_execution_id=None,
+    )
+    denied = WriteIntent.model_validate(denied_data)
+    denial_state = _state(
+        pending_proposal=proposal,
+        intents=(denied,),
+        decision=AgentDecision.GUIDE,
+        final_result=FinalResult(
+            decision=AgentDecision.GUIDE,
+            message="A política recusou a ação.",
+        ),
+        resume_anchor=ResumeAnchor.WRITE_POLICY,
+    )
+    denial_wire = denial_state.model_dump(mode="json")
+    denial_wire["intents"][0]["status"] = IntentStatus.AWAITING_CONFIRMATION.value
+    denial_wire["intents"][0]["decision"] = {
+        "decision": PolicyDecision.REQUIRE_CONFIRMATION.value,
+        "reason": PolicyReason.EXPLICIT_APPROVAL_REQUIRED.value,
+    }
+
+    with pytest.raises(ValidationError, match="terminal diverge"):
+        AgentState.model_validate(denial_wire)
+
+    completed_data = _intent().model_dump(mode="python")
+    completed_data.update(
+        request_id="req_01",
+        payload_hash=canonical_write_payload_hash(proposal),
+        status=IntentStatus.COMPLETED,
+        attempts=1,
+        receipt=ActionReceipt(
+            accepted=True,
+            action_id="act_terminal_state",
+            message="Reprocesso concluído.",
+        ),
+    )
+    completed = WriteIntent.model_validate(completed_data)
+    execution_state = _state(
+        pending_proposal=proposal,
+        intents=(completed,),
+        decision=AgentDecision.ACT,
+        final_result=FinalResult(
+            decision=AgentDecision.ACT,
+            message="Reprocesso concluído.",
+        ),
+        resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+    )
+    execution_wire = execution_state.model_dump(mode="json")
+    execution_wire["decision"] = AgentDecision.GUIDE.value
+    execution_wire["final_result"]["decision"] = AgentDecision.GUIDE.value
+
+    with pytest.raises(ValidationError, match="terminal diverge"):
+        AgentState.model_validate(execution_wire)
+
+
+@pytest.mark.parametrize("tamper", ["target", "payload_hash", "criticality"])
+def test_terminal_execution_rejects_adulterated_effect_binding(tamper: str):
+    receipt = ActionReceipt(
+        accepted=True,
+        action_id="act_effect_binding",
+        message="Ação concluída.",
+    )
+    if tamper == "criticality":
+        proposal = UpdateAssetCriticalityProposal(
+            criticality="critical",
+            justification="A criticidade máxima foi aplicada.",
+        )
+        intent = WriteIntent(
+            intent_id="intent_effect_criticality",
+            request_id="req_01",
+            scope=UpdateAssetCriticalityIntentScope(
+                action="update_asset_criticality",
+                case_id="case_tkt_inv_04",
+                company_id="comp_mineracao_andes",
+                user_id="usr_pedro",
+                asset_id="asset_G501",
+                criticality="critical",
+                justification=proposal.justification,
+            ),
+            payload_hash=canonical_write_payload_hash(proposal),
+            decision=WritePolicyResult(
+                decision=PolicyDecision.ALLOW,
+                reason=PolicyReason.AUTHORIZED,
+            ),
+            status=IntentStatus.COMPLETED,
+            prepared_execution_id="exec_01",
+            attempts=1,
+            receipt=receipt,
+        )
+        state = _state(
+            pending_proposal=proposal,
+            intents=(intent,),
+            decision=AgentDecision.ACT,
+            final_result=FinalResult(
+                decision=AgentDecision.ACT,
+                message="Criticidade atualizada.",
+            ),
+            resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+        )
+        wire = state.model_dump(mode="json")
+        wire["pending_proposal"]["criticality"] = "medium"
+    else:
+        proposal = ReprocessProposal(
+            analysis_id="an_9906",
+            justification="O reprocesso foi concluído.",
+        )
+        intent_data = _intent().model_dump(mode="python")
+        intent_data.update(
+            request_id="req_01",
+            payload_hash=canonical_write_payload_hash(proposal),
+            status=IntentStatus.COMPLETED,
+            attempts=1,
+            receipt=receipt,
+        )
+        state = _state(
+            pending_proposal=proposal,
+            intents=(WriteIntent.model_validate(intent_data),),
+            decision=AgentDecision.ACT,
+            final_result=FinalResult(
+                decision=AgentDecision.ACT,
+                message="Reprocesso concluído.",
+            ),
+            resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+        )
+        wire = state.model_dump(mode="json")
+        if tamper == "target":
+            wire["pending_proposal"]["analysis_id"] = "an_other"
+        else:
+            wire["intents"][0]["payload_hash"] = "sha256:v1:" + "b" * 64
+
+    with pytest.raises(ValidationError, match="terminal diverge"):
+        AgentState.model_validate(wire)
+
+
+def test_new_request_resets_request_bound_planner_progress_and_anchor():
+    terminal_prior = _state(
+        resume_anchor=ResumeAnchor.PLANNER_TOOL,
+        planner_terminal=PlannerTerminalRecord(
+            decision="guide",
+            stop_reason="sufficient_evidence",
+        ),
+    )
+    failed_prior = _state(
+        resume_anchor=ResumeAnchor.PLANNER_SELECT,
+        planner_failure=PlannerFailureRecord(
+            stage="planner_select",
+            code="repeated_tool_call",
+        ),
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+        final_result=FinalResult(
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            message="O ciclo terminou de forma segura.",
+        ),
+        review=ReviewRecord(status=ReviewStatus.REQUIRED),
+    )
+
+    continued_states = tuple(
+        prior.continue_with(
+            request=_request(),
+            identity=prior.identity,
+            permissions=prior.permissions,
+            request_id="req_02",
+            execution_id="exec_02",
+            step_limit=20,
+        )
+        for prior in (terminal_prior, failed_prior)
+    )
+
+    for continued in continued_states:
+        assert continued.resume_anchor is ResumeAnchor.START
+        assert continued.planner_terminal is None
+        assert continued.planner_failure is None
 
 
 @pytest.mark.parametrize(
@@ -698,6 +1014,255 @@ def test_agent_state_round_trips_real_json_with_receipt_error_and_offset():
     assert restored.intents[0].expires_at.utcoffset() == timedelta(hours=-3)
 
 
+def test_tool_observation_round_trips_json_safe_next_turn_content():
+    observation = ToolObservation(
+        call_id="call_01",
+        content={
+            "analysis_id": "an_9906",
+            "status": "current",
+            "limitations": ["Sinal disponível somente até 10:00."],
+        },
+        artifact=ToolArtifact(
+            tool_name="get_analysis",
+            arguments={"analysis_id": "an_9906"},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/analyses/an_9906",
+            ),
+            outcome=ToolOutcome(partial_data={"status": "current"}),
+        ),
+    )
+
+    restored = ToolObservation.model_validate_json(observation.model_dump_json())
+
+    assert restored == observation
+    assert restored.content is not None
+    assert restored.content.to_python() == {
+        "analysis_id": "an_9906",
+        "limitations": ["Sinal disponível somente até 10:00."],
+        "status": "current",
+    }
+
+    api_error = ApiError(
+        category=ApiErrorCategory.TIMEOUT,
+        code="READ_TIMEOUT",
+        message="A consulta excedeu o tempo limite.",
+    )
+    failed_observation = ToolObservation(
+        call_id="call_timeout",
+        content={"error": api_error.model_dump(mode="json")},
+        artifact=ToolArtifact(
+            tool_name="get_analysis",
+            arguments={"analysis_id": "an_9906"},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/analyses/an_9906",
+            ),
+            outcome=ToolOutcome(error=api_error),
+        ),
+    )
+    restored_failure = ToolObservation.model_validate_json(
+        failed_observation.model_dump_json()
+    )
+
+    assert restored_failure == failed_observation
+    assert isinstance(restored_failure.artifact.outcome.error, PersistedApiError)
+
+    with pytest.raises(ValidationError):
+        ToolObservation(
+            call_id="call_unsafe",
+            content={"raw_http_response": {"token": "must-not-persist"}},
+            artifact=observation.artifact,
+        )
+
+
+_READ_ARTIFACT_CASES = [
+        (
+            "get_asset",
+            AssetToolArtifact,
+            AssetToolOutcome,
+            {"asset_id": "asset_G501"},
+            "/assets/asset_G501",
+        ),
+        (
+            "list_asset_analyses",
+            AnalysisListToolArtifact,
+            AnalysisListToolOutcome,
+            {"asset_id": "asset_G501"},
+            "/assets/asset_G501/analyses",
+        ),
+        (
+            "get_analysis",
+            AnalysisDetailToolArtifact,
+            AnalysisDetailToolOutcome,
+            {"analysis_id": "an_9906"},
+            "/analyses/an_9906",
+        ),
+        (
+            "get_baseline",
+            BaselineToolArtifact,
+            BaselineToolOutcome,
+            {"asset_id": "asset_G501", "point_id": None},
+            "/assets/asset_G501/baseline",
+        ),
+        (
+            "get_rms_series",
+            RmsToolArtifact,
+            RmsToolOutcome,
+            {"asset_id": "asset_G501", "point_id": None},
+            "/assets/asset_G501/rms",
+        ),
+        (
+            "get_spectrum",
+            SpectrumToolArtifact,
+            SpectrumToolOutcome,
+            {"asset_id": "asset_G501", "point_id": None},
+            "/assets/asset_G501/spectrum",
+        ),
+        (
+            "get_data_quality",
+            DataQualityToolArtifact,
+            DataQualityToolOutcome,
+            {"asset_id": "asset_G501", "point_id": None},
+            "/assets/asset_G501/data-quality",
+        ),
+        (
+            "get_model",
+            ModelToolArtifact,
+            ModelToolOutcome,
+            {},
+            "/models/mdl_vib_v3",
+        ),
+        (
+            "search_knowledge",
+            KnowledgeSearchToolArtifact,
+            KnowledgeSearchToolOutcome,
+            {"query": "rolamento"},
+            "/knowledge/search",
+        ),
+        (
+            "get_knowledge_document",
+            KnowledgeDocumentToolArtifact,
+            KnowledgeDocumentToolOutcome,
+            {"document_id": "kb_bearing_guidance"},
+            "/knowledge/kb_bearing_guidance",
+        ),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "artifact_type", "outcome_type", "arguments", "resource"),
+    _READ_ARTIFACT_CASES,
+)
+def test_tool_observation_rehydrates_exact_read_artifact_after_json_round_trip(
+    tool_name,
+    artifact_type,
+    outcome_type,
+    arguments,
+    resource,
+):
+    error = ApiError(
+        category=ApiErrorCategory.TIMEOUT,
+        code="READ_TIMEOUT",
+        message="A consulta excedeu o tempo limite.",
+    )
+    artifact = artifact_type(
+        tool_name=tool_name,
+        arguments=arguments,
+        source=ToolSource(kind="industrial_api", resource=resource),
+        outcome=outcome_type(error=error),
+    )
+    observation = ToolObservation(
+        request_id="req_01",
+        call_id=f"call_{tool_name}",
+        content={"error": error.model_dump(mode="json")},
+        artifact=artifact,
+    )
+
+    restored = ToolObservation.model_validate_json(observation.model_dump_json())
+    restored_artifact = restored.artifact.validated_read_artifact()
+
+    assert type(restored_artifact) is artifact_type
+    assert type(restored_artifact.outcome) is outcome_type
+    assert restored_artifact.model_dump(mode="json") == artifact.model_dump(
+        mode="json"
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "artifact_type", "outcome_type", "arguments", "resource"),
+    _READ_ARTIFACT_CASES,
+)
+@pytest.mark.parametrize(
+    "unsafe_partial_data",
+    [
+        {"outer": {"identity": {"user_id": "usr_leaked"}}},
+        {"outer": {"headers": {"authorization": "leaked"}}},
+        {"outer": {"raw_response": {"body": "leaked"}}},
+    ],
+    ids=["identity", "headers", "raw-response"],
+)
+def test_degraded_read_artifact_rejects_unsafe_partial_data_before_checkpoint(
+    tool_name,
+    artifact_type,
+    outcome_type,
+    arguments,
+    resource,
+    unsafe_partial_data,
+):
+    artifact = artifact_type(
+        tool_name=tool_name,
+        arguments=arguments,
+        source=ToolSource(kind="industrial_api", resource=resource),
+        outcome=outcome_type(
+            mode=ResponseMode.PARTIAL,
+            notes="Resposta parcial.",
+            partial_data=unsafe_partial_data,
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="campo proibido"):
+        ToolObservation(
+            request_id="req_01",
+            call_id=f"call_{tool_name}",
+            content={
+                "mode": "partial",
+                "notes": "Resposta parcial.",
+                "partial_data": unsafe_partial_data,
+            },
+            artifact=artifact,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "artifact_type", "outcome_type", "arguments", "resource"),
+    _READ_ARTIFACT_CASES,
+)
+def test_raw_read_artifact_rejects_coerced_types_before_projection(
+    tool_name,
+    artifact_type,
+    outcome_type,
+    arguments,
+    resource,
+):
+    wire = artifact_type(
+        tool_name=tool_name,
+        arguments=arguments,
+        source=ToolSource(kind="industrial_api", resource=resource),
+        outcome=outcome_type(
+            error=ApiError(
+                category=ApiErrorCategory.TIMEOUT,
+                code="READ_TIMEOUT",
+                message="A consulta excedeu o tempo limite.",
+            )
+        ),
+    ).model_dump(mode="json")
+    wire["omitted_items"] = "0"
+
+    with pytest.raises(ValidationError):
+        PersistedToolArtifact.model_validate(wire)
+
+
 @pytest.mark.parametrize(
     "forbidden_name",
     [
@@ -827,11 +1392,11 @@ def test_persisted_argument_objects_keep_nested_mapping_and_round_trip():
     }
     call = PersistedToolCall(
         call_id="call_01",
-        name="get_asset",
+        name="custom_nested_tool",
         arguments=arguments,
     )
     artifact = PersistedToolArtifact(
-        tool_name="get_asset",
+        tool_name="custom_nested_tool",
         arguments=arguments,
         source={"kind": "industrial_api", "resource": "/assets/asset_G501"},
         outcome={},
