@@ -644,6 +644,161 @@ def test_ledger_history_rejects_tampered_source_value():
         AgentState.model_validate(wire)
 
 
+def test_empty_current_ledger_cannot_reuse_historical_request_id():
+    observation = ToolObservation(
+        request_id="req_01",
+        call_id="call_ledger_history_reuse",
+        artifact=DataQualityToolArtifact(
+            tool_name="get_data_quality",
+            arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=DataQualityArtifact(
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=0.98,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=False,
+                ),
+            ),
+        ),
+    )
+    ledger = compile_observations(
+        (observation,),
+        recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    continued = _state(
+        tool_observations=(observation,), ledger=ledger
+    ).continue_with(
+        request=_request().model_copy(update={"message": "Nova solicitação."}),
+        identity=_identity(),
+        permissions=frozenset({"read"}),
+        request_id="req_02",
+        execution_id="exec_02",
+    )
+    wire = continued.model_dump(mode="json")
+    wire["request_id"] = "req_01"
+    wire["execution_id"] = "exec_03"
+    wire["planner_usage"]["request_id"] = "req_01"
+
+    with pytest.raises(ValidationError, match="ledger"):
+        AgentState.model_validate(wire)
+
+
+def test_ledger_history_rejects_duplicate_request_id():
+    observation = ToolObservation(
+        request_id="req_01",
+        call_id="call_ledger_duplicate_history",
+        artifact=DataQualityToolArtifact(
+            tool_name="get_data_quality",
+            arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=DataQualityArtifact(
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=0.98,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=False,
+                ),
+            ),
+        ),
+    )
+    ledger = compile_observations(
+        (observation,),
+        recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    continued = _state(
+        tool_observations=(observation,), ledger=ledger
+    ).continue_with(
+        request=_request().model_copy(update={"message": "Nova solicitação."}),
+        identity=_identity(),
+        permissions=frozenset({"read"}),
+        request_id="req_02",
+        execution_id="exec_02",
+    )
+    wire = continued.model_dump(mode="json")
+    wire["ledger_history"].append(wire["ledger_history"][0])
+
+    with pytest.raises(ValidationError, match="duplicado"):
+        AgentState.model_validate(wire)
+
+
+def test_ledger_source_index_partitions_each_historical_request_once():
+    first_observation = ToolObservation(
+        request_id="req_01",
+        call_id="call_ledger_index_first",
+        artifact=DataQualityToolArtifact(
+            tool_name="get_data_quality",
+            arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(
+                kind="industrial_api",
+                resource="/assets/asset_G501/data-quality",
+            ),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                data_quality=DataQualityArtifact(
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=0.98,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=False,
+                ),
+            ),
+        ),
+    )
+    recorded_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    first_ledger = compile_observations((first_observation,), recorded_at=recorded_at)
+    second_seed = _state(
+        tool_observations=(first_observation,), ledger=first_ledger
+    ).continue_with(
+        request=_request().model_copy(update={"message": "Segunda solicitação."}),
+        identity=_identity(),
+        permissions=frozenset({"read"}),
+        request_id="req_02",
+        execution_id="exec_02",
+    )
+    second_observation = first_observation.model_copy(
+        update={"request_id": "req_02", "call_id": "call_ledger_index_second"}
+    )
+    second_ledger = compile_observations((second_observation,), recorded_at=recorded_at)
+    second_wire = second_seed.model_dump(mode="python")
+    second_wire.update(
+        tool_observations=(first_observation, second_observation),
+        ledger=second_ledger,
+    )
+    second = AgentState.model_validate(second_wire)
+    third = second.continue_with(
+        request=_request().model_copy(update={"message": "Terceira solicitação."}),
+        identity=_identity(),
+        permissions=frozenset({"read"}),
+        request_id="req_03",
+        execution_id="exec_03",
+    )
+
+    observations_by_request, intents_by_request = third._ledger_sources_by_request()
+
+    assert tuple(observations_by_request) == ("req_01", "req_02")
+    assert tuple(item.call_id for item in observations_by_request["req_01"]) == (
+        "call_ledger_index_first",
+    )
+    assert tuple(item.call_id for item in observations_by_request["req_02"]) == (
+        "call_ledger_index_second",
+    )
+    assert intents_by_request == {}
+
+
 def test_new_state_starts_with_empty_typed_evidence_and_observable_collections():
     state = _state()
 

@@ -1187,31 +1187,54 @@ class AgentState(FrozenStateModel):
 
     def _validate_current_ledger(self) -> None:
         """Recompila integralmente o ledger atual e o histórico, sem subconjuntos."""
+        observations_by_request, intents_by_request = self._ledger_sources_by_request()
+        history_request_ids = tuple(
+            historic.request_id for historic in self.ledger_history
+        )
+        if any(request_id is None for request_id in history_request_ids):
+            raise ValueError("histórico do ledger exige request_id")
+        if len(history_request_ids) != len(set(history_request_ids)):
+            raise ValueError("histórico do ledger não aceita request_id duplicado")
         for historic in self.ledger_history:
-            if historic.request_id is None:
-                raise ValueError("histórico do ledger exige request_id")
+            assert historic.request_id is not None
             self._validate_ledger_for_request(
                 historic,
                 request_id=historic.request_id,
                 label="histórico do ledger",
+                observations=observations_by_request.get(historic.request_id, ()),
+                intents=intents_by_request.get(historic.request_id, ()),
             )
-
-        if (
-            self.ledger.request_id is None
-            and not self.ledger.items
-            and not self.ledger.gaps
-            and not self.ledger.conflicts
-            and any(
-                historic.request_id == self.request_id
-                for historic in self.ledger_history
-            )
-        ):
-            # Reuso será rejeitado pela entrada pública; o histórico segue auditável.
-            return
         self._validate_ledger_for_request(
             self.ledger,
             request_id=self.request_id,
             label="ledger atual",
+            observations=observations_by_request.get(self.request_id, ()),
+            intents=intents_by_request.get(self.request_id, ()),
+        )
+
+    def _ledger_sources_by_request(
+        self,
+    ) -> tuple[
+        dict[str, tuple[ToolObservation, ...]],
+        dict[str, tuple[WriteIntent, ...]],
+    ]:
+        """Indexa uma vez as fontes claimable para toda a validação do estado."""
+        observation_lists: dict[str, list[ToolObservation]] = {}
+        intent_lists: dict[str, list[WriteIntent]] = {}
+        for observation in self.tool_observations:
+            if (
+                observation.request_id is not None
+                and observation.artifact.validated_read_artifact() is not None
+            ):
+                observation_lists.setdefault(observation.request_id, []).append(
+                    observation
+                )
+        for intent in self.intents:
+            if intent.request_id is not None:
+                intent_lists.setdefault(intent.request_id, []).append(intent)
+        return (
+            {request_id: tuple(values) for request_id, values in observation_lists.items()},
+            {request_id: tuple(values) for request_id, values in intent_lists.items()},
         )
 
     def _validate_ledger_for_request(
@@ -1220,6 +1243,8 @@ class AgentState(FrozenStateModel):
         *,
         request_id: str,
         label: str,
+        observations: tuple[ToolObservation, ...],
+        intents: tuple[WriteIntent, ...],
     ) -> None:
         """Compara uma projeção semântica completa com todas as fontes tipadas."""
         if ledger.request_id not in {request_id, None}:
@@ -1236,15 +1261,6 @@ class AgentState(FrozenStateModel):
             merge_ledgers,
         )
 
-        observations = tuple(
-            observation
-            for observation in self.tool_observations
-            if observation.request_id == request_id
-            and observation.artifact.validated_read_artifact() is not None
-        )
-        intents = tuple(
-            intent for intent in self.intents if intent.request_id == request_id
-        )
         canonical_time = datetime(2000, 1, 1, tzinfo=timezone.utc)
         expected = merge_ledgers(
             compile_observations(observations, recorded_at=canonical_time),
