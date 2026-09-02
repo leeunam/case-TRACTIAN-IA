@@ -12,6 +12,7 @@ from datetime import datetime
 from enum import Enum
 import hashlib
 import json
+import re
 from typing import Literal
 
 from pydantic import Field, JsonValue, field_validator
@@ -118,7 +119,14 @@ class EvidenceAssessment(FrozenStateModel):
 
 
 _OUTCOME_METADATA = frozenset({"mode", "notes", "partial_data", "error"})
-_SOURCE_TIME_KEYS = ("created_at", "established_at", "invalidated_at")
+_SOURCE_TIME_KEYS = (
+    "created_at",
+    "established_at",
+    "invalidated_at",
+    "ts",
+    "collected_at",
+    "last_run_at",
+)
 
 
 def _canonical_json(value: JsonValue) -> str:
@@ -151,13 +159,18 @@ def _parse_source_time(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
 
 
-def _source_at(value: Mapping[str, JsonValue]) -> datetime | None:
-    for key in _SOURCE_TIME_KEYS:
-        parsed = _parse_source_time(value.get(key))
-        if parsed is not None:
-            return parsed
-    for nested in value.values():
-        if isinstance(nested, Mapping):
+def _source_at(value: JsonValue) -> datetime | None:
+    if isinstance(value, Mapping):
+        for key in _SOURCE_TIME_KEYS:
+            parsed = _parse_source_time(value.get(key))
+            if parsed is not None:
+                return parsed
+        for nested in value.values():
+            parsed = _source_at(nested)
+            if parsed is not None:
+                return parsed
+    elif isinstance(value, list):
+        for nested in value:
             parsed = _source_at(nested)
             if parsed is not None:
                 return parsed
@@ -190,9 +203,18 @@ def _obsolescence(value: Mapping[str, JsonValue], *, expired: bool) -> tuple[Evi
     if not isinstance(outcome, Mapping):
         return ()
     analysis = outcome.get("analysis")
+    analyses = outcome.get("analyses")
     baseline = outcome.get("baseline")
     data_quality = outcome.get("data_quality")
     if isinstance(analysis, Mapping) and analysis.get("status") == "stale":
+        reasons.append(EvidenceObsolescenceReason.ANALYSIS_STALE)
+    if (
+        isinstance(analyses, list)
+        and any(
+            isinstance(item, Mapping) and item.get("status") == "stale"
+            for item in analyses
+        )
+    ):
         reasons.append(EvidenceObsolescenceReason.ANALYSIS_STALE)
     if isinstance(baseline, Mapping) and baseline.get("state") == "invalidated":
         reasons.append(EvidenceObsolescenceReason.BASELINE_INVALIDATED)
@@ -203,11 +225,34 @@ def _obsolescence(value: Mapping[str, JsonValue], *, expired: bool) -> tuple[Evi
     return tuple(reasons)
 
 
+def _canonical_segment(key: str) -> str:
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", key)
+    segments = re.findall(r"[A-Za-z0-9]+", separated)
+    normalized = "_".join(segment.casefold() for segment in segments)
+    if not normalized or not normalized[0].isalpha():
+        return "key_" + hashlib.sha256(key.encode()).hexdigest()[:12]
+    return normalized
+
+
+def _canonical_mapping_segments(value: Mapping[str, JsonValue]) -> dict[str, str]:
+    """Normaliza chaves JSON sem perder irmãs que colidem após normalização."""
+    bases = {key: _canonical_segment(key) for key in value}
+    counts: dict[str, int] = defaultdict(int)
+    for base in bases.values():
+        counts[base] += 1
+    return {
+        key: base if counts[base] == 1 else f"{base}__key_{hashlib.sha256(key.encode()).hexdigest()[:12]}"
+        for key, base in bases.items()
+    }
+
+
 def _leaves(value: JsonValue, prefix: str = "") -> Iterable[tuple[str, JsonValue]]:
     if isinstance(value, Mapping):
+        segments = _canonical_mapping_segments(value)
         for key in sorted(value):
             child = value[key]
-            child_path = f"{prefix}.{key}" if prefix else key
+            segment = segments[key]
+            child_path = f"{prefix}.{segment}" if prefix else segment
             yield from _leaves(child, child_path)
     elif isinstance(value, list):
         # Lista é um fato íntegro; índices instáveis não viram caminhos de API.

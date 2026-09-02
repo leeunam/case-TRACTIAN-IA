@@ -19,11 +19,27 @@ from tractian_agent.tools.technical import (
     DataQualityArtifact,
     DataQualityToolArtifact,
     DataQualityToolOutcome,
+    RmsArtifact,
+    RmsSample,
+    RmsToolArtifact,
+    RmsToolOutcome,
+    SpectrumArtifact,
+    SpectrumToolArtifact,
+    SpectrumToolOutcome,
 )
 from tractian_agent.tools.analyses import (
     AnalysisArtifact,
     AnalysisDetailToolArtifact,
     AnalysisDetailToolOutcome,
+    AnalysisListToolArtifact,
+    AnalysisListToolOutcome,
+)
+from tractian_agent.tools.knowledge import (
+    ModelArtifact,
+    ModelCoverage,
+    ModelRequirements,
+    ModelToolArtifact,
+    ModelToolOutcome,
 )
 from tractian_agent.tools.observations import ToolSource
 
@@ -238,3 +254,99 @@ def test_legacy_observation_without_request_provenance_never_becomes_claimable()
         EvidenceGapReason.MISSING_PROVENANCE,
         EvidenceGapReason.NO_CLAIMABLE_FACT,
     )
+
+
+def test_stale_analysis_inside_list_is_obsolete_and_never_claimable():
+    observation = ToolObservation(
+        request_id="req_01", call_id="call_list",
+        artifact=AnalysisListToolArtifact(
+            tool_name="list_asset_analyses", arguments={"asset_id": "asset_G501"},
+            source=ToolSource(kind="industrial_api", resource="/assets/asset_G501/analyses"),
+            outcome=AnalysisListToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                analyses=[AnalysisArtifact(
+                    id="an_9906", asset_id="asset_G501", point_id="pt_001",
+                    type="bearing_fault", detection_mode="symptom", severity="high",
+                    confidence=0.9, baseline_state_at_detection="established", evidence=[],
+                    limitations=[], model_version="v1", created_at="2026-09-01T10:00:00+00:00",
+                    status="stale",
+                )],
+                total_analyses=1, returned_analyses=1, omitted_analyses=0,
+            ),
+        ),
+    )
+
+    ledger = compile_observations((observation,), recorded_at=RECORDED_AT)
+
+    assert {gap.reason for gap in ledger.gaps} == {EvidenceGapReason.OBSOLETE}
+    assert all(item.quality is EvidenceQuality.OBSOLETE for item in ledger.items)
+
+
+def test_rms_spectrum_and_model_keep_their_validated_source_timestamps():
+    observations = (
+        ToolObservation(
+            request_id="req_01", call_id="call_rms",
+            artifact=RmsToolArtifact(
+                tool_name="get_rms_series", arguments={"asset_id": "asset_G501", "point_id": None},
+                source=ToolSource(kind="industrial_api", resource="/assets/asset_G501/rms"),
+                outcome=RmsToolOutcome(mode=ResponseMode.COMPLETE, rms=RmsArtifact(
+                    asset_id="asset_G501", point_id=None, unit="mm/s", baseline_reference=None,
+                    baseline_state="established", alarm_threshold=None,
+                    samples=[RmsSample(ts="2026-09-01T10:00:00+00:00", value=1.1)], total_samples=1,
+                )),
+            ),
+        ),
+        ToolObservation(
+            request_id="req_01", call_id="call_spectrum",
+            artifact=SpectrumToolArtifact(
+                tool_name="get_spectrum", arguments={"asset_id": "asset_G501", "point_id": None},
+                source=ToolSource(kind="industrial_api", resource="/assets/asset_G501/spectrum"),
+                outcome=SpectrumToolOutcome(mode=ResponseMode.COMPLETE, spectrum=SpectrumArtifact(
+                    asset_id="asset_G501", point_id=None, peaks=[], bands_missing=[],
+                    collected_at="2026-09-01T11:00:00+00:00", total_peaks=0,
+                )),
+            ),
+        ),
+        ToolObservation(
+            request_id="req_01", call_id="call_model",
+            artifact=ModelToolArtifact(
+                tool_name="get_model", arguments={"model_id": "mdl_001"},
+                source=ToolSource(kind="industrial_api", resource="/models/mdl_001"),
+                outcome=ModelToolOutcome(mode=ResponseMode.COMPLETE, model=ModelArtifact(
+                    id="mdl_001", version="v1", coverage=[ModelCoverage(
+                        machine_type="pump", supported=True, can_learn_baseline=True
+                    )], requirements=ModelRequirements(
+                        min_completeness=0.9, min_snr_db=10, min_rotation_rpm=None
+                    ), processing_state="idle", last_run_at="2026-09-01T12:00:00+00:00",
+                )),
+            ),
+        ),
+    )
+
+    ledger = compile_observations(observations, recorded_at=RECORDED_AT)
+
+    assert {item.source_at.isoformat() for item in ledger.items} == {
+        "2026-09-01T10:00:00+00:00", "2026-09-01T11:00:00+00:00", "2026-09-01T12:00:00+00:00"
+    }
+
+
+def test_partial_non_snake_keys_are_preserved_as_safe_distinct_canonical_paths():
+    observation = ToolObservation(
+        request_id="req_01", call_id="call_partial",
+        artifact=DataQualityToolArtifact(
+            tool_name="get_data_quality", arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(kind="industrial_api", resource="/assets/asset_G501/data-quality"),
+            outcome=DataQualityToolOutcome(
+                mode=ResponseMode.PARTIAL,
+                partial_data={"sensor-name": "A", "sensor_name": "B"},
+            ),
+        ),
+    )
+
+    ledger = compile_observations((observation,), recorded_at=RECORDED_AT)
+
+    paths = [item.fact_path for item in ledger.items]
+    assert len(paths) == 2
+    assert len(set(paths)) == 2
+    assert all("-" not in path for path in paths)
+    assert {item.value.to_python() for item in ledger.items} == {"A", "B"}
