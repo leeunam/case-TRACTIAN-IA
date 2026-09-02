@@ -84,6 +84,7 @@ from tractian_agent.write_policy import (
     RequestModelRetrainingProposal,
     RequestSpecialistAnalysisProposal,
     TrustedActionApproval,
+    TrustedWriteContext,
     UpdateAssetCriticalityProposal,
     WritePolicyResult,
     canonical_write_payload_hash,
@@ -134,6 +135,13 @@ def _state(**changes: object) -> AgentState:
         "step_limit": 3,
     }
     data.update(changes)
+    if "trusted_write_context" not in changes:
+        request = data["request"]
+        data["trusted_write_context"] = TrustedWriteContext(
+            central_asset_id=request.asset_id,
+            current_case_id=request.case_id,
+            configured_model_id="mdl_vib_v3",
+        )
     if "ledger" not in changes:
         recorded_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
         observations = tuple(

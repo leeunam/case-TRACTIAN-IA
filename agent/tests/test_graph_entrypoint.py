@@ -28,6 +28,8 @@ from tractian_agent.state import (
     ReviewStatus,
     ThreadScope,
     ToolObservation,
+    WriterFailureCode,
+    WriterFailureRecord,
 )
 from tractian_agent.tools.runtime import (
     ReadToolRuntime,
@@ -45,6 +47,7 @@ from tractian_agent.write_policy import (
     PolicyReason,
     ReprocessProposal,
     TrustedActionApproval,
+    TrustedWriteContext,
     WritePolicyResult,
     canonical_write_payload_hash,
 )
@@ -107,6 +110,11 @@ def _initial_state(
             case_id="case_tkt_inv_04",
             company_id="comp_mineracao_andes",
             user_id="usr_pedro",
+        ),
+        trusted_write_context=TrustedWriteContext(
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            configured_model_id="mdl_vib_v3",
         ),
         step_limit=step_limit,
     )
@@ -291,6 +299,51 @@ class _RecordingGraph:
         self.values = values
         self.as_node = as_node
         return config
+
+
+def test_resume_rejects_a_third_writer_call_after_two_format_attempts():
+    state = _initial_state(step_limit=24).model_copy(
+        update={
+            "decision": AgentDecision.REQUEST_INFORMATION,
+            "planner_terminal": PlannerTerminalRecord(
+                decision="request_information",
+                stop_reason="missing_information",
+                missing_information="Informe o ponto de medição.",
+            ),
+            "resume_anchor": ResumeAnchor.WRITER,
+            "writer_attempts": 2,
+            "writer_failure": WriterFailureRecord(
+                code=WriterFailureCode.INVALID_STRUCTURED_OUTPUT,
+                attempts=2,
+                repairable=True,
+            ),
+        }
+    )
+    persisted_values = state.model_dump(mode="json")
+    graph = _RecordingGraph(
+        persisted_values,
+        next_nodes=("writer",),
+        planner_enabled=True,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=_runtime(client),
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_writer_third_attempt",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == "RESUME_ANCHOR_MISMATCH"
+    assert graph.as_node is None
+    assert graph.invoke_config is None
 
 
 def test_entrypoint_requires_thread_configuration_and_sync_durability():

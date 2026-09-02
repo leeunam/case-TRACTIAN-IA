@@ -41,28 +41,16 @@ from tractian_agent.tools.technical import (
     SpectrumToolArtifact,
 )
 from tractian_agent.write_contracts import (
-    EscalateCaseIntentScope,
     IntentStatus,
     PersistedApiError,
-    ReprocessIntentScope,
-    RequestModelRetrainingIntentScope,
-    RequestSpecialistAnalysisIntentScope,
-    UpdateAssetCriticalityIntentScope,
     WriteIntent,
     WriteIntentScope,
-    intent_scope_material_parameters,
-    intent_scope_target_id,
     proposal_matches_intent_scope,
 )
 from tractian_agent.write_policy import (
-    EscalateCaseProposal,
     PolicyDecision,
-    ReprocessProposal,
-    RequestModelRetrainingProposal,
-    RequestSpecialistAnalysisProposal,
     TrustedActionApproval,
-    UpdateAssetCriticalityProposal,
-    WriteMaterialParameters,
+    TrustedWriteContext,
     WriteProposal,
 )
 
@@ -77,47 +65,23 @@ def _proposal_matches_persisted_intent(
     *,
     request: PersistedSupportRequest,
     payload_hash: str,
+    trusted_context: TrustedWriteContext | None,
 ) -> bool:
     """Vincula o efeito terminal à proposal sem recuperar runtime no estado."""
-    if not proposal_matches_intent_scope(
-        proposal,
-        scope,
-        payload_hash=payload_hash,
-    ):
+    if trusted_context is None:
         return False
-    persisted_target = intent_scope_target_id(scope)
-    persisted_material = intent_scope_material_parameters(scope)
-    if isinstance(proposal, ReprocessProposal):
-        return (
-            isinstance(scope, ReprocessIntentScope)
-            and proposal.analysis_id == persisted_target
-            and persisted_material == WriteMaterialParameters()
-        )
-    if isinstance(proposal, RequestSpecialistAnalysisProposal):
-        return (
-            isinstance(scope, RequestSpecialistAnalysisIntentScope)
-            and proposal.analysis_id == persisted_target
-            and persisted_material == WriteMaterialParameters()
-        )
-    if isinstance(proposal, UpdateAssetCriticalityProposal):
-        return (
-            isinstance(scope, UpdateAssetCriticalityIntentScope)
-            and request.asset_id is not None
-            and persisted_target == request.asset_id
-            and persisted_material
-            == WriteMaterialParameters(criticality=proposal.criticality)
-        )
-    if isinstance(proposal, RequestModelRetrainingProposal):
-        # O model_id é confiável, mas não pertence ao estado persistível.
-        return (
-            isinstance(scope, RequestModelRetrainingIntentScope)
-            and persisted_material == WriteMaterialParameters()
-        )
     return (
-        isinstance(proposal, EscalateCaseProposal)
-        and isinstance(scope, EscalateCaseIntentScope)
-        and persisted_target == request.case_id
-        and persisted_material == WriteMaterialParameters()
+        trusted_context.current_case_id == request.case_id
+        and (
+            request.asset_id is None
+            or trusted_context.central_asset_id == request.asset_id
+        )
+        and proposal_matches_intent_scope(
+            proposal,
+            scope,
+            payload_hash=payload_hash,
+            trusted_context=trusted_context,
+        )
     )
 
 
@@ -1064,6 +1028,7 @@ class AgentState(FrozenStateModel):
     thread_id: str = Field(min_length=1, pattern=r"^\S+$")
     execution_id: str = Field(min_length=1, pattern=r"^\S+$")
     thread_scope: ThreadScope
+    trusted_write_context: TrustedWriteContext | None = None
     messages: tuple[PersistedMessage, ...] = ()
     tool_calls: tuple[PersistedToolCall, ...] = ()
     tool_observations: tuple[ToolObservation, ...] = ()
@@ -1190,6 +1155,7 @@ class AgentState(FrozenStateModel):
                     intent.scope,
                     request=self.request,
                     payload_hash=intent.payload_hash,
+                    trusted_context=self.trusted_write_context,
                 ):
                     return False
                 expected_decision = (
@@ -1277,6 +1243,15 @@ class AgentState(FrozenStateModel):
             or self.request.identity.user_id != self.identity.user_id
         ):
             raise ValueError("identidade da solicitação diverge da fronteira confiável")
+        if self.trusted_write_context is not None and (
+            self.trusted_write_context.current_case_id != self.request.case_id
+            or (
+                self.request.asset_id is not None
+                and self.trusted_write_context.central_asset_id
+                != self.request.asset_id
+            )
+        ):
+            raise ValueError("escopo confiável diverge da solicitação")
         thread_intent_scope = (
             self.thread_scope.case_id,
             self.thread_scope.company_id,
@@ -1358,6 +1333,13 @@ class AgentState(FrozenStateModel):
             self.writer_failure.attempts != self.writer_attempts
         ):
             raise ValueError("falha do writer diverge do contador persistido")
+        if self.resume_anchor is ResumeAnchor.WRITER and self.writer_attempts == 0:
+            raise ValueError("âncora do writer exige tentativa persistida")
+        if self.writer_attempts > 0 and self.resume_anchor not in {
+            ResumeAnchor.WRITER,
+            ResumeAnchor.RELEASE_GATE,
+        }:
+            raise ValueError("resultado do writer diverge da âncora persistida")
         if self.release_gate is not None and self.resume_anchor is not ResumeAnchor.RELEASE_GATE:
             raise ValueError("atestado do gate exige sua âncora persistida")
         terminal_anchors = {
@@ -1404,6 +1386,7 @@ class AgentState(FrozenStateModel):
                 if intent.request_id == self.request_id
             ),
             proposal=self.pending_proposal,
+            trusted_write_context=self.trusted_write_context,
             planner_terminal=self.planner_terminal,
             approval=self.approval,
             missing_information=(
@@ -1546,6 +1529,7 @@ class AgentState(FrozenStateModel):
         request_id: str,
         execution_id: str,
         step_limit: int | None = None,
+        trusted_write_context: TrustedWriteContext | None = None,
     ) -> AgentState:
         """Cria uma invocação no mesmo thread, validando novamente seu escopo."""
         if execution_id == self.execution_id:
@@ -1564,6 +1548,11 @@ class AgentState(FrozenStateModel):
             permissions=permissions,
             request_id=request_id,
             execution_id=execution_id,
+            trusted_write_context=(
+                self.trusted_write_context
+                if same_request
+                else trusted_write_context
+            ),
         )
         if not same_request:
             history = self.ledger_history

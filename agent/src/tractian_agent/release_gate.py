@@ -42,6 +42,7 @@ from tractian_agent.write_policy import (
     PolicyDecision,
     PolicyReason,
     TrustedActionApproval,
+    TrustedWriteContext,
     WriteProposal,
 )
 from tractian_agent.writer import (
@@ -80,6 +81,7 @@ class ReleaseGateContext(StrictModel):
     permissions: frozenset[Permission]
     intents: tuple[WriteIntent, ...] = ()
     proposal: WriteProposal | None = None
+    trusted_write_context: TrustedWriteContext | None = None
     planner_terminal: PlannerTerminalRecord | None = None
     approval: TrustedActionApproval | None = None
     missing_information: str | None = None
@@ -148,6 +150,11 @@ def _record(
                     else None
                 ),
                 "request_id": context.request_id,
+                "trusted_write_context": (
+                    context.trusted_write_context.model_dump(mode="json")
+                    if context.trusted_write_context is not None
+                    else None
+                ),
                 "writer_failure": (
                     context.writer_failure.model_dump(mode="json")
                     if context.writer_failure is not None
@@ -208,6 +215,8 @@ def _action_decision_is_canonical(
         }:
             return ReleaseGateReason.INTENT_MISSING
         return None
+    if context.trusted_write_context is None:
+        return ReleaseGateReason.INTENT_POLICY_MISMATCH
     if intent.status is IntentStatus.DENIED:
         return ReleaseGateReason.INTENT_POLICY_MISMATCH
     if intent.status is IntentStatus.UNCERTAIN:
@@ -223,6 +232,7 @@ def _action_decision_is_canonical(
             context.proposal,
             intent.scope,
             payload_hash=intent.payload_hash,
+            trusted_context=context.trusted_write_context,
         ):
             return ReleaseGateReason.INTENT_POLICY_MISMATCH
         if context.decision is not AgentDecision.REQUEST_CONFIRMATION:
@@ -245,6 +255,7 @@ def _action_decision_is_canonical(
         context.proposal,
         intent.scope,
         payload_hash=intent.payload_hash,
+        trusted_context=context.trusted_write_context,
     ):
         return ReleaseGateReason.INTENT_POLICY_MISMATCH
     expected = (
@@ -275,6 +286,8 @@ def _ledger_integrity_reason(
     context: ReleaseGateContext,
 ) -> ReleaseGateReason | None:
     if any(item.request_id != context.request_id for item in context.ledger.items):
+        return ReleaseGateReason.REQUEST_MISMATCH
+    if any(gap.request_id != context.request_id for gap in context.ledger.gaps):
         return ReleaseGateReason.REQUEST_MISMATCH
     if any(
         item.evidence_id != canonical_evidence_id(item)
@@ -412,6 +425,14 @@ def evaluate_release(context: ReleaseGateContext) -> ReleaseGateRecord:
     )
     if context.draft.evidence_ids != evidence_ids:
         return _review(context, ReleaseGateReason.EVIDENCE_REFERENCE_MISMATCH)
+    evidence_by_id = {
+        item.evidence_id: item for item in context.ledger.items
+    }
+    if "read" not in context.permissions and any(
+        evidence_by_id[evidence_id].source_kind is EvidenceSourceKind.TOOL
+        for evidence_id in context.draft.evidence_ids
+    ):
+        return _review(context, ReleaseGateReason.PERMISSION_INCOMPATIBLE)
     if context.draft.limitation_refs != limitation_refs:
         return _review(context, ReleaseGateReason.LIMITATION_REFERENCE_MISMATCH)
     if context.draft.next_step is not _NEXT_STEP_BY_DECISION[context.decision]:
@@ -456,9 +477,8 @@ def evaluate_release(context: ReleaseGateContext) -> ReleaseGateRecord:
         or has_degraded_item
     ):
         return _review(context, ReleaseGateReason.INSUFFICIENT_EVIDENCE)
-    if context.decision is AgentDecision.GUIDE:
-        if "read" not in context.permissions:
-            return _review(context, ReleaseGateReason.PERMISSION_INCOMPATIBLE)
+    if context.decision is AgentDecision.GUIDE and "read" not in context.permissions:
+        return _review(context, ReleaseGateReason.PERMISSION_INCOMPATIBLE)
     return _record(
         context,
         ReleaseGateOutcome.RELEASE,

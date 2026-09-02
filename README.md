@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação e checkpointer SQLite de desenvolvimento. Em 02/09/2026, `make test` passou com 99 testes da API e 1.535 do agente (1.634 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 8 estão concluídas. O grafo atual ainda não é um agente de produção: revisão humana retomável, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação e checkpointer SQLite de desenvolvimento. Em 02/09/2026, `make test` passou com 99 testes da API e 1.555 do agente (1.654 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 8 estão concluídas. O grafo atual ainda não é um agente de produção: revisão humana retomável, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -45,14 +45,16 @@ No MVP, planner e writer podem usar o mesmo modelo com prompts e contratos difer
 
 O writer usa o prompt `writer-v1`, não recebe tools e devolve somente um draft
 estruturado com a decisão imutável, IDs ordenados e próximo passo enumerado. Seu
-contexto é limitado a 64 referências e usa somente IDs e categorias fechadas:
-alvos, valores, timestamps e caminhos técnicos permanecem no ledger. O gate
-deriva a decisão de ação da intenção, proposal e terminal do planner atuais,
-recompõe IDs e conflitos e recompila evidências de ação contra o recibo. Apenas
-um atestado `release` permite ao renderer buscar os valores no ledger; a mensagem
-técnica não vem do modelo e é revalidada ao restaurar o checkpoint. Uma saída de
-formato inválido admite somente um repair; duas falhas, erro de provider ou
-qualquer incerteza terminam em aviso sanitizado e seguro para futura revisão.
+contexto usa um orçamento total de 64 referências e somente IDs e categorias
+fechadas: alvos, valores, timestamps e caminhos técnicos permanecem no ledger.
+O gate deriva a decisão e o alvo da ação da request confiável, da proposal, da
+intenção, da aprovação e do recibo atuais; recompõe IDs e conflitos e exige
+`read` sempre que o draft cita um fato de tool. Apenas um atestado `release`
+permite ao renderer buscar os valores no ledger; a mensagem técnica não vem do
+modelo e é revalidada ao restaurar o checkpoint. Uma saída de formato inválido
+admite somente um repair; contador, âncora e próximo nó impedem uma terceira
+chamada. Duas falhas, erro de provider ou qualquer incerteza terminam em aviso
+sanitizado e seguro para futura revisão.
 
 O **ledger de evidências** associa fatos às fontes consultadas no estado da execução. Ele recebe somente observações de leitura validadas e recibos tipados de intenções terminais; texto livre de LLM, proposals e mensagens de recibo não viram fatos. O Logfire receberá traces e métricas para consulta humana e operação; ele não será o banco principal do ledger nem uma fonte que o agente consulta durante o atendimento. Logfire ainda não está implementado.
 
@@ -62,6 +64,7 @@ Há dois armazenamentos SQLite independentes no desenvolvimento. A API usa `IDEM
 
 - `thread_id` identifica a linha persistida; um thread pode receber novos `request_id`, e cada execução ou retomada recebe novo `execution_id`. Mudança de caso, empresa, pessoa usuária ou alvo confiável falha fechada.
 - A intenção persistida registra ID, request, escopo imutável, hash, decisão/status, tentativas, execução preparadora e recibo ou erro; runtime, cliente, credenciais, seed, golden set, resposta HTTP bruta e raciocínio não entram no checkpoint.
+- O estado persiste somente os três alvos confiáveis necessários à escrita — ativo central, caso atual e modelo industrial configurado — e os vincula novamente à request, à intenção e ao atestado; esse contexto nunca é enviado ao writer.
 - Criação e retomada que podem escrever usam `durability="sync"`; `prepare_intent` fica em superstep distinto e é persistido antes de `execute_action`. Confirmações usam `interrupt()` estruturado e `Command` pelo ID na fronteira confiável.
 - O primeiro alvo de idempotência é `POST /analyses/{analysisId}/reprocess`.
 - A API exige uma `Idempotency-Key` de 1 a 255 caracteres sem espaços, reserva a intenção antes da ação, persiste respostas concluídas em SQLite e faz replay mesmo após recriar o armazenamento; mesma chave com payload diferente retorna `409 Conflict`.

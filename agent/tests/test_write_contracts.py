@@ -16,12 +16,19 @@ from tractian_agent.write_contracts import (
     RequestSpecialistAnalysisIntentScope,
     UpdateAssetCriticalityIntentScope,
     WriteIntent,
+    proposal_matches_intent_scope,
 )
 from tractian_agent.write_policy import (
+    EscalateCaseProposal,
     PolicyDecision,
     PolicyReason,
     ReprocessProposal,
+    RequestModelRetrainingProposal,
+    RequestSpecialistAnalysisProposal,
+    TrustedWriteContext,
+    UpdateAssetCriticalityProposal,
     WritePolicyResult,
+    canonical_write_payload_hash,
 )
 
 
@@ -73,6 +80,116 @@ def _intent(**changes: object) -> WriteIntent:
     }
     data.update(changes)
     return WriteIntent(**data)
+
+
+@pytest.mark.parametrize(
+    ("proposal", "scope", "divergent_scope"),
+    [
+        (
+            ReprocessProposal(
+                analysis_id="an_9906",
+                justification="Reprocesse a análise depois da correção dos dados.",
+            ),
+            ReprocessIntentScope(
+                action="reprocess_analysis",
+                case_id="case_tkt_inv_04",
+                company_id="comp_mineracao_andes",
+                user_id="usr_pedro",
+                analysis_id="an_9906",
+                justification="Reprocesse a análise depois da correção dos dados.",
+            ),
+            {"analysis_id": "an_9910"},
+        ),
+        (
+            RequestSpecialistAnalysisProposal(
+                analysis_id="an_9906",
+                justification="Solicite análise especializada para validar o diagnóstico.",
+            ),
+            RequestSpecialistAnalysisIntentScope(
+                action="request_specialist_analysis",
+                case_id="case_tkt_inv_04",
+                company_id="comp_mineracao_andes",
+                user_id="usr_pedro",
+                analysis_id="an_9906",
+                justification="Solicite análise especializada para validar o diagnóstico.",
+            ),
+            {"analysis_id": "an_9910"},
+        ),
+        (
+            UpdateAssetCriticalityProposal(
+                criticality="critical",
+                justification="Atualize a criticidade devido ao impacto operacional atual.",
+            ),
+            UpdateAssetCriticalityIntentScope(
+                action="update_asset_criticality",
+                case_id="case_tkt_inv_04",
+                company_id="comp_mineracao_andes",
+                user_id="usr_pedro",
+                asset_id="asset_G501",
+                criticality="critical",
+                justification="Atualize a criticidade devido ao impacto operacional atual.",
+            ),
+            {"asset_id": "asset_G502"},
+        ),
+        (
+            RequestModelRetrainingProposal(
+                justification="Solicite retreinamento após confirmar o erro sistemático.",
+            ),
+            RequestModelRetrainingIntentScope(
+                action="request_model_retraining",
+                case_id="case_tkt_inv_04",
+                company_id="comp_mineracao_andes",
+                user_id="usr_pedro",
+                model_id="mdl_vib_v3",
+                justification="Solicite retreinamento após confirmar o erro sistemático.",
+            ),
+            {"model_id": "mdl_vib_v4"},
+        ),
+        (
+            EscalateCaseProposal(
+                justification="Escale o caso porque a condição exige atendimento humano.",
+            ),
+            EscalateCaseIntentScope(
+                action="escalate_case",
+                case_id="case_tkt_inv_04",
+                company_id="comp_mineracao_andes",
+                user_id="usr_pedro",
+                justification="Escale o caso porque a condição exige atendimento humano.",
+            ),
+            {"case_id": "case_tkt_inv_05"},
+        ),
+    ],
+)
+def test_canonical_proposal_intent_matcher_binds_each_action_target(
+    proposal,
+    scope,
+    divergent_scope,
+):
+    trusted_context = TrustedWriteContext(
+        central_asset_id="asset_G501",
+        current_case_id="case_tkt_inv_04",
+        configured_model_id="mdl_vib_v3",
+    )
+    payload_hash = canonical_write_payload_hash(proposal)
+
+    assert proposal_matches_intent_scope(
+        proposal,
+        scope,
+        payload_hash=payload_hash,
+        trusted_context=trusted_context,
+    )
+    assert not proposal_matches_intent_scope(
+        proposal,
+        scope.model_copy(update=divergent_scope),
+        payload_hash=payload_hash,
+        trusted_context=trusted_context,
+    )
+    assert not proposal_matches_intent_scope(
+        proposal,
+        scope.model_copy(update={"case_id": "case_tkt_inv_05"}),
+        payload_hash=payload_hash,
+        trusted_context=trusted_context,
+    )
 
 
 def test_write_intent_request_id_is_optional_only_for_legacy_wire():

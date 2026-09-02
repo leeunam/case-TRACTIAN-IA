@@ -340,17 +340,19 @@ pacotes. Writer e gate continuam pendentes na Fase 8.
 **Aceite:** o writer não consegue criar nova decisão, tool call ou fato não registrado.
 
 **Aceite verificado (02/09/2026):** o `Writer` usa o prompt versionado
-`writer-v1`, somente `with_structured_output` e uma projeção positiva limitada
-a 64 referências. O modelo recebe apenas decisão, IDs e categorias fechadas de
+`writer-v1`, somente `with_structured_output` e uma projeção positiva com
+orçamento total de 64 referências. O modelo recebe apenas decisão, IDs e categorias fechadas de
 fato/limitação, além da informação ausente já decidida; resource, target,
 `source_at`, valor e `fact_path` permanecem no ledger. Seu draft strict não
 contém prosa, valores ou tool calls. Uma falha de formato permite uma única
 tentativa adicional em superstep persistível; erro de provider não ganha retry
 e sua exceção sanitizada não retém saída bruta em causa, contexto ou traceback.
-O `ReleaseGate` puro deriva ACT/ESCALATE da intenção, proposal e terminal do
-planner atuais; recompõe cada ID, valida coerência mode/quality/obsolescence,
-reconstrói conflitos e recompila integralmente a evidência de ação contra
-intent/recibo. Intenção negada, falha, incerta ou não terminal nunca pode ser
+O `ReleaseGate` puro deriva ACT/ESCALATE e o alvo do escopo confiável persistido,
+da intenção, proposal e terminal do planner atuais; recompõe cada ID, valida
+coerência mode/quality/obsolescence, reconstrói conflitos e recompila
+integralmente a evidência de ação contra intent/aprovação/recibo. Fatos de tool
+citados exigem permissão `read`, inclusive em respostas de ação; recibo isolado
+usa somente a permissão da ação. Intenção negada, falha, incerta ou não terminal nunca pode ser
 escondida por uma decisão GUIDE. O renderer resolve todo texto técnico somente
 no ledger. Draft, atestado e resposta são recompostos ao restaurar o estado, de
 modo que adulteração do checkpoint falha fechada mesmo com digests recalculados.
@@ -361,16 +363,18 @@ atual como bloqueante para uma resposta técnica. Isso pode pedir revisão em
 casos conservadores, mas impede que o writer esconda uma lacuna fora da seleção.
 IDs de limitações derivam de tipo, request, todas as fontes/referências, razão e
 detalhe canônicos; IDs de conflito são únicos, ordenados e deduplicados antes do
-hash. O planner passa a reservar writer, um possível repair e gate
+hash. Lacunas também precisam pertencer à request atual. O planner passa a reservar writer, um possível repair e gate
 dentro do teto de 24 passos; o fallback sem planner conserva os budgets exatos
-3/5 e a resposta determinística legada.
+3/5 e a resposta determinística legada. O contador, o resultado, a âncora e o
+próximo nó do writer são validados juntos, de modo que nenhum checkpoint permita
+uma terceira chamada ao modelo.
 
 As cinco ações passaram por interrupção após o efeito, fechamento/reabertura do
 SQLite, retomada somente em writer/gate e replay sem novo HTTP ou modelo. A
 confirmação estruturada também terminou no gate sem repetir efeito. As suítes
-focadas da Fase 8 somaram 581 testes, as regressões dos fluxos de escrita
-227, a suíte completa do agente 1.535 e o `make test` confirmou 99 testes da API
-+ 1.535 do agente = 1.634 testes. `uv lock --check --offline` resolveu 49
+focadas da Fase 8 somaram 601 testes, as regressões dos fluxos de escrita
+227, a suíte completa do agente 1.555 e o `make test` confirmou 99 testes da API
++ 1.555 do agente = 1.654 testes. `uv lock --check --offline` resolveu 49
 pacotes; permaneceu apenas o warning conhecido de `python_multipart`.
 
 ## Fase 9 — revisão humana

@@ -51,6 +51,7 @@ from tractian_agent.write_policy import (
     PolicyReason,
     ReprocessProposal,
     TrustedActionApproval,
+    TrustedWriteContext,
     UpdateAssetCriticalityProposal,
     WritePolicyResult,
     canonical_write_payload_hash,
@@ -105,6 +106,14 @@ def _draft_for(
             AgentDecision.REQUEST_CONFIRMATION: WriterNextStep.CONFIRM_ACTION,
             AgentDecision.REQUIRE_HUMAN_REVIEW: WriterNextStep.AWAIT_HUMAN_REVIEW,
         }[decision],
+    )
+
+
+def _trusted_write_context() -> TrustedWriteContext:
+    return TrustedWriteContext(
+        central_asset_id="asset_G501",
+        current_case_id="case_tkt_inv_04",
+        configured_model_id="mdl_vib_v3",
     )
 
 
@@ -166,6 +175,7 @@ def _released_action_state() -> AgentState:
         ledger=ledger,
         draft=draft,
         permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
         intents=(intent,),
         proposal=proposal,
         approval=approval,
@@ -195,6 +205,7 @@ def _released_action_state() -> AgentState:
             company_id=request.identity.company_id,
             user_id=request.identity.user_id,
         ),
+        trusted_write_context=_trusted_write_context(),
         ledger=ledger,
         decision=AgentDecision.ACT,
         step_count=9,
@@ -218,6 +229,7 @@ def test_gate_derives_act_from_the_completed_canonical_action() -> None:
         ledger=ledger,
         draft=_draft_for(AgentDecision.ESCALATE, ledger),
         permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
         intents=(intent,),
         proposal=proposal,
         approval=approval,
@@ -227,6 +239,107 @@ def test_gate_derives_act_from_the_completed_canonical_action() -> None:
 
     assert result.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
     assert result.reason is ReleaseGateReason.DECISION_MISMATCH
+
+
+def test_action_with_cited_tool_evidence_requires_read_permission() -> None:
+    proposal, approval, intent, action_ledger = _completed_update_action()
+    technical = _claimable_ledger().items[0].model_copy(
+        update={"request_id": "req_gate_action"}
+    )
+    technical = technical.model_copy(
+        update={"evidence_id": canonical_evidence_id(technical)}
+    )
+    ledger = EvidenceLedger(
+        request_id="req_gate_action",
+        items=tuple(
+            sorted(
+                (*action_ledger.items, technical),
+                key=lambda item: item.evidence_id,
+            )
+        ),
+    )
+    context = ReleaseGateContext(
+        request_id="req_gate_action",
+        decision=AgentDecision.ACT,
+        ledger=ledger,
+        draft=_draft_for(AgentDecision.ACT, ledger),
+        permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
+        intents=(intent,),
+        proposal=proposal,
+        approval=approval,
+    )
+
+    result = evaluate_release(context)
+
+    assert result.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+    assert result.reason is ReleaseGateReason.PERMISSION_INCOMPATIBLE
+
+
+def test_receipt_only_action_does_not_require_read_permission() -> None:
+    proposal, approval, intent, ledger = _completed_update_action()
+    context = ReleaseGateContext(
+        request_id="req_gate_action",
+        decision=AgentDecision.ACT,
+        ledger=ledger,
+        draft=_draft_for(AgentDecision.ACT, ledger),
+        permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
+        intents=(intent,),
+        proposal=proposal,
+        approval=approval,
+    )
+
+    result = evaluate_release(context)
+
+    assert result.outcome is ReleaseGateOutcome.RELEASE
+
+
+def test_read_permission_revoked_after_draft_blocks_cited_tool_evidence() -> None:
+    proposal, approval, intent, action_ledger = _completed_update_action()
+    technical = _claimable_ledger().items[0].model_copy(
+        update={"request_id": "req_gate_action"}
+    )
+    technical = technical.model_copy(
+        update={"evidence_id": canonical_evidence_id(technical)}
+    )
+    ledger = EvidenceLedger(
+        request_id="req_gate_action",
+        items=tuple(
+            sorted(
+                (*action_ledger.items, technical),
+                key=lambda item: item.evidence_id,
+            )
+        ),
+    )
+    draft = _draft_for(AgentDecision.ACT, ledger)
+    allowed = ReleaseGateContext(
+        request_id="req_gate_action",
+        decision=AgentDecision.ACT,
+        ledger=ledger,
+        draft=draft,
+        permissions=frozenset({"read", "action_high"}),
+        trusted_write_context=_trusted_write_context(),
+        intents=(intent,),
+        proposal=proposal,
+        approval=approval,
+    )
+    revoked = ReleaseGateContext(
+        request_id=allowed.request_id,
+        decision=allowed.decision,
+        ledger=allowed.ledger,
+        draft=draft,
+        permissions=frozenset({"action_high"}),
+        trusted_write_context=allowed.trusted_write_context,
+        intents=allowed.intents,
+        proposal=allowed.proposal,
+        approval=allowed.approval,
+    )
+
+    assert evaluate_release(allowed).outcome is ReleaseGateOutcome.RELEASE
+    result = evaluate_release(revoked)
+    assert result.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+    assert result.reason is ReleaseGateReason.PERMISSION_INCOMPATIBLE
 
 
 def test_gate_does_not_hide_a_denied_write_intent_behind_read_evidence() -> None:
@@ -249,6 +362,7 @@ def test_gate_does_not_hide_a_denied_write_intent_behind_read_evidence() -> None
         ledger=ledger,
         draft=_draft_for(AgentDecision.GUIDE, ledger),
         permissions=frozenset({"read"}),
+        trusted_write_context=_trusted_write_context(),
         intents=(denied,),
         proposal=proposal,
     )
@@ -313,6 +427,7 @@ def test_request_confirmation_requires_the_action_permission() -> None:
         ledger=ledger,
         draft=_draft_for(AgentDecision.REQUEST_CONFIRMATION, ledger),
         permissions=frozenset(),
+        trusted_write_context=_trusted_write_context(),
         intents=(awaiting,),
         proposal=proposal,
     )
@@ -343,6 +458,7 @@ def test_request_confirmation_accepts_only_a_coherent_awaiting_intent() -> None:
         ledger=ledger,
         draft=_draft_for(AgentDecision.REQUEST_CONFIRMATION, ledger),
         permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
         intents=(awaiting,),
         proposal=proposal,
     )
@@ -373,6 +489,7 @@ def test_request_confirmation_rejects_an_approval_incompatible_with_policy() -> 
         ledger=ledger,
         draft=_draft_for(AgentDecision.REQUEST_CONFIRMATION, ledger),
         permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
         intents=(awaiting,),
         proposal=proposal,
         approval=approval,
@@ -413,6 +530,7 @@ def test_release_context_revalidates_the_status_policy_matrix() -> None:
             ledger=ledger,
             draft=_draft_for(AgentDecision.REQUEST_CONFIRMATION, ledger),
             permissions=frozenset({"action_high"}),
+            trusted_write_context=_trusted_write_context(),
             intents=(awaiting,),
             proposal=proposal,
         )
@@ -430,6 +548,7 @@ def test_completed_action_requires_the_exact_canonical_proposal() -> None:
         ledger=ledger,
         draft=_draft_for(AgentDecision.ACT, ledger),
         permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
         intents=(intent,),
         proposal=divergent,
         approval=approval,
@@ -487,6 +606,7 @@ def test_completed_action_binds_the_proposal_target_to_the_intent_scope() -> Non
         ledger=ledger,
         draft=_draft_for(AgentDecision.ACT, ledger),
         permissions=frozenset({"action_low"}),
+        trusted_write_context=_trusted_write_context(),
         intents=(intent,),
         proposal=divergent_proposal,
         approval=TrustedActionApproval(
@@ -552,6 +672,34 @@ def test_gate_releases_only_the_canonical_facts_selected_by_id() -> None:
     assert 'asset.criticality = "high"' in result.message
     assert "get_asset" in result.message
     assert evidence_id not in result.message
+
+
+def test_projection_overflow_marker_blocks_release() -> None:
+    base = _claimable_ledger()
+    items = []
+    for index in range(65):
+        item = base.items[0].model_copy(
+            update={"call_id": f"call_gate_overflow_{index:03d}"}
+        )
+        items.append(
+            item.model_copy(update={"evidence_id": canonical_evidence_id(item)})
+        )
+    ledger = EvidenceLedger(
+        request_id=base.request_id,
+        items=tuple(sorted(items, key=lambda item: item.evidence_id)),
+    )
+    context = ReleaseGateContext(
+        request_id="req_gate_01",
+        decision=AgentDecision.GUIDE,
+        ledger=ledger,
+        draft=_draft_for(AgentDecision.GUIDE, ledger),
+        permissions=frozenset({"read"}),
+    )
+
+    result = evaluate_release(context)
+
+    assert result.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+    assert result.reason is ReleaseGateReason.INSUFFICIENT_EVIDENCE
 
 
 def test_request_information_keeps_structured_provenance_without_technical_text() -> None:
@@ -734,6 +882,36 @@ def test_gate_rejects_a_historical_item_inserted_in_the_current_ledger() -> None
     assert result.reason is ReleaseGateReason.REQUEST_MISMATCH
 
 
+def test_gate_rejects_a_historical_gap_without_exposing_its_reference() -> None:
+    base = _claimable_ledger()
+    historical_gap = EvidenceGap(
+        reason=EvidenceGapReason.PARTIAL,
+        request_id="req_historical_secret",
+        call_id="call_historical_secret",
+        fact_path="asset.criticality",
+    )
+    ledger = EvidenceLedger(
+        request_id=base.request_id,
+        items=base.items,
+        gaps=(historical_gap,),
+    )
+    context = ReleaseGateContext(
+        request_id="req_gate_01",
+        decision=AgentDecision.GUIDE,
+        ledger=ledger,
+        draft=_draft_for(AgentDecision.GUIDE, ledger),
+        permissions=frozenset({"read"}),
+    )
+
+    attestation = evaluate_release(context)
+    result = render_non_release_result(context, attestation)
+
+    assert attestation.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+    assert attestation.reason is ReleaseGateReason.REQUEST_MISMATCH
+    assert result.limitation_refs == ()
+    assert "historical" not in result.message
+
+
 def test_gate_rejects_partial_evidence_marked_as_claimable() -> None:
     base = _claimable_ledger()
     incoherent = base.items[0].model_copy(
@@ -797,6 +975,7 @@ def test_gate_recompiles_action_evidence_and_rejects_the_wrong_resource() -> Non
         ledger=ledger,
         draft=_draft_for(AgentDecision.ACT, ledger),
         permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
         intents=(intent,),
         proposal=proposal,
         approval=approval,
@@ -884,6 +1063,7 @@ def test_gate_reports_uncertain_action_before_considering_its_evidence_gap() -> 
         ledger=ledger,
         draft=_draft_for(AgentDecision.ACT, ledger),
         permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
         intents=(intent,),
         proposal=proposal,
         approval=approval,
@@ -921,6 +1101,7 @@ def test_checkpoint_rejects_a_forged_decision_with_recomputed_digests() -> None:
         ledger=state.ledger,
         draft=forged_draft,
         permissions=state.permissions,
+        trusted_write_context=state.trusted_write_context,
         intents=state.intents,
         proposal=state.pending_proposal,
         approval=state.approval,
@@ -949,6 +1130,62 @@ def test_checkpoint_rejects_a_forged_decision_with_recomputed_digests() -> None:
         AgentState.model_validate(tampered)
 
 
+def test_checkpoint_binds_the_released_action_target_to_the_trusted_request() -> None:
+    state = _released_action_state()
+    intent = state.intents[0]
+    assert isinstance(intent.scope, UpdateAssetCriticalityIntentScope)
+    forged_intent = intent.model_copy(
+        update={
+            "scope": intent.scope.model_copy(update={"asset_id": "asset_G502"})
+        }
+    )
+    forged_approval = state.approval.model_copy(update={"target_id": "asset_G502"})
+    forged_ledger = compile_action_intents(
+        (forged_intent,),
+        recorded_at=state.ledger.items[0].recorded_at,
+    )
+    forged_draft = _draft_for(AgentDecision.ACT, forged_ledger)
+    forged_trusted_context = _trusted_write_context().model_copy(
+        update={"central_asset_id": "asset_G502"}
+    )
+    forged_context = ReleaseGateContext(
+        request_id=state.request_id,
+        decision=AgentDecision.ACT,
+        ledger=forged_ledger,
+        draft=forged_draft,
+        permissions=state.permissions,
+        trusted_write_context=forged_trusted_context,
+        intents=(forged_intent,),
+        proposal=state.pending_proposal,
+        approval=forged_approval,
+    )
+    forged_gate = evaluate_release(forged_context)
+    assert forged_gate.outcome is ReleaseGateOutcome.RELEASE
+    forged_result = render_released_result(forged_context, forged_gate)
+    tampered = state.model_dump(mode="json")
+    tampered["intents"] = [forged_intent.model_dump(mode="json")]
+    tampered["approval"] = forged_approval.model_dump(mode="json")
+    tampered["trusted_write_context"] = forged_trusted_context.model_dump(
+        mode="json"
+    )
+    tampered["ledger"] = forged_ledger.model_dump(mode="json")
+    tampered["writer_draft"] = forged_draft.model_dump(mode="json")
+    tampered["release_gate"] = forged_gate.model_dump(mode="json")
+    tampered["final_result"] = forged_result.model_dump(mode="json")
+
+    with pytest.raises(ValidationError, match="escopo confiável"):
+        AgentState.model_validate(tampered)
+
+
+def test_checkpoint_cannot_delete_the_trusted_action_scope() -> None:
+    state = _released_action_state()
+    tampered = state.model_dump(mode="json")
+    tampered.pop("trusted_write_context")
+
+    with pytest.raises(ValidationError, match="atestado"):
+        AgentState.model_validate(tampered)
+
+
 def test_gate_attestation_binds_missing_information_even_if_message_is_recomputed() -> None:
     missing_information = "Informe o ponto de medição."
     planner_terminal = PlannerTerminalRecord(
@@ -968,6 +1205,7 @@ def test_gate_attestation_binds_missing_information_even_if_message_is_recompute
         ledger=ledger,
         draft=draft,
         permissions=frozenset({"read"}),
+        trusted_write_context=_trusted_write_context(),
         planner_terminal=planner_terminal,
         missing_information=missing_information,
     )
@@ -996,6 +1234,7 @@ def test_gate_attestation_binds_missing_information_even_if_message_is_recompute
             company_id=request.identity.company_id,
             user_id=request.identity.user_id,
         ),
+        trusted_write_context=_trusted_write_context(),
         ledger=ledger,
         decision=AgentDecision.REQUEST_INFORMATION,
         step_count=5,

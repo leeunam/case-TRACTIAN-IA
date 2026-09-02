@@ -30,6 +30,7 @@ from tractian_agent.write_policy import (
     ApprovalSource,
     PolicyReason,
     TrustedActionApproval,
+    TrustedWriteContext,
     WriteProposal,
 )
 
@@ -169,6 +170,7 @@ def _resume_predecessor(
     next_nodes: tuple[str, ...],
     *,
     planner_enabled: bool,
+    state: AgentState,
 ) -> str:
     pending_node = _pending_node(next_nodes)
     if (anchor, pending_node) not in _ALLOWED_RESUME_PAIRS:
@@ -183,6 +185,31 @@ def _resume_predecessor(
         raise AgentInvocationProtocolError(
             "RESUME_TOPOLOGY_MISMATCH",
             "checkpoint parcial pertence a outra topologia de grafo",
+        )
+    if anchor is ResumeAnchor.WRITER:
+        expected_writer_node = (
+            "writer"
+            if (
+                state.writer_draft is None
+                and state.writer_failure is not None
+                and state.writer_failure.repairable
+                and state.writer_attempts == 1
+            )
+            else "release_gate"
+        )
+        if pending_node != expected_writer_node:
+            raise AgentInvocationProtocolError(
+                "RESUME_ANCHOR_MISMATCH",
+                "o resultado persistido do writer diverge do próximo nó",
+            )
+    elif pending_node == "writer" and (
+        state.writer_attempts != 0
+        or state.writer_draft is not None
+        or state.writer_failure is not None
+    ):
+        raise AgentInvocationProtocolError(
+            "RESUME_ANCHOR_MISMATCH",
+            "o writer pendente exige contador e resultado vazios",
         )
     return anchor.value
 
@@ -361,6 +388,18 @@ def _validate_runtime_request_scope(
         )
 
 
+def _trusted_write_context(
+    request: SupportRequest,
+    runtime: ReadToolRuntime,
+) -> TrustedWriteContext:
+    """Persiste somente os alvos confiáveis necessários à política e ao gate."""
+    return TrustedWriteContext(
+        central_asset_id=runtime.central_asset_id,
+        current_case_id=request.case_id,
+        configured_model_id=runtime.configured_model_id,
+    )
+
+
 def _validate_current_read_access(
     state: AgentState,
     runtime: ReadToolRuntime,
@@ -473,6 +512,7 @@ async def invoke_agent(
         planner_enabled=planner_enabled,
     )
     _validate_runtime_request_scope(request, runtime)
+    trusted_write_context = _trusted_write_context(request, runtime)
     resolved_step_limit = step_limit
     if resolved_step_limit is None:
         if planner_enabled:
@@ -515,6 +555,7 @@ async def invoke_agent(
                         checkpoint_anchor,
                         snapshot.next,
                         planner_enabled=planner_enabled,
+                        state=persisted,
                     )
                     if snapshot.next
                     else None
@@ -580,6 +621,7 @@ async def invoke_agent(
                 request_id=request_id,
                 execution_id=execution_id,
                 step_limit=resolved_step_limit,
+                trusted_write_context=trusted_write_context,
             )
             if not new_request:
                 _validate_persisted_write_inputs(
@@ -669,6 +711,7 @@ async def invoke_agent(
                             checkpoint_anchor,
                             snapshot.next,
                             planner_enabled=planner_enabled,
+                            state=state,
                         )
                     )
                     config = await graph.aupdate_state(
@@ -709,6 +752,7 @@ async def invoke_agent(
                     company_id=runtime.identity.company_id,
                     user_id=runtime.identity.user_id,
                 ),
+                trusted_write_context=trusted_write_context,
                 step_limit=resolved_step_limit,
                 pending_proposal=proposal,
                 approval=original_approval,

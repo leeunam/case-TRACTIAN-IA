@@ -469,11 +469,75 @@ def test_writer_projection_has_a_deterministic_reference_limit() -> None:
         missing_information=None,
     )
 
-    assert len(context.facts) == 64
-    assert len(context.limitations) <= 64
+    assert len(context.facts) == 63
+    assert len(context.facts) + len(context.limitations) == 64
     assert {item.kind for item in context.limitations} == {
         "projection_overflow"
     }
+
+
+@pytest.mark.parametrize(
+    (
+        "fact_count",
+        "limitation_count",
+        "expected_facts",
+        "expected_limitations",
+        "overflow",
+    ),
+    [
+        (63, 0, 63, 0, False),
+        (64, 0, 64, 0, False),
+        (65, 0, 63, 1, True),
+        (63, 1, 63, 1, False),
+        (63, 2, 63, 1, True),
+        (64, 64, 63, 1, True),
+        (32, 33, 32, 32, True),
+    ],
+)
+def test_writer_projection_shares_one_total_budget_across_reference_kinds(
+    fact_count,
+    limitation_count,
+    expected_facts,
+    expected_limitations,
+    overflow,
+):
+    base = _claimable_ledger()
+    items = tuple(
+        base.items[0].model_copy(
+            update={
+                "evidence_id": f"sha256:v1:{index:064x}",
+                "call_id": f"call_budget_{index:03d}",
+            }
+        )
+        for index in range(fact_count)
+    )
+    gaps = tuple(
+        EvidenceGap(
+            reason=EvidenceGapReason.PARTIAL,
+            request_id=base.request_id,
+            call_id=f"call_gap_{index:03d}",
+            fact_path="asset.criticality",
+        )
+        for index in range(limitation_count)
+    )
+
+    context = build_writer_context(
+        decision=AgentDecision.GUIDE,
+        ledger=EvidenceLedger(
+            request_id=base.request_id,
+            items=items,
+            gaps=gaps,
+        ),
+        missing_information=None,
+    )
+
+    assert len(context.facts) == expected_facts
+    assert len(context.limitations) == expected_limitations
+    assert len(context.facts) + len(context.limitations) <= 64
+    assert (
+        any(item.kind == "projection_overflow" for item in context.limitations)
+        is overflow
+    )
 
 
 def test_conflict_limitation_id_covers_every_conflicting_evidence_reference() -> None:

@@ -22,8 +22,7 @@ from tractian_agent.state import (
 
 
 WRITER_SYSTEM_PROMPT_VERSION: Final = "writer-v1"
-WRITER_MAX_FACT_REFERENCES: Final = 64
-WRITER_MAX_LIMITATION_REFERENCES: Final = 64
+MAX_WRITER_REFERENCES: Final = 64
 WRITER_SYSTEM_PROMPT: Final = """writer-v1
 Você é o writer do atendimento industrial. Receba somente a decisão já tomada,
 fatos canônicos e limitações selecionados em código. Não altere a decisão, não
@@ -232,14 +231,15 @@ def build_writer_context(
     )
     canonical_limitations = _canonical_limitations(ledger)
     projection_overflow = (
-        len(all_facts) > WRITER_MAX_FACT_REFERENCES
-        or len(canonical_limitations) > WRITER_MAX_LIMITATION_REFERENCES
+        len(all_facts) + len(canonical_limitations) > MAX_WRITER_REFERENCES
     )
-    limitation_budget = (
-        WRITER_MAX_LIMITATION_REFERENCES - 1
+    reference_budget = (
+        MAX_WRITER_REFERENCES - 1
         if projection_overflow
-        else WRITER_MAX_LIMITATION_REFERENCES
+        else MAX_WRITER_REFERENCES
     )
+    facts = all_facts[:reference_budget]
+    limitation_budget = reference_budget - len(facts)
     limitations = [
         WriterLimitation(
             limitation_ref=limitation.limitation_ref,
@@ -266,7 +266,7 @@ def build_writer_context(
         limitations.sort(key=lambda value: value.limitation_ref)
     return WriterContext(
         decision=decision,
-        facts=all_facts[:WRITER_MAX_FACT_REFERENCES],
+        facts=facts,
         limitations=tuple(limitations),
         missing_information=missing_information,
     )
@@ -373,8 +373,7 @@ class Writer:
 __all__ = [
     "WRITER_SYSTEM_PROMPT",
     "WRITER_SYSTEM_PROMPT_VERSION",
-    "WRITER_MAX_FACT_REFERENCES",
-    "WRITER_MAX_LIMITATION_REFERENCES",
+    "MAX_WRITER_REFERENCES",
     "Writer",
     "WriterContext",
     "WriterDraft",

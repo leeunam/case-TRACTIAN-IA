@@ -29,7 +29,6 @@ from tractian_agent.evidence import (
 )
 from tractian_agent.planner import (
     Planner,
-    PlannerDecisionKind,
     PlannerDecisionTurn,
     PlannerProtocolError,
     PlannerToolTurn,
@@ -800,6 +799,19 @@ def _planner_finalize(state: AgentState) -> dict[str, object]:
 
 def _writer_node(writer: Writer):
     async def write(state: AgentState) -> dict[str, object]:
+        initial_attempt = (
+            state.writer_attempts == 0
+            and state.writer_draft is None
+            and state.writer_failure is None
+        )
+        persisted_repair = (
+            state.writer_attempts == 1
+            and state.writer_draft is None
+            and state.writer_failure is not None
+            and state.writer_failure.repairable
+        )
+        if not (initial_attempt or persisted_repair):
+            return _checkpoint_update(state)
         try:
             advanced = state.advance_step()
         except ValueError:
@@ -905,6 +917,7 @@ def _release_gate_context(state: AgentState) -> ReleaseGateContext:
         permissions=state.permissions,
         intents=current_intents,
         proposal=state.pending_proposal,
+        trusted_write_context=state.trusted_write_context,
         planner_terminal=state.planner_terminal,
         approval=state.approval,
         missing_information=(

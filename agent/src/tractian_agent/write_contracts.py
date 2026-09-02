@@ -18,17 +18,14 @@ from tractian_agent.contracts import (
 from tractian_agent.tools.identifiers import AnalysisId, AssetId, ModelId
 from tractian_agent.write_policy import (
     AssetCriticality,
-    EscalateCaseProposal,
     PolicyDecision,
     PolicyReason,
-    ReprocessProposal,
-    RequestModelRetrainingProposal,
-    RequestSpecialistAnalysisProposal,
-    UpdateAssetCriticalityProposal,
+    TrustedWriteContext,
     WriteMaterialParameters,
     WritePolicyResult,
     WriteProposal,
     canonical_write_payload_hash,
+    resolve_action_scope,
 )
 
 
@@ -162,34 +159,33 @@ def proposal_matches_intent_scope(
     scope: WriteIntentScope,
     *,
     payload_hash: str,
+    trusted_context: TrustedWriteContext,
 ) -> bool:
-    """Compara a proposal pública com todos os campos que ela originou."""
+    """Vincula proposal e intent ao alvo resolvido pela fronteira confiável."""
     if (
         proposal.action != scope.action
         or proposal.justification != scope.justification
         or canonical_write_payload_hash(proposal) != payload_hash
     ):
         return False
-    if isinstance(proposal, ReprocessProposal):
-        return (
-            isinstance(scope, ReprocessIntentScope)
-            and proposal.analysis_id == scope.analysis_id
-        )
-    if isinstance(proposal, RequestSpecialistAnalysisProposal):
-        return (
-            isinstance(scope, RequestSpecialistAnalysisIntentScope)
-            and proposal.analysis_id == scope.analysis_id
-        )
-    if isinstance(proposal, UpdateAssetCriticalityProposal):
-        return (
-            isinstance(scope, UpdateAssetCriticalityIntentScope)
-            and proposal.criticality == scope.criticality
-        )
-    if isinstance(proposal, RequestModelRetrainingProposal):
-        return isinstance(scope, RequestModelRetrainingIntentScope)
-    return isinstance(proposal, EscalateCaseProposal) and isinstance(
-        scope,
-        EscalateCaseIntentScope,
+    expected_scope_type = {
+        "reprocess_analysis": ReprocessIntentScope,
+        "request_specialist_analysis": RequestSpecialistAnalysisIntentScope,
+        "update_asset_criticality": UpdateAssetCriticalityIntentScope,
+        "request_model_retraining": RequestModelRetrainingIntentScope,
+        "escalate_case": EscalateCaseIntentScope,
+    }[proposal.action]
+    if not isinstance(scope, expected_scope_type):
+        return False
+    canonical = resolve_action_scope(
+        proposal,
+        trusted_context=trusted_context,
+    )
+    return (
+        scope.case_id == trusted_context.current_case_id
+        and canonical.target_id == intent_scope_target_id(scope)
+        and canonical.material_parameters
+        == intent_scope_material_parameters(scope)
     )
 
 
