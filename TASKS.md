@@ -216,9 +216,11 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
   antes de confirmação, checkpoint e qualquer HTTP. O provider não pode criar
   aprovação, identidade, permissão ou efeito de escrita.
 - `make smoke-groq` é opt-in e fica fora de `make test`: compara os dois modelos
-  Groq com dados sintéticos, uma repetição e sem retry, emitindo apenas status e
-  métricas agregadas. Sem `GROQ_API_KEY`, não constrói provider nem toca a rede,
-  imprime `status=skipped reason=missing_groq_api_key` e sai com zero.
+  Groq com dados sintéticos e sem retry, emitindo apenas status e métricas
+  agregadas. Uma rodada declara estabilidade `not_measured`; com
+  `GROQ_SMOKE_RUNS>=2`, compara assinaturas de contratos entre rodadas. Sem
+  `GROQ_API_KEY`, não constrói provider nem toca a rede, imprime
+  `status=skipped reason=missing_groq_api_key` e sai com zero.
 
 **Evidência final de aceite (01/09/2026):** os testes focados de provider,
 planner, grafo e smoke passaram, incluindo dois `ModelProvider` falsos pelo
@@ -226,7 +228,7 @@ caminho público `create_chat_model → Planner → build_agent_graph → invoke
 Eles receberam IDs externos distintos e produziram os mesmos schemas e ordem
 de catálogo, tool e argumentos persistidos, decisão `request_confirmation` e
 resultado de política `require_confirmation/explicit_approval_required`, sem
-HTTP. A suíte completa do agente passou com **1.424 testes**; os
+HTTP. A suíte completa do agente passou com **1.428 testes**; os
 locks offline resolveram 49 pacotes do agente e 55 da API. O smoke real
 `make smoke-groq` foi **skipped**, nunca passed, pois `GROQ_API_KEY` não estava
 disponível; isso não tocou a rede e deixa a compatibilidade ao vivo da conta

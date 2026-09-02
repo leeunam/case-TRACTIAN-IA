@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Final, Literal, TextIO
 
@@ -25,6 +26,8 @@ _SMOKE_CONFIG: Final = {
     "timeout_seconds": 30.0,
     "max_output_tokens": 128,
 }
+_PORTUGUESE_OBJECTIVE: Final = "continuar o atendimento industrial em português"
+_PORTUGUESE_TERMINAL_STATUS: Final = "concluído"
 
 
 class SmokeToolArguments(StrictModel):
@@ -33,7 +36,7 @@ class SmokeToolArguments(StrictModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     idioma: Literal["pt-BR"]
-    objetivo: str
+    objetivo: Literal[_PORTUGUESE_OBJECTIVE]
 
 
 class SmokeTerminalDecision(StrictModel):
@@ -41,7 +44,7 @@ class SmokeTerminalDecision(StrictModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    status: str
+    status: Literal[_PORTUGUESE_TERMINAL_STATUS]
 
 
 def _validate_portuguese_tool(idioma: Literal["pt-BR"], objetivo: str) -> str:
@@ -59,6 +62,19 @@ _PORTUGUESE_TOOL: Final = StructuredTool.from_function(
 )
 
 
+@dataclass(frozen=True)
+class _SmokeResult:
+    model_id: str
+    passed: bool
+    portuguese: bool
+    tool: bool
+    arguments: bool
+    pydantic: bool
+    calls: int
+    latency_ms: int
+    signature: tuple[object, ...] | None
+
+
 def _safe_result_line(
     *,
     model_id: str,
@@ -69,17 +85,32 @@ def _safe_result_line(
     pydantic: bool,
     calls: int,
     latency_ms: int,
-    stable: bool,
+    runs: int,
+    stable: Literal["true", "false", "not_measured"],
 ) -> str:
     return (
         f"model={model_id} status={status} portuguese={str(portuguese).lower()} "
         f"tool={str(tool).lower()} arguments={str(arguments).lower()} "
         f"pydantic={str(pydantic).lower()} calls={calls} "
-        f"latency_ms={latency_ms} stable={str(stable).lower()}"
+        f"latency_ms={latency_ms} runs={runs} stable={stable}"
     )
 
 
-async def _run_model(provider: ModelProvider, model_id: str) -> str:
+def _failed_result(model_id: str, *, latency_ms: int = 0) -> _SmokeResult:
+    return _SmokeResult(
+        model_id=model_id,
+        passed=False,
+        portuguese=False,
+        tool=False,
+        arguments=False,
+        pydantic=False,
+        calls=0,
+        latency_ms=latency_ms,
+        signature=None,
+    )
+
+
+async def _run_model(provider: ModelProvider, model_id: str) -> _SmokeResult:
     started_at = perf_counter()
     successful_calls = 0
     portuguese = tool_selected = arguments_valid = terminal_valid = False
@@ -121,26 +152,80 @@ async def _run_model(provider: ModelProvider, model_id: str) -> str:
             ]
         )
         successful_calls += 1
-        terminal_valid = (
-            SmokeTerminalDecision.model_validate(terminal).status.strip() != ""
-        )
+        validated_terminal = SmokeTerminalDecision.model_validate(terminal)
+        terminal_valid = True
         passed = portuguese and tool_selected and arguments_valid and terminal_valid
-        status = "passed" if passed else "failed"
+        signature = (
+            selected.get("name") if tool_selected else None,
+            validated.model_dump_json() if tool_selected else None,
+            validated_terminal.model_dump_json(),
+        )
     except Exception:
-        status = "failed"
-        successful_calls = 0
-        portuguese = tool_selected = arguments_valid = terminal_valid = False
+        return _failed_result(
+            model_id,
+            latency_ms=int((perf_counter() - started_at) * 1000),
+        )
     latency_ms = int((perf_counter() - started_at) * 1000)
-    return _safe_result_line(
+    return _SmokeResult(
         model_id=model_id,
-        status=status,
+        passed=passed,
         portuguese=portuguese,
         tool=tool_selected,
         arguments=arguments_valid,
         pydantic=terminal_valid,
         calls=successful_calls,
         latency_ms=latency_ms,
-        stable=(status == "passed"),
+        signature=signature if passed else None,
+    )
+
+
+def _configured_runs(environment: Mapping[str, str]) -> int | None:
+    raw_runs = environment.get("GROQ_SMOKE_RUNS", "1")
+    try:
+        runs = int(raw_runs)
+    except (TypeError, ValueError):
+        return None
+    return runs if runs >= 1 else None
+
+
+def _aggregate_result(
+    model_id: str,
+    results: tuple[_SmokeResult, ...],
+    *,
+    runs: int,
+) -> str:
+    if not results:
+        return _safe_result_line(
+            model_id=model_id,
+            status="failed",
+            portuguese=False,
+            tool=False,
+            arguments=False,
+            pydantic=False,
+            calls=0,
+            latency_ms=0,
+            runs=runs,
+            stable="not_measured",
+        )
+    contracts_passed = all(result.passed for result in results)
+    stable: Literal["true", "false", "not_measured"]
+    if runs == 1:
+        stable = "not_measured"
+    elif contracts_passed and len({result.signature for result in results}) == 1:
+        stable = "true"
+    else:
+        stable = "false"
+    return _safe_result_line(
+        model_id=model_id,
+        status="passed" if contracts_passed else "failed",
+        portuguese=all(result.portuguese for result in results),
+        tool=all(result.tool for result in results),
+        arguments=all(result.arguments for result in results),
+        pydantic=all(result.pydantic for result in results),
+        calls=sum(result.calls for result in results),
+        latency_ms=sum(result.latency_ms for result in results),
+        runs=runs,
+        stable=stable,
     )
 
 
@@ -156,8 +241,31 @@ def run_smoke(
         print("status=skipped reason=missing_groq_api_key", file=output)
         return 0
 
-    provider = provider_factory.from_env(environment)
-    lines = [asyncio.run(_run_model(provider, model_id)) for model_id in SMOKE_MODEL_IDS]
+    runs = _configured_runs(environment)
+    if runs is None:
+        lines = [
+            _aggregate_result(model_id, (), runs=0)
+            for model_id in SMOKE_MODEL_IDS
+        ]
+        for line in lines:
+            print(line, file=output)
+        return 1
+    try:
+        provider = provider_factory.from_env(environment)
+    except Exception:
+        lines = [
+            _aggregate_result(model_id, (), runs=runs)
+            for model_id in SMOKE_MODEL_IDS
+        ]
+        for line in lines:
+            print(line, file=output)
+        return 1
+    lines = []
+    for model_id in SMOKE_MODEL_IDS:
+        results = tuple(
+            asyncio.run(_run_model(provider, model_id)) for _ in range(runs)
+        )
+        lines.append(_aggregate_result(model_id, results, runs=runs))
     for line in lines:
         print(line, file=output)
     return 0 if all("status=passed" in line for line in lines) else 1
