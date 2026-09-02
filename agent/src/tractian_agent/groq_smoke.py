@@ -15,6 +15,11 @@ from pydantic import ConfigDict
 from tractian_agent.contracts import StrictModel
 from tractian_agent.groq_provider import GroqModelProvider
 from tractian_agent.model_provider import ModelConfig, ModelProvider
+from tractian_agent.planner import (
+    PlannerDecisionKind,
+    PlannerStopReason,
+    PlannerTerminalDecision,
+)
 
 
 SMOKE_MODEL_IDS: Final = (
@@ -24,10 +29,9 @@ SMOKE_MODEL_IDS: Final = (
 _SMOKE_CONFIG: Final = {
     "temperature": 0.0,
     "timeout_seconds": 30.0,
-    "max_output_tokens": 128,
+    "max_output_tokens": 512,
 }
 _PORTUGUESE_OBJECTIVE: Final = "continuar o atendimento industrial em português"
-_PORTUGUESE_TERMINAL_STATUS: Final = "concluído"
 
 
 class SmokeToolArguments(StrictModel):
@@ -37,14 +41,6 @@ class SmokeToolArguments(StrictModel):
 
     idioma: Literal["pt-BR"]
     objetivo: Literal[_PORTUGUESE_OBJECTIVE]
-
-
-class SmokeTerminalDecision(StrictModel):
-    """Finalização Pydantic independente da escolha da tool."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    status: Literal[_PORTUGUESE_TERMINAL_STATUS]
 
 
 def _validate_portuguese_tool(idioma: Literal["pt-BR"], objetivo: str) -> str:
@@ -147,21 +143,27 @@ async def _run_model(provider: ModelProvider, model_id: str) -> _SmokeResult:
                 portuguese = arguments_valid and validated.idioma == "pt-BR"
 
         terminal = await model.with_structured_output(
-            SmokeTerminalDecision,
+            PlannerTerminalDecision,
             include_raw=False,
         ).ainvoke(
             [
                 HumanMessage(
                     content=(
-                        "Finalize em português com o schema solicitado, sem "
-                        "explicações adicionais."
+                        "Finalize o contrato do planner com decision=guide, "
+                        "stop_reason=sufficient_evidence e "
+                        "missing_information=null, sem explicações adicionais."
                     )
                 )
             ]
         )
         successful_calls += 1
-        validated_terminal = SmokeTerminalDecision.model_validate(terminal)
-        terminal_valid = True
+        validated_terminal = PlannerTerminalDecision.model_validate(terminal)
+        terminal_valid = (
+            validated_terminal.decision is PlannerDecisionKind.GUIDE
+            and validated_terminal.stop_reason
+            is PlannerStopReason.SUFFICIENT_EVIDENCE
+            and validated_terminal.missing_information is None
+        )
         passed = portuguese and tool_selected and arguments_valid and terminal_valid
         signature = (
             selected.get("name") if tool_selected else None,

@@ -207,11 +207,14 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
   Pydantic separada. No adapter Groq, a finalização é traduzida para JSON Schema
   estrito nativo (`method="json_schema"`, `strict=True`), em vez do default
   `function_calling`: o smoke anterior observou `tool_use_failed` porque a tool
-  sintética desse default podia não ser chamada pelos GPT-OSS. A seleção continua
-  usando somente `bind_tools`, em requisição distinta e sem retry. O grafo só
-  oferece catálogo autorizado pelo estado e runtime, limita sete tools, oito
-  seleções, uma finalização, 48 mil caracteres e 20 passos; tool inválida,
-  repetida ou fora de escopo falha fechada.
+  sintética desse default podia não ser chamada pelos GPT-OSS. Schemas Pydantic
+  são revalidados pelo adapter diretamente a partir do texto JSON com
+  `model_validate_json`, preservando a semântica JSON dos Enums estritos e todos
+  os validators de coerência; o contrato do planner não conhece esse detalhe do
+  provider. A seleção continua usando somente `bind_tools`, em requisição
+  distinta e sem retry. O grafo só oferece catálogo autorizado pelo estado e
+  runtime, limita sete tools, oito seleções, uma finalização, 48 mil caracteres
+  e 20 passos; tool inválida, repetida ou fora de escopo falha fechada.
 - O estado nunca recebe modelo, credencial, resposta HTTP bruta, texto livre do
   seletor nem ID externo de provider. Cada `PersistedToolCall` recebe
   `call_planner_<24 hex>` derivado por SHA-256 de
@@ -221,8 +224,10 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
   antes de confirmação, checkpoint e qualquer HTTP. O provider não pode criar
   aprovação, identidade, permissão ou efeito de escrita.
 - `make smoke-groq` é opt-in e fica fora de `make test`: compara os dois modelos
-  Groq com dados sintéticos e sem retry, emitindo apenas status e métricas
-  agregadas. Uma rodada declara estabilidade `not_measured`; com
+  Groq com dados sintéticos, sem retry e com 512 tokens de saída, emitindo apenas
+  status e métricas agregadas. A finalização usa o contrato real
+  `PlannerTerminalDecision` e exige `guide`, `sufficient_evidence` e
+  `missing_information=null`. Uma rodada declara estabilidade `not_measured`; com
   `GROQ_SMOKE_RUNS>=2`, compara assinaturas de contratos entre rodadas. Sem
   `GROQ_API_KEY`, não constrói provider nem toca a rede, imprime
   `status=skipped reason=missing_groq_api_key` e sai com zero.
@@ -237,20 +242,29 @@ HTTP. A suíte completa do agente passou com **1.434 testes**; os
 locks offline resolveram 49 pacotes do agente e 55 da API. O smoke real
 `make smoke-groq` foi **skipped**, nunca passed, pois `GROQ_API_KEY` não estava
 disponível; isso não tocou a rede e deixa a compatibilidade ao vivo da conta
-como verificação futura opt-in. Após a correção de JSON Schema estrito em
-02/09/2026, a repetição manual com chave continua pendente; o smoke não deve ser
-declarado aprovado antes dessa execução.
+como verificação futura opt-in naquele momento.
 
 **Evidência da correção de aceite (02/09/2026):** o teste RED/GREEN sem rede
 provou que a interface pública de saída estruturada do modelo devolvido pelo
 adapter usa `json_schema` estrito. Um segundo ciclo RED/GREEN comprovou que, se
 a seleção terminou e a finalização falha, o smoke emite somente métricas seguras
 com `tool=true`, `arguments=true`, `pydantic=false` e `calls=1`; falha de
-construção ou da primeira chamada mantém métricas falsas e zero chamadas. Os 18
+construção ou da primeira chamada mantém métricas falsas e zero chamadas. Os 26
 testes focados de provider e smoke passaram; os locks offline resolveram 49
-pacotes do agente e 55 da API; e `make test` passou com 59 testes da API e 1.437
-do agente (1.496 no total). O smoke pós-correção foi **skipped** sem chave, sem
-tocar a rede; a confirmação manual opt-in com `GROQ_API_KEY` continua pendente.
+pacotes do agente e 55 da API; e `make test` passou com 59 testes da API e 1.445
+do agente (1.504 no total). O smoke pós-correção foi **skipped** sem chave, sem
+tocar a rede naquele ambiente.
+
+**Evidência manual diagnóstica (02/09/2026):** com chave fornecida somente no
+terminal, o smoke mostrou o 120b aprovado (`portuguese`, tool, argumentos e
+Pydantic verdadeiros, duas chamadas) e o 20b com seleção aprovada, mas
+finalização reprovada após uma chamada. O probe isolado do 20b identificou
+`BadRequestError` HTTP 400 com código `json_validate_failed` no orçamento antigo
+de 128 tokens. Com 512, terminou com `finish_reason=stop`, 171 tokens de saída,
+150 tokens de raciocínio, sem erro de parser e com Pydantic válido. Isso demonstra
+insuficiência do orçamento antigo, não incompatibilidade do modelo. O parser do
+adapter e o smoke foram corrigidos e cobertos sem rede; o smoke completo ao vivo
+pós-correção ainda precisa ser repetido e não é declarado aprovado.
 
 - [x] Criar interface de modelo independente do provedor.
 - [x] Implementar adapter inicial do Groq.
@@ -259,8 +273,8 @@ tocar a rede; a confirmação manual opt-in com `GROQ_API_KEY` continua pendente
 - [x] Limitar passos, repetição e consumo de contexto.
 
 **Aceite verificado:** trocar o adapter não altera estado, tools ou regras de
-segurança; a prova usa providers falsos e o smoke ao vivo permanece skipped até
-existir uma chave Groq no ambiente.
+segurança; a prova de independência usa providers falsos, e a evidência ao vivo
+é registrada sem antecipar o resultado da repetição pós-correção.
 
 ## Fase 7 — ledger de evidências
 

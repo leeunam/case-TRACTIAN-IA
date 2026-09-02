@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner LLM opt-in e checkpointer SQLite de desenvolvimento. Após a correção do adapter Groq em 02/09/2026, `make test` passou com 59 testes da API e 1.437 do agente (1.496 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 6 estão concluídas. O grafo atual não é um agente de produção: writer, resposta gerada ao cliente, ledger completo, gate de liberação, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner LLM opt-in e checkpointer SQLite de desenvolvimento. Após a correção do adapter Groq em 02/09/2026, `make test` passou com 59 testes da API e 1.445 do agente (1.504 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 6 estão concluídas. O grafo atual não é um agente de produção: writer, resposta gerada ao cliente, ledger completo, gate de liberação, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -69,23 +69,33 @@ tokens e sem retry oculto. O planner usa `bind_tools` para uma escolha por
 turno e uma chamada Pydantic separada para encerrar. No adapter Groq, essa
 finalização usa o JSON Schema nativo estrito (`method="json_schema"`,
 `strict=True`); a correção evita o `tool_use_failed` observado quando o default
-`function_calling` criava uma tool sintética que GPT-OSS podia não chamar. O
-modelo, credenciais e respostas brutas não entram no estado. IDs persistidos de
-tool call são derivados pelo runtime de `request_id` e do ordinal, nunca do ID
-externo do provider. NVIDIA NIM continua alternativa futura; writer poderá usar
-outro modelo quando existir, sem mudar as regras de negócio.
+`function_calling` criava uma tool sintética que GPT-OSS podia não chamar. Para
+schemas Pydantic, o adapter valida diretamente o texto JSON com
+`model_validate_json`: valores de Enum mantêm a semântica do wire JSON, enquanto
+os validators e as regras de coerência do contrato continuam falhando fechados.
+O planner e seu contrato permanecem independentes desse detalhe de transporte.
+O modelo, credenciais e respostas brutas não entram no estado. IDs persistidos
+de tool call são derivados pelo runtime de `request_id` e do ordinal, nunca do
+ID externo do provider. NVIDIA NIM continua alternativa futura; writer poderá
+usar outro modelo quando existir, sem mudar as regras de negócio.
 
 O smoke opt-in `make smoke-groq` compara `openai/gpt-oss-120b` e
-`openai/gpt-oss-20b` com dados sintéticos e sem retry. Por padrão há uma rodada
-por modelo e a estabilidade é declarada como `not_measured`; defina
+`openai/gpt-oss-20b` com dados sintéticos, sem retry e com o mesmo orçamento de
+512 tokens da configuração inicial. A finalização usa o contrato real
+`PlannerTerminalDecision` e exige `guide`, `sufficient_evidence` e informação
+ausente nula. Por padrão há uma rodada por modelo e a estabilidade é declarada
+como `not_measured`; defina
 `GROQ_SMOKE_RUNS=2` ou maior para comparar as assinaturas dos contratos entre
 rodadas. Ele exige `GROQ_API_KEY` já disponível no ambiente, não lê `.env` e só
 imprime métricas agregadas seguras. Sem a chave, sai com código zero e
 `status=skipped reason=missing_groq_api_key`, sem tocar a rede. No aceite desta
-entrega, o smoke ao vivo ficou **skipped** porque a chave não estava disponível.
-A correção do JSON Schema estrito foi coberta sem rede; a repetição manual
-opt-in com chave continua pendente para confirmar a compatibilidade ao vivo da
-conta Groq após essa correção.
+entrega, o smoke ao vivo inicialmente ficou **skipped** porque a chave não
+estava disponível. Na verificação manual posterior, o 120b passou os dois
+contratos; o 20b passou a seleção e falhou na finalização com o orçamento antigo
+de 128 tokens. Um probe isolado confirmou `json_validate_failed` em 128 e
+conclusão válida em 512, com `finish_reason=stop`, 171 tokens de saída, 150 deles
+de raciocínio e Pydantic válido. A repetição do smoke completo depois desta
+correção de orçamento e parser continua pendente e não é declarada aprovada.
 
 ## Avaliação offline planejada
 

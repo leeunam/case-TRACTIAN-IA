@@ -6,8 +6,13 @@ from typing import Any
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 
-from tractian_agent.groq_smoke import SmokeTerminalDecision, run_smoke
+from tractian_agent.groq_smoke import run_smoke
 from tractian_agent.model_provider import ModelConfig
+from tractian_agent.planner import (
+    PlannerDecisionKind,
+    PlannerStopReason,
+    PlannerTerminalDecision,
+)
 
 
 class _FakeSmokeModel:
@@ -31,11 +36,15 @@ class _FakeSmokeModel:
         return RunnableLambda(select)
 
     def with_structured_output(self, schema: object, **kwargs: Any) -> RunnableLambda:
-        assert schema is SmokeTerminalDecision
+        assert schema is PlannerTerminalDecision
         assert kwargs == {"include_raw": False}
 
-        async def finalize(_: object) -> SmokeTerminalDecision:
-            return SmokeTerminalDecision(status="concluído")
+        async def finalize(_: object) -> PlannerTerminalDecision:
+            return PlannerTerminalDecision(
+                decision=PlannerDecisionKind.GUIDE,
+                stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+                missing_information=None,
+            )
 
         return RunnableLambda(finalize)
 
@@ -90,6 +99,10 @@ def test_groq_smoke_reports_only_safe_aggregate_metrics_with_fake_provider():
         "openai/gpt-oss-120b",
         "openai/gpt-oss-20b",
     ]
+    assert all(
+        config.max_output_tokens == 512
+        for config in _FakeSmokeProvider.received_configs
+    )
     assert len(lines) == 2
     assert all(
         "status=passed" in line
@@ -184,6 +197,49 @@ def test_groq_smoke_preserves_safe_selection_progress_when_finalization_fails():
     assert "SENTINEL_SECRET" not in output.getvalue()
     assert "raw response" not in output.getvalue()
     assert "provider-only-id" not in output.getvalue()
+
+
+class _UnexpectedTerminalSmokeModel(_FakeSmokeModel):
+    def with_structured_output(self, schema: object, **kwargs: Any) -> RunnableLambda:
+        assert schema is PlannerTerminalDecision
+        assert kwargs == {"include_raw": False}
+
+        async def finalize(_: object) -> PlannerTerminalDecision:
+            return PlannerTerminalDecision(
+                decision=PlannerDecisionKind.REQUEST_INFORMATION,
+                stop_reason=PlannerStopReason.MISSING_INFORMATION,
+                missing_information="Informe o ponto de medição.",
+            )
+
+        return RunnableLambda(finalize)
+
+
+class _UnexpectedTerminalSmokeProvider(_FakeSmokeProvider):
+    def create_chat_model(self, config: ModelConfig) -> _UnexpectedTerminalSmokeModel:
+        self.received_configs.append(config)
+        return _UnexpectedTerminalSmokeModel()
+
+
+def test_groq_smoke_requires_the_expected_real_planner_decision():
+    _UnexpectedTerminalSmokeProvider.received_configs = []
+    output = StringIO()
+
+    exit_code = run_smoke(
+        environment={"GROQ_API_KEY": "not-printed-test-key"},
+        output=output,
+        provider_factory=_UnexpectedTerminalSmokeProvider,  # type: ignore[arg-type]
+    )
+
+    lines = output.getvalue().splitlines()
+    assert exit_code == 1
+    assert len(lines) == 2
+    assert all(
+        "status=failed" in line
+        and "pydantic=false" in line
+        and "calls=2" in line
+        for line in lines
+    )
+    assert "Informe o ponto de medição" not in output.getvalue()
 
 
 class _SequencedSmokeProvider(_FakeSmokeProvider):

@@ -1,12 +1,39 @@
-from unittest.mock import patch
+import asyncio
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables import RunnableLambda
 from langchain_groq import ChatGroq
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from tractian_agent.groq_provider import GroqModelProvider
 from tractian_agent.model_provider import ModelConfig
-from tractian_agent.planner import PlannerTerminalDecision
+from tractian_agent.planner import (
+    PlannerDecisionKind,
+    PlannerStopReason,
+    PlannerTerminalDecision,
+)
+
+
+def _fake_chat_result(content: str) -> ChatResult:
+    return ChatResult(
+        generations=[ChatGeneration(message=AIMessage(content=content))]
+    )
+
+
+def _create_test_model():
+    return GroqModelProvider(
+        api_key=SecretStr("test-groq-key")
+    ).create_chat_model(
+        ModelConfig(
+            model_id="openai/gpt-oss-20b",
+            temperature=0.0,
+            timeout_seconds=10.0,
+            max_output_tokens=512,
+        )
+    )
 
 
 def test_groq_provider_masks_a_direct_string_key_in_its_state():
@@ -85,22 +112,156 @@ def test_groq_provider_maps_common_config_without_network():
 
 
 def test_groq_provider_uses_strict_json_schema_for_public_structured_output():
-    provider = GroqModelProvider(api_key=SecretStr("test-groq-key"))
-    model = provider.create_chat_model(
-        ModelConfig(
-            model_id="openai/gpt-oss-20b",
-            temperature=0.0,
-            timeout_seconds=10.0,
-            max_output_tokens=512,
-        )
-    )
+    model = _create_test_model()
 
-    with patch.object(ChatGroq, "with_structured_output", return_value=object()) as method:
+    upstream = RunnableLambda(lambda _: {"raw": AIMessage(content="{}")})
+    with patch.object(
+        ChatGroq,
+        "with_structured_output",
+        return_value=upstream,
+    ) as method:
         model.with_structured_output(PlannerTerminalDecision, include_raw=False)
 
     method.assert_called_once_with(
         PlannerTerminalDecision,
         method="json_schema",
         strict=True,
-        include_raw=False,
+        include_raw=True,
     )
+
+
+def test_groq_provider_validates_strict_pydantic_output_from_json_wire():
+    model = _create_test_model()
+    response = _fake_chat_result(
+        '{"decision":"guide","stop_reason":"sufficient_evidence",'
+        '"missing_information":null}'
+    )
+
+    with patch.object(model, "_generate", return_value=response):
+        result = model.with_structured_output(
+            PlannerTerminalDecision,
+            include_raw=False,
+        ).invoke([HumanMessage(content="Finalize.")])
+
+    assert result == PlannerTerminalDecision(
+        decision=PlannerDecisionKind.GUIDE,
+        stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+        missing_information=None,
+    )
+
+
+def test_groq_provider_validates_pydantic_json_through_async_public_interface():
+    model = _create_test_model()
+    response = _fake_chat_result(
+        '{"decision":"guide","stop_reason":"sufficient_evidence",'
+        '"missing_information":null}'
+    )
+
+    async def invoke_structured_output():
+        with patch.object(
+            model,
+            "_agenerate",
+            new=AsyncMock(return_value=response),
+        ):
+            return await asyncio.wait_for(
+                model.with_structured_output(
+                    PlannerTerminalDecision,
+                    include_raw=False,
+                ).ainvoke([HumanMessage(content="Finalize.")]),
+                timeout=2.0,
+            )
+
+    result = asyncio.run(invoke_structured_output())
+
+    assert result == PlannerTerminalDecision(
+        decision=PlannerDecisionKind.GUIDE,
+        stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+        missing_information=None,
+    )
+
+
+def test_groq_provider_preserves_include_raw_while_parsing_json_wire():
+    model = _create_test_model()
+    response = _fake_chat_result(
+        '{"decision":"guide","stop_reason":"sufficient_evidence",'
+        '"missing_information":null}'
+    )
+
+    with patch.object(model, "_generate", return_value=response):
+        result = model.with_structured_output(
+            PlannerTerminalDecision,
+            include_raw=True,
+        ).invoke([HumanMessage(content="Finalize.")])
+
+    assert result["raw"] == response.generations[0].message
+    assert result["parsed"] == PlannerTerminalDecision(
+        decision=PlannerDecisionKind.GUIDE,
+        stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+        missing_information=None,
+    )
+    assert result["parsing_error"] is None
+
+
+def test_groq_provider_include_raw_captures_invalid_pydantic_json():
+    model = _create_test_model()
+    response = _fake_chat_result(
+        '{"decision":"invented","stop_reason":"sufficient_evidence",'
+        '"missing_information":null}'
+    )
+
+    with patch.object(model, "_generate", return_value=response):
+        result = model.with_structured_output(
+            PlannerTerminalDecision,
+            include_raw=True,
+        ).invoke([HumanMessage(content="Finalize.")])
+
+    assert result["raw"] == response.generations[0].message
+    assert result["parsed"] is None
+    assert isinstance(result["parsing_error"], ValidationError)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        (
+            '{"decision":"invented","stop_reason":"sufficient_evidence",'
+            '"missing_information":null}'
+        ),
+        (
+            '{"decision":"guide","stop_reason":"missing_information",'
+            '"missing_information":"Informe o ponto de medição."}'
+        ),
+    ],
+    ids=["unknown-enum", "incoherent-contract"],
+)
+def test_groq_provider_fails_closed_for_invalid_terminal_json(content):
+    model = _create_test_model()
+
+    with patch.object(model, "_generate", return_value=_fake_chat_result(content)):
+        structured_model = model.with_structured_output(
+            PlannerTerminalDecision,
+            include_raw=False,
+        )
+        with pytest.raises(ValidationError):
+            structured_model.invoke([HumanMessage(content="Finalize.")])
+
+
+def test_groq_provider_preserves_include_raw_for_json_schema_dict():
+    model = _create_test_model()
+    schema = {
+        "title": "SmokeStatus",
+        "type": "object",
+        "properties": {"status": {"type": "string"}},
+        "required": ["status"],
+        "additionalProperties": False,
+    }
+    response = _fake_chat_result('{"status":"ok"}')
+
+    with patch.object(model, "_generate", return_value=response):
+        result = model.with_structured_output(schema, include_raw=True).invoke(
+            [HumanMessage(content="Finalize.")]
+        )
+
+    assert result["raw"] == response.generations[0].message
+    assert result["parsed"] == {"status": "ok"}
+    assert result["parsing_error"] is None
