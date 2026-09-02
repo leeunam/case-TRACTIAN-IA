@@ -703,7 +703,16 @@ class ToolObservation(FrozenStateModel):
 
 
 class StateEvidence(FrozenStateModel):
+    """Snapshot legado anterior ao ledger compilado.
+
+    Ele continua desserializável para checkpoints históricos, mas não traz a
+    proveniência completa exigida por ``EvidenceItem`` e, portanto, nunca deve
+    ser usado como fato claimable. O compilador da Fase 7 recebe as observações
+    tipadas e não promove este snapshot.
+    """
+
     evidence_id: str = Field(min_length=1, pattern=r"^\S+$")
+    request_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
     call_id: str = Field(min_length=1, pattern=r"^\S+$")
     value: JsonSnapshot
 

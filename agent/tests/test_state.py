@@ -1552,6 +1552,23 @@ def test_technical_data_preserves_nested_domain_identifiers_and_names():
     assert outcome.partial_data.to_python() == domain_data
 
 
+def test_legacy_state_evidence_keeps_optional_request_id_for_checkpoint_compatibility():
+    legacy = StateEvidence(
+        evidence_id="evidence_01",
+        call_id="call_01",
+        value={"analysis_id": "an_9906"},
+    )
+    attributed = StateEvidence(
+        evidence_id="evidence_02",
+        request_id="req_01",
+        call_id="call_01",
+        value={"analysis_id": "an_9906"},
+    )
+
+    assert StateEvidence.model_validate_json(legacy.model_dump_json()) == legacy
+    assert attributed.request_id == "req_01"
+
+
 def _alias_forms(*segments: str) -> tuple[str, str, str]:
     snake = "_".join(segments)
     kebab = "-".join(segments)
