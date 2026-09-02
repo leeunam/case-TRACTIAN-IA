@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+import hashlib
 import json
 from typing import Any
 
@@ -222,7 +223,10 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
     assert len(state.tool_calls) == 1
     assert len(state.tool_observations) == 1
     observation = state.tool_observations[0]
-    assert observation.call_id == "call_get_asset_1"
+    expected_id = hashlib.sha256(
+        ("planner-v1\0req_planner_read\0" + "0").encode("utf-8")
+    ).hexdigest()[:24]
+    assert observation.call_id == f"call_planner_{expected_id}"
     assert type(observation.artifact.validated_read_artifact()) is AssetToolArtifact
     assert observation.content is not None
     assert observation.content.to_python()["id"] == "asset_G501"

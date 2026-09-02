@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import traceback
@@ -3033,7 +3034,10 @@ def test_planner_selects_one_offered_tool_without_executing_it():
     )
 
     assert isinstance(result, PlannerToolTurn)
-    assert result.tool_call.call_id == "call_get_asset_01"
+    expected_id = hashlib.sha256(
+        ("planner-v1\0req_planner_01\0" + "0").encode("utf-8")
+    ).hexdigest()[:24]
+    assert result.tool_call.call_id == f"call_planner_{expected_id}"
     assert result.tool_call.name == "get_asset"
     assert result.tool_call.arguments.to_python() == {"asset_id": "asset_G501"}
     assert PlannerToolTurn.model_validate_json(result.model_dump_json()) == result
@@ -3386,15 +3390,21 @@ def test_planner_rejects_canonical_repeat_but_allows_distinct_arguments():
     }
 
 
-def test_planner_rejects_provider_call_id_reused_with_distinct_arguments():
-    calls, observations = _planner_history(1)
+def test_planner_allows_provider_call_id_reused_with_distinct_arguments():
+    calls, _ = _planner_history(1)
+    prior_call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id=calls[0].call_id,
+        name="search_knowledge",
+        arguments={"query": "rolamento", "document_type": None},
+    )
     model = _RecordingPlannerModel(
         selector_response=AIMessage(
             content="",
             tool_calls=[
                 {
-                    "name": "get_asset",
-                    "args": {"asset_id": "asset_G999"},
+                    "name": "search_knowledge",
+                    "args": {"query": "lubrificacao"},
                     "id": calls[0].call_id,
                     "type": "tool_call",
                 }
@@ -3402,23 +3412,23 @@ def test_planner_rejects_provider_call_id_reused_with_distinct_arguments():
         )
     )
 
-    with pytest.raises(PlannerProtocolError) as exc_info:
-        asyncio.run(
-            Planner(model).ainvoke(
-                _request(),
-                request_id="req_planner_01",
-                usage=PlannerUsage(request_id="req_planner_01"),
-                offered_tools=(get_asset,),
-                tool_calls=calls,
-                tool_observations=observations,
-            )
+    result = asyncio.run(
+        Planner(model).ainvoke(
+            _request(),
+            request_id="req_planner_01",
+            usage=PlannerUsage(request_id="req_planner_01"),
+            offered_tools=(search_knowledge,),
+            tool_calls=(prior_call,),
+            tool_observations=(_successful_search_observation(prior_call),),
         )
-
-    assert exc_info.value.code is PlannerErrorCode.INVALID_SELECTION
-    assert exc_info.value.usage == PlannerUsage(
-        request_id="req_planner_01",
-        selection_count=1,
     )
+
+    assert isinstance(result, PlannerToolTurn)
+    assert result.tool_call.arguments.to_python() == {
+        "query": "lubrificacao",
+        "document_type": None,
+    }
+    assert result.tool_call.call_id != prior_call.call_id
     assert model._events == ["bind_tools", "selection_request"]
 
 

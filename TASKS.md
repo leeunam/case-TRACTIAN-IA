@@ -198,13 +198,49 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 
 **Decidir:** modelo Groq inicial, temperatura, timeout, limites e contrato comum de provider.
 
-- [ ] Criar interface de modelo independente do provedor.
-- [ ] Implementar adapter inicial do Groq.
-- [ ] Criar prompt e saída estruturada do planner.
-- [ ] Expor apenas tools pertinentes ao estado atual.
-- [ ] Limitar passos, repetição e consumo de contexto.
+**Decisões implementadas:**
 
-**Aceite:** trocar o adapter não altera estado, tools ou regras de segurança.
+- `ModelProvider.create_chat_model(ModelConfig)` isola o adapter do domínio. O
+  primeiro adapter é `GroqModelProvider`, com `openai/gpt-oss-120b`, temperatura
+  zero, timeout de 30 segundos, máximo de 512 tokens e `max_retries=0`.
+- O planner versionado usa uma seleção via `bind_tools` e uma finalização
+  Pydantic separada. O grafo só oferece catálogo autorizado pelo estado e
+  runtime, limita sete tools, oito seleções, uma finalização, 48 mil caracteres
+  e 20 passos; tool inválida, repetida ou fora de escopo falha fechada.
+- O estado nunca recebe modelo, credencial, resposta HTTP bruta, texto livre do
+  seletor nem ID externo de provider. Cada `PersistedToolCall` recebe
+  `call_planner_<24 hex>` derivado por SHA-256 de
+  `planner-v1\0<request_id>\0<ordinal>`; repetição continua definida pelo
+  fingerprint canônico de tool e argumentos.
+- A proposal escolhida pelo planner continua indo para a política determinística
+  antes de confirmação, checkpoint e qualquer HTTP. O provider não pode criar
+  aprovação, identidade, permissão ou efeito de escrita.
+- `make smoke-groq` é opt-in e fica fora de `make test`: compara os dois modelos
+  Groq com dados sintéticos, uma repetição e sem retry, emitindo apenas status e
+  métricas agregadas. Sem `GROQ_API_KEY`, não constrói provider nem toca a rede,
+  imprime `status=skipped reason=missing_groq_api_key` e sai com zero.
+
+**Evidência final de aceite (01/09/2026):** os testes focados de provider,
+planner, grafo e smoke passaram, incluindo dois `ModelProvider` falsos pelo
+caminho público `create_chat_model → Planner → build_agent_graph → invoke_agent`.
+Eles receberam IDs externos distintos e produziram os mesmos schemas e ordem
+de catálogo, tool e argumentos persistidos, decisão `request_confirmation` e
+resultado de política `require_confirmation/explicit_approval_required`, sem
+HTTP. A suíte completa do agente passou com **1.424 testes**; os
+locks offline resolveram 49 pacotes do agente e 55 da API. O smoke real
+`make smoke-groq` foi **skipped**, nunca passed, pois `GROQ_API_KEY` não estava
+disponível; isso não tocou a rede e deixa a compatibilidade ao vivo da conta
+como verificação futura opt-in.
+
+- [x] Criar interface de modelo independente do provedor.
+- [x] Implementar adapter inicial do Groq.
+- [x] Criar prompt e saída estruturada do planner.
+- [x] Expor apenas tools pertinentes ao estado atual.
+- [x] Limitar passos, repetição e consumo de contexto.
+
+**Aceite verificado:** trocar o adapter não altera estado, tools ou regras de
+segurança; a prova usa providers falsos e o smoke ao vivo permanece skipped até
+existir uma chave Groq no ambiente.
 
 ## Fase 7 — ledger de evidências
 

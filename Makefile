@@ -6,6 +6,7 @@
 #   make up      # inicia a API industrial em :8000
 #   make test    # executa a suíte atual
 #   make stop    # encerra a API
+#   make smoke-groq # compara modelos Groq com dados sintéticos (opt-in)
 #
 # Variáveis (override: make VAR=valor):
 PYTHON ?= python3
@@ -20,7 +21,7 @@ MAKEFLAGS += --no-print-directory
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup deps data up up-api stop logs test clean clean-data
+.PHONY: help setup deps data up up-api stop logs test smoke-groq clean clean-data
 
 help: ## Mostra esta ajuda
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -71,6 +72,9 @@ logs: ## Mostra o log da API
 test: ## Executa os testes da API e do agente
 	@cd $(ROOT)/api && $(API_PY) -m pytest -q
 	@cd $(ROOT)/agent && $(AGENT_PY) -m pytest -q
+
+smoke-groq: ## Compara modelos Groq com dados sintéticos; requer GROQ_API_KEY
+	@cd $(ROOT)/agent && $(AGENT_PY) -m tractian_agent.groq_smoke
 
 clean-data: ## Apaga dados gerados; regenere com make data
 	@rm -rf data agent-input eval

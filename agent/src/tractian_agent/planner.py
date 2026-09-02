@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+import hashlib
 import json
 import math
 import re
@@ -117,6 +118,14 @@ class PlannerLimits(StrictModel):
 
 
 PLANNER_LIMITS: Final = PlannerLimits()
+
+
+def _persisted_call_id(*, request_id: str, ordinal: int) -> str:
+    """Deriva um ID estável sem persistir o identificador do provider."""
+    material = f"{PLANNER_SYSTEM_PROMPT_VERSION}\0{request_id}\0{ordinal}".encode(
+        "utf-8"
+    )
+    return f"call_planner_{hashlib.sha256(material).hexdigest()[:24]}"
 
 _ANALYSIS_ID_ADAPTER: Final = TypeAdapter(AnalysisId)
 _COMPANY_ID_ADAPTER: Final = TypeAdapter(CompanyId)
@@ -2190,7 +2199,6 @@ class Planner:
         observations = tuple(
             observation for _, observation in validated_interactions
         )
-        call_ids = tuple(call.call_id for call in calls)
         call_fingerprints = tuple(_tool_call_fingerprint(call) for call in calls)
         if len(call_fingerprints) != len(set(call_fingerprints)):
             raise PlannerProtocolError(
@@ -2308,11 +2316,6 @@ class Planner:
                 usage=selection_usage,
             )
         selected_call = selection.tool_calls[0]
-        if selected_call["id"] in set(call_ids):
-            raise PlannerProtocolError(
-                PlannerErrorCode.INVALID_SELECTION,
-                usage=selection_usage,
-            )
         selected_tool = tools_by_name.get(selected_call["name"])
         if selected_tool is None:
             raise PlannerProtocolError(
@@ -2334,7 +2337,10 @@ class Planner:
                 tool_turn = PlannerToolTurn(
                     tool_call=PersistedToolCall(
                         request_id=request_id,
-                        call_id=selected_call["id"],
+                        call_id=_persisted_call_id(
+                            request_id=request_id,
+                            ordinal=len(calls),
+                        ),
                         name=selected_call["name"],
                         arguments=arguments,
                     ),
