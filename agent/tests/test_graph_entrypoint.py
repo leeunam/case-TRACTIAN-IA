@@ -4,13 +4,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import ValidationError
 
 from tractian_agent.checkpoint import LocalCheckpointOwner, open_checkpointer
 from tractian_agent.client import IndustrialApiClient
-from tractian_agent.contracts import ActionReceipt, Identity, ResponseMode, SupportRequest
+from tractian_agent.contracts import (
+    ActionReceipt,
+    ApiError,
+    ApiErrorCategory,
+    Identity,
+    ResponseMode,
+    SupportRequest,
+)
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
 from tractian_agent.evidence import compile_action_intents
 from tractian_agent.graph import CompiledAgentGraph, build_agent_graph
@@ -28,6 +36,8 @@ from tractian_agent.state import (
     ReviewStatus,
     ThreadScope,
     ToolObservation,
+    WriterFailureCode,
+    WriterFailureRecord,
 )
 from tractian_agent.tools.runtime import (
     ReadToolRuntime,
@@ -37,6 +47,7 @@ from tractian_agent.tools.runtime import (
 from tractian_agent.write_contracts import (
     IntentStatus,
     ReprocessIntentScope,
+    RequestSpecialistAnalysisIntentScope,
     WriteIntent,
 )
 from tractian_agent.write_policy import (
@@ -44,7 +55,9 @@ from tractian_agent.write_policy import (
     PolicyDecision,
     PolicyReason,
     ReprocessProposal,
+    RequestSpecialistAnalysisProposal,
     TrustedActionApproval,
+    TrustedWriteContext,
     WritePolicyResult,
     canonical_write_payload_hash,
 )
@@ -55,11 +68,12 @@ def _request(
     message: str = "Consulte o estado deste ativo.",
     user_id: str = "usr_pedro",
     company_id: str = "comp_mineracao_andes",
+    asset_id: str | None = "asset_G501",
 ) -> SupportRequest:
     return SupportRequest(
         case_id="case_tkt_inv_04",
         ticket_id="TKT-INV-04",
-        asset_id="asset_G501",
+        asset_id=asset_id,
         message=message,
         identity=Identity(
             user_id=user_id,
@@ -108,11 +122,25 @@ def _initial_state(
             company_id="comp_mineracao_andes",
             user_id="usr_pedro",
         ),
+        trusted_write_context=TrustedWriteContext(
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            configured_model_id="mdl_vib_v3",
+        ),
         step_limit=step_limit,
     )
 
 
-def _denied_historical_intent(request_id: str) -> WriteIntent:
+def _denied_historical_intent(
+    request_id: str,
+    proposal: ReprocessProposal | None = None,
+) -> WriteIntent:
+    analysis_id = "an_historical" if proposal is None else proposal.analysis_id
+    justification = (
+        "Histórico terminal usado apenas para proveniência."
+        if proposal is None
+        else proposal.justification
+    )
     return WriteIntent(
         intent_id=f"intent_{request_id}",
         request_id=request_id,
@@ -121,10 +149,14 @@ def _denied_historical_intent(request_id: str) -> WriteIntent:
             case_id="case_tkt_inv_04",
             company_id="comp_mineracao_andes",
             user_id="usr_pedro",
-            analysis_id="an_historical",
-            justification="Histórico terminal usado apenas para proveniência.",
+            analysis_id=analysis_id,
+            justification=justification,
         ),
-        payload_hash="sha256:v1:" + "a" * 64,
+        payload_hash=(
+            "sha256:v1:" + "a" * 64
+            if proposal is None
+            else canonical_write_payload_hash(proposal)
+        ),
         decision=WritePolicyResult(
             decision=PolicyDecision.DENY,
             reason=PolicyReason.MISSING_PERMISSION,
@@ -184,13 +216,14 @@ def _terminal_planner_state() -> AgentState:
 
 def _terminal_denial_state() -> AgentState:
     state = _initial_state(step_limit=5)
+    proposal = ReprocessProposal(
+        analysis_id="an_historical",
+        justification="A política deve conservar a negação persistida.",
+    )
     values = state.model_dump(mode="python")
     values.update(
-        pending_proposal=ReprocessProposal(
-            analysis_id="an_historical",
-            justification="A política deve conservar a negação persistida.",
-        ),
-        intents=(_denied_historical_intent(state.request_id),),
+        pending_proposal=proposal,
+        intents=(_denied_historical_intent(state.request_id, proposal),),
         decision=AgentDecision.GUIDE,
         final_result=FinalResult(
             decision=AgentDecision.GUIDE,
@@ -216,6 +249,7 @@ def _terminal_execution_state() -> AgentState:
             reason=PolicyReason.AUTHORIZED,
         ),
         status=IntentStatus.COMPLETED,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
         payload_hash=canonical_write_payload_hash(proposal),
         idempotency_key="tractian-agent:intent_req_01",
         expires_at=datetime.now(timezone.utc) + timedelta(days=1),
@@ -227,10 +261,16 @@ def _terminal_execution_state() -> AgentState:
             message="Reprocesso concluído.",
         ),
     )
+    completed_data["scope"]["justification"] = proposal.justification
     completed = WriteIntent.model_validate(completed_data)
     values = state.model_dump(mode="python")
     values.update(
         pending_proposal=proposal,
+        approval=TrustedActionApproval(
+            action="reprocess_analysis",
+            target_id="an_historical",
+            source=ApprovalSource.ORIGINAL_REQUEST,
+        ),
         intents=(completed,),
         ledger=compile_action_intents(
             (completed,),
@@ -240,6 +280,67 @@ def _terminal_execution_state() -> AgentState:
         final_result=FinalResult(
             decision=AgentDecision.ACT,
             message="Reprocesso concluído.",
+        ),
+        resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+    )
+    return AgentState.model_validate(values)
+
+
+def _terminal_conservative_non_idempotent_state() -> AgentState:
+    state = _initial_state(step_limit=24)
+    proposal = RequestSpecialistAnalysisProposal(
+        analysis_id="an_9906",
+        justification="A limitação registrada exige análise especializada.",
+    )
+    intent = WriteIntent(
+        intent_id="intent_conservative_fast_replay",
+        request_id=state.request_id,
+        scope=RequestSpecialistAnalysisIntentScope(
+            action="request_specialist_analysis",
+            case_id=state.request.case_id,
+            company_id=state.identity.company_id,
+            user_id=state.identity.user_id,
+            analysis_id=proposal.analysis_id,
+            justification=proposal.justification,
+        ),
+        payload_hash=canonical_write_payload_hash(proposal),
+        decision=WritePolicyResult(
+            decision=PolicyDecision.ALLOW,
+            reason=PolicyReason.AUTHORIZED,
+        ),
+        status=IntentStatus.UNCERTAIN,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
+        prepared_execution_id="exec_prepare",
+        attempts=0,
+        error=ApiError(
+            category=ApiErrorCategory.API,
+            code="NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME",
+            message=(
+                "A execução preparadora terminou sem resultado terminal observável."
+            ),
+        ),
+    )
+    values = state.model_dump(mode="python")
+    values.update(
+        execution_id="exec_resume",
+        pending_proposal=proposal,
+        approval=TrustedActionApproval(
+            action="request_specialist_analysis",
+            target_id=proposal.analysis_id,
+            source=ApprovalSource.ORIGINAL_REQUEST,
+        ),
+        intents=(intent,),
+        ledger=compile_action_intents(
+            (intent,),
+            recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        ),
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+        final_result=FinalResult(
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            message=(
+                "O resultado remoto da ação é desconhecido e ela não será "
+                "reenviada automaticamente."
+            ),
         ),
         resume_anchor=ResumeAnchor.EXECUTE_ACTION,
     )
@@ -290,6 +391,51 @@ class _RecordingGraph:
         self.values = values
         self.as_node = as_node
         return config
+
+
+def test_resume_rejects_a_third_writer_call_after_two_format_attempts():
+    state = _initial_state(step_limit=24).model_copy(
+        update={
+            "decision": AgentDecision.REQUEST_INFORMATION,
+            "planner_terminal": PlannerTerminalRecord(
+                decision="request_information",
+                stop_reason="missing_information",
+                missing_information="Informe o ponto de medição.",
+            ),
+            "resume_anchor": ResumeAnchor.WRITER,
+            "writer_attempts": 2,
+            "writer_failure": WriterFailureRecord(
+                code=WriterFailureCode.INVALID_STRUCTURED_OUTPUT,
+                attempts=2,
+                repairable=True,
+            ),
+        }
+    )
+    persisted_values = state.model_dump(mode="json")
+    graph = _RecordingGraph(
+        persisted_values,
+        next_nodes=("writer",),
+        planner_enabled=True,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=_runtime(client),
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_writer_third_attempt",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == "RESUME_ANCHOR_MISMATCH"
+    assert graph.as_node is None
+    assert graph.invoke_config is None
 
 
 def test_entrypoint_requires_thread_configuration_and_sync_durability():
@@ -464,6 +610,247 @@ def test_terminal_read_replay_revalidates_current_runtime_before_return(
     assert graph.invoke_config is None
 
 
+def test_terminal_write_replay_binds_hidden_asset_when_request_has_no_asset():
+    base = _terminal_execution_state()
+    state_data = base.model_dump(mode="python")
+    state_data["request"]["asset_id"] = None
+    state = AgentState.model_validate(state_data)
+    forged_data = state.model_dump(mode="python")
+    forged_data["trusted_write_context"]["central_asset_id"] = "asset_G502"
+    forged = AgentState.model_validate(forged_data)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            replayed = await invoke_agent(
+                _RecordingGraph(state.model_dump(mode="json")),
+                request=_request(asset_id=None),
+                runtime=runtime,
+                thread_id=state.thread_id,
+                request_id=state.request_id,
+                execution_id="exec_hidden_asset_replay",
+            )
+            forged_graph = _RecordingGraph(forged.model_dump(mode="json"))
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    forged_graph,
+                    request=_request(asset_id=None),
+                    runtime=runtime,
+                    thread_id=forged.thread_id,
+                    request_id=forged.request_id,
+                    execution_id="exec_hidden_asset_drift",
+                )
+        return replayed, forged_graph, error.value
+
+    replayed, forged_graph, error = asyncio.run(scenario())
+
+    assert replayed == state
+    assert error.code == "TRUSTED_WRITE_CONTEXT_DRIFT"
+    assert forged_graph.invoke_config is None
+
+
+def test_canonical_conservative_terminal_fast_replays_without_graph_or_http():
+    state = _terminal_conservative_non_idempotent_state()
+    graph = _RecordingGraph(
+        state.model_dump(mode="json"),
+        planner_enabled=True,
+    )
+
+    async def scenario():
+        http_calls = 0
+
+        def handler(_request):
+            nonlocal http_calls
+            http_calls += 1
+            raise AssertionError("fast replay não pode chamar HTTP")
+
+        async with IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            replayed = await invoke_agent(
+                graph,
+                request=_request(),
+                runtime=runtime,
+                thread_id=state.thread_id,
+                request_id=state.request_id,
+                execution_id="exec_fast_replay",
+            )
+        return replayed, http_calls
+
+    replayed, http_calls = asyncio.run(scenario())
+
+    assert replayed == state
+    assert graph.invoke_config is None
+    assert graph.context is None
+    assert http_calls == 0
+
+
+def test_tampered_conservative_terminal_is_rejected_before_graph_ainvoke():
+    state = _terminal_conservative_non_idempotent_state()
+    wire = state.model_dump(mode="json")
+    wire["final_result"]["message"] = "A ação pode ter sido concluída."
+    graph = _RecordingGraph(wire, planner_enabled=True)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            with pytest.raises(ValidationError, match="terminal diverge"):
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_reject_tamper",
+                )
+
+    asyncio.run(scenario())
+
+    assert graph.invoke_config is None
+    assert graph.context is None
+
+
+def test_conservative_terminal_without_result_is_rejected_before_graph_ainvoke():
+    state = _terminal_conservative_non_idempotent_state()
+    wire = state.model_dump(mode="json")
+    wire["final_result"] = None
+    graph = _RecordingGraph(wire, planner_enabled=True)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            with pytest.raises(ValidationError, match="terminal diverge"):
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_reject_missing_result",
+                )
+
+    asyncio.run(scenario())
+
+    assert graph.invoke_config is None
+    assert graph.context is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("attempts", "0"),
+        ("attempts", False),
+        ("error.ok", 0),
+        ("error.ok", "false"),
+    ],
+)
+def test_coerced_conservative_terminal_is_rejected_before_graph_ainvoke(
+    field: str,
+    value: object,
+):
+    state = _terminal_conservative_non_idempotent_state()
+    wire = state.model_dump(mode="json")
+    if field == "attempts":
+        wire["intents"][0]["attempts"] = value
+    else:
+        wire["intents"][0]["error"]["ok"] = value
+    graph = _RecordingGraph(wire, planner_enabled=True)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            with pytest.raises(ValidationError):
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_reject_coerced_primitive",
+                )
+
+    asyncio.run(scenario())
+
+    assert graph.invoke_config is None
+    assert graph.context is None
+
+
+def test_terminal_write_replay_rejects_persisted_model_drift_at_public_boundary():
+    state_data = _terminal_execution_state().model_dump(mode="python")
+    state_data["trusted_write_context"]["configured_model_id"] = "mdl_vib_v4"
+    synchronized = AgentState.model_validate(state_data)
+    graph = _RecordingGraph(synchronized.model_dump(mode="json"))
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=synchronized.thread_id,
+                    request_id=synchronized.request_id,
+                    execution_id="exec_terminal_model_drift",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == "TRUSTED_WRITE_CONTEXT_DRIFT"
+    assert graph.invoke_config is None
+
+
 def test_partial_read_scope_mismatch_fails_before_checkpoint_update():
     state = _initial_state().model_copy(
         update={"resume_anchor": ResumeAnchor.INGEST}
@@ -579,9 +966,12 @@ def test_nonterminal_resume_rejects_invalid_pending_work_shape(
     [
         (ResumeAnchor.INGEST, "planner_select"),
         (ResumeAnchor.PLANNER_TOOL, "planner_select"),
+        (ResumeAnchor.WRITE_POLICY, "writer"),
+        (ResumeAnchor.CONFIRMATION_GATE, "writer"),
+        (ResumeAnchor.EXECUTE_ACTION, "writer"),
     ],
 )
-def test_planner_select_resume_accepts_both_explicit_predecessors(
+def test_planner_resume_accepts_each_explicit_predecessor(
     anchor: ResumeAnchor,
     next_node: str,
 ):
@@ -608,6 +998,62 @@ def test_planner_select_resume_accepts_both_explicit_predecessors(
     asyncio.run(scenario())
 
     assert graph.as_node == anchor.value
+
+
+def test_planner_direct_write_reserves_writer_repair_and_gate_budget():
+    proposal = ReprocessProposal(
+        analysis_id="an_9901",
+        justification="O rolamento foi trocado e a análise deve ser refeita.",
+    )
+    approval = TrustedActionApproval(
+        action="reprocess_analysis",
+        target_id="an_9901",
+        source=ApprovalSource.ORIGINAL_REQUEST,
+    )
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                client=client,
+            )
+            rejected = _RecordingGraph(planner_enabled=True)
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    rejected,
+                    request=_request(message="Reprocesse a análise informada."),
+                    runtime=runtime,
+                    thread_id="thread_planner_budget_rejected",
+                    request_id="req_planner_budget_rejected",
+                    execution_id="exec_planner_budget_rejected",
+                    step_limit=7,
+                    proposal=proposal,
+                    original_approval=approval,
+                )
+            accepted_graph = _RecordingGraph(planner_enabled=True)
+            accepted = await invoke_agent(
+                accepted_graph,
+                request=_request(message="Reprocesse a análise informada."),
+                runtime=runtime,
+                thread_id="thread_planner_budget_accepted",
+                request_id="req_planner_budget_accepted",
+                execution_id="exec_planner_budget_accepted",
+                step_limit=8,
+                proposal=proposal,
+                original_approval=approval,
+            )
+        return error.value, rejected, accepted
+
+    error, rejected, accepted = asyncio.run(scenario())
+
+    assert error.code == "STEP_LIMIT_EXHAUSTED"
+    assert rejected.state_config is not None
+    assert rejected.invoke_config is None
+    assert accepted.step_limit == 8
 
 
 @pytest.mark.parametrize(
@@ -770,7 +1216,7 @@ def test_new_request_can_migrate_from_valid_terminal_fallback_to_planner():
     assert graph.as_node == ResumeAnchor.START.value
     assert migrated.request_id == "req_migrated_to_planner"
     assert migrated.resume_anchor is ResumeAnchor.START
-    assert migrated.step_limit == 20
+    assert migrated.step_limit == 24
 
 
 def test_new_request_can_migrate_from_valid_terminal_planner_to_fallback():
@@ -873,6 +1319,7 @@ def test_terminal_anchor_table_rejects_known_but_impossible_state(
         "execution_as_guide",
         "execution_with_other_target",
         "execution_with_other_payload_hash",
+        "execution_with_wrong_approval",
     ],
 )
 def test_adulterated_terminal_checkpoint_fails_closed_before_return(
@@ -904,6 +1351,8 @@ def test_adulterated_terminal_checkpoint_fails_closed_before_return(
             persisted_values["final_result"]["decision"] = AgentDecision.GUIDE.value
         elif tamper == "execution_with_other_target":
             persisted_values["pending_proposal"]["analysis_id"] = "an_other"
+        elif tamper == "execution_with_wrong_approval":
+            persisted_values["approval"]["target_id"] = "an_other"
         else:
             persisted_values["intents"][0]["payload_hash"] = (
                 "sha256:v1:" + "b" * 64
@@ -912,7 +1361,10 @@ def test_adulterated_terminal_checkpoint_fails_closed_before_return(
 
     async def scenario():
         async with IndustrialApiClient("https://industrial.test") as client:
-            with pytest.raises(ValidationError, match="terminal diverge"):
+            with pytest.raises(
+                ValidationError,
+                match="ciclo de escrita|terminal diverge",
+            ):
                 await invoke_agent(
                     graph,
                     request=_request(),
@@ -929,7 +1381,7 @@ def test_adulterated_terminal_checkpoint_fails_closed_before_return(
 
 
 def test_planner_step_limit_above_cap_only_blocks_same_request_resume():
-    state = _terminal_read_state().model_copy(update={"step_limit": 21})
+    state = _terminal_read_state().model_copy(update={"step_limit": 25})
 
     async def scenario():
         async with IndustrialApiClient("https://industrial.test") as client:
@@ -966,10 +1418,10 @@ def test_planner_step_limit_above_cap_only_blocks_same_request_resume():
     assert same_graph.as_node is None
     assert same_graph.invoke_config is None
     assert new_graph.as_node == ResumeAnchor.START.value
-    assert migrated.step_limit == 20
+    assert migrated.step_limit == 24
 
 
-def test_planner_builder_defaults_to_20_and_rejects_21_before_checkpoint():
+def test_planner_builder_defaults_to_24_and_rejects_25_before_checkpoint():
     async def scenario():
         async with IndustrialApiClient("https://industrial.test") as client:
             graph = _RecordingGraph(planner_enabled=True)
@@ -990,13 +1442,13 @@ def test_planner_builder_defaults_to_20_and_rejects_21_before_checkpoint():
                     thread_id="thread_planner_over_budget",
                     request_id="req_planner_over_budget",
                     execution_id="exec_planner_over_budget",
-                    step_limit=21,
+                    step_limit=25,
                 )
         return state, rejected, error.value
 
     state, rejected, error = asyncio.run(scenario())
 
-    assert state.step_limit == 20
+    assert state.step_limit == 24
     assert error.code == "PLANNER_STEP_LIMIT_EXCEEDED"
     assert rejected.state_config is None
     assert rejected.invoke_config is None
@@ -1715,6 +2167,11 @@ def test_checkpoint_preserves_intent_expiration_and_never_creates_a_key(
             case_id="case_tkt_inv_04",
             company_id="comp_mineracao_andes",
             user_id="usr_pedro",
+        ),
+        trusted_write_context=TrustedWriteContext(
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            configured_model_id="mdl_vib_v3",
         ),
         step_limit=3,
         intents=(intent,),

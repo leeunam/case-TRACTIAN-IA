@@ -17,11 +17,17 @@ from tractian_agent.contracts import (
 )
 from tractian_agent.tools.identifiers import AnalysisId, AssetId, ModelId
 from tractian_agent.write_policy import (
+    ApprovalSource,
     AssetCriticality,
     PolicyDecision,
     PolicyReason,
+    TrustedActionApproval,
+    TrustedWriteContext,
     WriteMaterialParameters,
     WritePolicyResult,
+    WriteProposal,
+    canonical_write_payload_hash,
+    resolve_action_scope,
 )
 
 
@@ -150,6 +156,45 @@ def intent_scope_material_parameters(
     return WriteMaterialParameters()
 
 
+def proposal_matches_intent_scope(
+    proposal: WriteProposal,
+    scope: WriteIntentScope,
+    *,
+    payload_hash: str,
+    trusted_context: TrustedWriteContext,
+) -> bool:
+    """Vincula proposal e intent ao alvo resolvido pela fronteira confiável."""
+    if (
+        proposal.action != scope.action
+        or proposal.justification != scope.justification
+        or canonical_write_payload_hash(
+            proposal,
+            trusted_context=trusted_context,
+        )
+        != payload_hash
+    ):
+        return False
+    expected_scope_type = {
+        "reprocess_analysis": ReprocessIntentScope,
+        "request_specialist_analysis": RequestSpecialistAnalysisIntentScope,
+        "update_asset_criticality": UpdateAssetCriticalityIntentScope,
+        "request_model_retraining": RequestModelRetrainingIntentScope,
+        "escalate_case": EscalateCaseIntentScope,
+    }[proposal.action]
+    if not isinstance(scope, expected_scope_type):
+        return False
+    canonical = resolve_action_scope(
+        proposal,
+        trusted_context=trusted_context,
+    )
+    return (
+        scope.case_id == trusted_context.current_case_id
+        and canonical.target_id == intent_scope_target_id(scope)
+        and canonical.material_parameters
+        == intent_scope_material_parameters(scope)
+    )
+
+
 class PersistedActionReceipt(StrictModel):
     """Cópia imutável do recibo compartilhado para o checkpoint."""
 
@@ -185,6 +230,13 @@ class PersistedApiError(StrictModel):
             return value.model_dump(mode="python")
         return value
 
+    @field_validator("ok", mode="before")
+    @classmethod
+    def _require_exact_false(cls, value: object) -> object:
+        if value is not False:
+            raise ValueError("ok persistido deve ser o booleano false")
+        return value
+
 
 class WriteIntent(StrictModel):
     """Registro observável de uma intenção no checkpointer do grafo."""
@@ -201,6 +253,7 @@ class WriteIntent(StrictModel):
     payload_hash: CanonicalHash
     decision: WritePolicyResult
     status: IntentStatus
+    approval_source: ApprovalSource | None = None
     idempotency_key: IdempotencyKey | None = None
     expires_at: datetime | None = None
     prepared_execution_id: str | None = Field(
@@ -208,7 +261,7 @@ class WriteIntent(StrictModel):
         min_length=1,
         pattern=r"^\S+$",
     )
-    attempts: int = Field(default=0, ge=0, le=2)
+    attempts: int = Field(default=0, ge=0, le=2, strict=True)
     receipt: PersistedActionReceipt | None = None
     error: PersistedApiError | None = None
 
@@ -346,3 +399,37 @@ class WriteIntent(StrictModel):
                     "zero tentativa só aceita falha local pré-despacho"
                 )
         return self
+
+
+def approval_matches_write_intent(
+    proposal: WriteProposal,
+    intent: WriteIntent,
+    *,
+    approval: TrustedActionApproval | None,
+    trusted_context: TrustedWriteContext | None,
+) -> bool:
+    """Compara aprovação, proposal e intenção sem confiar em um só registro."""
+
+    if (
+        approval is None
+        or intent.approval_source is None
+        or trusted_context is None
+        or not proposal_matches_intent_scope(
+            proposal,
+            intent.scope,
+            payload_hash=intent.payload_hash,
+            trusted_context=trusted_context,
+        )
+    ):
+        return False
+    canonical = resolve_action_scope(
+        proposal,
+        trusted_context=trusted_context,
+    )
+    expected = TrustedActionApproval(
+        action=canonical.action,
+        target_id=canonical.target_id,
+        material_parameters=canonical.material_parameters,
+        source=intent.approval_source,
+    )
+    return approval == expected

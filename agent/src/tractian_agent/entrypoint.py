@@ -13,6 +13,8 @@ from tractian_agent.contracts import SupportRequest
 from tractian_agent.graph import (
     MINIMAL_GRAPH_STEP_COUNT,
     PLANNER_GRAPH_STEP_LIMIT,
+    PLANNER_MINIMAL_GRAPH_STEP_COUNT,
+    PLANNER_WRITE_GRAPH_STEP_COUNT,
     REPROCESS_GRAPH_STEP_COUNT,
 )
 from tractian_agent.state import AgentState, ResumeAnchor, ThreadScope
@@ -21,6 +23,7 @@ from tractian_agent.write_contracts import (
     ConfirmationReply,
     IntentStatus,
     WriteIntent,
+    approval_matches_write_intent,
     intent_scope_material_parameters,
     intent_scope_target_id,
 )
@@ -28,6 +31,7 @@ from tractian_agent.write_policy import (
     ApprovalSource,
     PolicyReason,
     TrustedActionApproval,
+    TrustedWriteContext,
     WriteProposal,
 )
 
@@ -93,6 +97,12 @@ _PLANNER_RESUME_PAIRS = {
     (ResumeAnchor.PLANNER_SELECT, "planner_finalize"),
     (ResumeAnchor.PLANNER_TOOL, "planner_select"),
     (ResumeAnchor.PLANNER_TOOL, "write_policy"),
+    (ResumeAnchor.WRITE_POLICY, "writer"),
+    (ResumeAnchor.CONFIRMATION_GATE, "writer"),
+    (ResumeAnchor.EXECUTE_ACTION, "writer"),
+    (ResumeAnchor.PLANNER_FINALIZE, "writer"),
+    (ResumeAnchor.WRITER, "writer"),
+    (ResumeAnchor.WRITER, "release_gate"),
 }
 _ALLOWED_RESUME_PAIRS = (
     _COMMON_RESUME_PAIRS | _FALLBACK_RESUME_PAIRS | _PLANNER_RESUME_PAIRS
@@ -161,6 +171,7 @@ def _resume_predecessor(
     next_nodes: tuple[str, ...],
     *,
     planner_enabled: bool,
+    state: AgentState,
 ) -> str:
     pending_node = _pending_node(next_nodes)
     if (anchor, pending_node) not in _ALLOWED_RESUME_PAIRS:
@@ -175,6 +186,31 @@ def _resume_predecessor(
         raise AgentInvocationProtocolError(
             "RESUME_TOPOLOGY_MISMATCH",
             "checkpoint parcial pertence a outra topologia de grafo",
+        )
+    if anchor is ResumeAnchor.WRITER:
+        expected_writer_node = (
+            "writer"
+            if (
+                state.writer_draft is None
+                and state.writer_failure is not None
+                and state.writer_failure.repairable
+                and state.writer_attempts == 1
+            )
+            else "release_gate"
+        )
+        if pending_node != expected_writer_node:
+            raise AgentInvocationProtocolError(
+                "RESUME_ANCHOR_MISMATCH",
+                "o resultado persistido do writer diverge do próximo nó",
+            )
+    elif pending_node == "writer" and (
+        state.writer_attempts != 0
+        or state.writer_draft is not None
+        or state.writer_failure is not None
+    ):
+        raise AgentInvocationProtocolError(
+            "RESUME_ANCHOR_MISMATCH",
+            "o writer pendente exige contador e resultado vazios",
         )
     return anchor.value
 
@@ -196,7 +232,17 @@ def _replace_state(state: AgentState, **changes: object) -> AgentState:
     return AgentState.model_validate(data)
 
 
-def _required_step_count(state: AgentState) -> int:
+def _required_step_count(
+    state: AgentState,
+    *,
+    planner_enabled: bool,
+) -> int:
+    if planner_enabled:
+        return (
+            PLANNER_WRITE_GRAPH_STEP_COUNT
+            if state.pending_proposal is not None
+            else PLANNER_MINIMAL_GRAPH_STEP_COUNT
+        )
     return (
         REPROCESS_GRAPH_STEP_COUNT
         if state.pending_proposal is not None
@@ -234,13 +280,16 @@ def _terminal_confirmation_replay(
         return False
     intent = matches[0]
     if confirmation.decision == "approve":
-        expected_approval = TrustedActionApproval(
-            action=intent.scope.action,
-            target_id=intent_scope_target_id(intent.scope),
-            material_parameters=intent_scope_material_parameters(intent.scope),
-            source=ApprovalSource.CONFIRMATION,
+        return (
+            intent.approval_source is ApprovalSource.CONFIRMATION
+            and state.pending_proposal is not None
+            and approval_matches_write_intent(
+                state.pending_proposal,
+                intent,
+                approval=state.approval,
+                trusted_context=state.trusted_write_context,
+            )
         )
-        return state.approval == expected_approval
     return (
         intent.status is IntentStatus.DENIED
         and intent.decision.reason is PolicyReason.CONFIRMATION_REJECTED
@@ -328,11 +377,7 @@ def _validate_runtime_request_scope(
     request: SupportRequest,
     runtime: ReadToolRuntime,
 ) -> None:
-    if runtime.identity.model_dump() != request.identity.model_dump():
-        raise AgentInvocationProtocolError(
-            "RUNTIME_IDENTITY_SCOPE_MISMATCH",
-            "a identidade confiável diverge da solicitação",
-        )
+    _validate_runtime_identity_scope(request, runtime)
     if (
         request.asset_id is not None
         and runtime.central_asset_id != request.asset_id
@@ -341,6 +386,74 @@ def _validate_runtime_request_scope(
             "RUNTIME_ASSET_SCOPE_MISMATCH",
             "o ativo central do runtime diverge da solicitação",
         )
+
+
+def _validate_runtime_identity_scope(
+    request: SupportRequest,
+    runtime: ReadToolRuntime,
+) -> None:
+    if runtime.identity.model_dump() != request.identity.model_dump():
+        raise AgentInvocationProtocolError(
+            "RUNTIME_IDENTITY_SCOPE_MISMATCH",
+            "a identidade confiável diverge da solicitação",
+        )
+
+
+def _trusted_write_context(
+    request: SupportRequest,
+    runtime: ReadToolRuntime,
+) -> TrustedWriteContext:
+    """Persiste somente os alvos confiáveis necessários à política e ao gate."""
+    return TrustedWriteContext(
+        central_asset_id=runtime.central_asset_id,
+        current_case_id=request.case_id,
+        configured_model_id=runtime.configured_model_id,
+    )
+
+
+def _validate_persisted_trusted_write_context(
+    state: AgentState,
+    runtime: ReadToolRuntime,
+) -> None:
+    """Impede que uma retomada substitua o escopo confiável já persistido."""
+
+    expected = _trusted_write_context(state.request, runtime)
+    if state.trusted_write_context != expected:
+        raise AgentInvocationProtocolError(
+            "TRUSTED_WRITE_CONTEXT_DRIFT",
+            "o runtime atual diverge do contexto confiável persistido",
+        )
+
+
+def _is_conservative_non_idempotent_resume(
+    state: AgentState,
+    *,
+    checkpoint_anchor: ResumeAnchor,
+    pending_nodes: tuple[str, ...],
+    execution_id: str,
+    new_request: bool,
+    proposal: WriteProposal | None,
+    original_approval: TrustedActionApproval | None,
+    confirmation: ConfirmationReply | None,
+) -> bool:
+    """Reconhece somente o salto PREPARED que deve terminar como incerto."""
+
+    intents = _current_request_intents(state)
+    return (
+        not new_request
+        and state.final_result is None
+        and checkpoint_anchor is ResumeAnchor.PREPARE_INTENT
+        and pending_nodes == ("execute_action",)
+        and proposal is None
+        and original_approval is None
+        and confirmation is None
+        and state.pending_proposal is not None
+        and len(intents) == 1
+        and intents[0].status is IntentStatus.PREPARED
+        and intents[0].scope.action != "reprocess_analysis"
+        and intents[0].prepared_execution_id is not None
+        and intents[0].prepared_execution_id != execution_id
+    )
 
 
 def _validate_current_read_access(
@@ -454,7 +567,8 @@ async def invoke_agent(
         original_approval=original_approval,
         planner_enabled=planner_enabled,
     )
-    _validate_runtime_request_scope(request, runtime)
+    _validate_runtime_identity_scope(request, runtime)
+    trusted_write_context = _trusted_write_context(request, runtime)
     resolved_step_limit = step_limit
     if resolved_step_limit is None:
         if planner_enabled:
@@ -472,7 +586,7 @@ async def invoke_agent(
     ):
         raise AgentInvocationProtocolError(
             "PLANNER_STEP_LIMIT_EXCEEDED",
-            "o caminho do planner aceita no máximo 20 passos",
+            "o caminho do planner aceita no máximo 24 passos",
         )
     config: dict[str, object] = {"configurable": {"thread_id": thread_id}}
 
@@ -497,10 +611,23 @@ async def invoke_agent(
                         checkpoint_anchor,
                         snapshot.next,
                         planner_enabled=planner_enabled,
+                        state=persisted,
                     )
                     if snapshot.next
                     else None
                 )
+            conservative_resume = _is_conservative_non_idempotent_resume(
+                persisted,
+                checkpoint_anchor=checkpoint_anchor,
+                pending_nodes=snapshot.next,
+                execution_id=execution_id,
+                new_request=new_request,
+                proposal=proposal,
+                original_approval=original_approval,
+                confirmation=confirmation,
+            )
+            if not conservative_resume:
+                _validate_runtime_request_scope(request, runtime)
             _validate_current_read_access(
                 persisted,
                 runtime,
@@ -514,7 +641,7 @@ async def invoke_agent(
             ):
                 raise AgentInvocationProtocolError(
                     "PLANNER_STEP_LIMIT_EXCEEDED",
-                    "checkpoint do planner excede o teto de 20 passos",
+                    "checkpoint do planner excede o teto de 24 passos",
                 )
             persisted_original_approval = (
                 persisted.approval
@@ -537,19 +664,30 @@ async def invoke_agent(
                 )
             )
             if write_flow:
-                _validate_write_boundary(
-                    request=request,
-                    runtime=runtime,
-                    proposal=(
-                        proposal
-                        if proposal is not None
-                        else persisted.pending_proposal
-                    ),
-                    confirmation=confirmation,
-                    original_approval=persisted_original_approval,
-                    planner_enabled=planner_enabled,
-                )
+                if not isinstance(runtime, WriteToolRuntime):
+                    raise AgentInvocationProtocolError(
+                        "WRITE_RUNTIME_REQUIRED",
+                        "o fluxo de escrita exige contexto confiável de escrita",
+                    )
+                if not conservative_resume:
+                    _validate_write_boundary(
+                        request=request,
+                        runtime=runtime,
+                        proposal=(
+                            proposal
+                            if proposal is not None
+                            else persisted.pending_proposal
+                        ),
+                        confirmation=confirmation,
+                        original_approval=persisted_original_approval,
+                        planner_enabled=planner_enabled,
+                    )
                 _validate_legacy_intents_for_write(persisted)
+                if not new_request and not conservative_resume:
+                    _validate_persisted_trusted_write_context(
+                        persisted,
+                        runtime,
+                    )
             if new_request and _request_id_has_history(persisted, request_id):
                 raise AgentInvocationProtocolError(
                     "REQUEST_ID_ALREADY_USED",
@@ -562,6 +700,7 @@ async def invoke_agent(
                 request_id=request_id,
                 execution_id=execution_id,
                 step_limit=resolved_step_limit,
+                trusted_write_context=trusted_write_context,
             )
             if not new_request:
                 _validate_persisted_write_inputs(
@@ -606,7 +745,11 @@ async def invoke_agent(
                 )
                 if (
                     state.pending_proposal is not None
-                    and state.step_limit < _required_step_count(state)
+                    and state.step_limit
+                    < _required_step_count(
+                        state,
+                        planner_enabled=planner_enabled,
+                    )
                 ):
                     raise AgentInvocationProtocolError(
                         "STEP_LIMIT_EXHAUSTED",
@@ -619,7 +762,10 @@ async def invoke_agent(
                 )
                 invocation_input = None
             else:
-                if state.step_limit < _required_step_count(state):
+                if state.step_limit < _required_step_count(
+                    state,
+                    planner_enabled=planner_enabled,
+                ):
                     raise AgentInvocationProtocolError(
                         "STEP_LIMIT_EXHAUSTED",
                         "checkpoint parcial esgotou o orçamento de passos",
@@ -644,6 +790,7 @@ async def invoke_agent(
                             checkpoint_anchor,
                             snapshot.next,
                             planner_enabled=planner_enabled,
+                            state=state,
                         )
                     )
                     config = await graph.aupdate_state(
@@ -653,6 +800,7 @@ async def invoke_agent(
                     )
                     invocation_input = None
         else:
+            _validate_runtime_request_scope(request, runtime)
             if confirmation is not None:
                 raise AgentInvocationProtocolError(
                     "STALE_CONFIRMATION",
@@ -660,7 +808,12 @@ async def invoke_agent(
                 )
             if (
                 proposal is not None
-                and resolved_step_limit < REPROCESS_GRAPH_STEP_COUNT
+                and resolved_step_limit
+                < (
+                    PLANNER_WRITE_GRAPH_STEP_COUNT
+                    if planner_enabled
+                    else REPROCESS_GRAPH_STEP_COUNT
+                )
             ):
                 raise AgentInvocationProtocolError(
                     "STEP_LIMIT_EXHAUSTED",
@@ -679,6 +832,7 @@ async def invoke_agent(
                     company_id=runtime.identity.company_id,
                     user_id=runtime.identity.user_id,
                 ),
+                trusted_write_context=trusted_write_context,
                 step_limit=resolved_step_limit,
                 pending_proposal=proposal,
                 approval=original_approval,

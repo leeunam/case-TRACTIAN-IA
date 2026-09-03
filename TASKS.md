@@ -332,12 +332,94 @@ pacotes. Writer e gate continuam pendentes na Fase 8.
 
 **Decidir:** schema da resposta, regras críticas e no máximo uma tentativa de reparo de formato.
 
-- [ ] Criar prompt separado para o writer.
-- [ ] Enviar ao writer somente decisão e evidências necessárias.
-- [ ] Validar formato, afirmações críticas, permissões e incerteza em código.
-- [ ] Pedir informação ou revisão humana quando a resposta não puder ser liberada com segurança.
+- [x] Criar prompt separado para o writer.
+- [x] Enviar ao writer somente decisão e evidências necessárias.
+- [x] Validar formato, afirmações críticas, permissões e incerteza em código.
+- [x] Pedir informação ou revisão humana quando a resposta não puder ser liberada com segurança.
 
 **Aceite:** o writer não consegue criar nova decisão, tool call ou fato não registrado.
+
+**Aceite verificado (02/09/2026):** o `Writer` usa o prompt versionado
+`writer-v1`, somente `with_structured_output` e uma projeção positiva com
+orçamento total de 64 referências. O modelo recebe apenas decisão, IDs e categorias fechadas de
+fato/limitação, além da informação ausente já decidida; resource, target,
+`source_at`, valor e `fact_path` permanecem no ledger. Seu draft strict não
+contém prosa, valores ou tool calls. Uma falha de formato permite uma única
+tentativa adicional em superstep persistível; erro de provider não ganha retry
+e sua exceção sanitizada não retém saída bruta em causa, contexto ou traceback.
+O `ReleaseGate` puro deriva ACT/ESCALATE e o alvo do escopo confiável persistido,
+da intenção, proposal e terminal do planner atuais; recompõe cada ID, valida
+coerência mode/quality/obsolescence, reconstrói conflitos e recompila
+integralmente a evidência de ação contra intent/aprovação/recibo. Fatos de tool
+citados exigem permissão `read`, inclusive em respostas de ação; recibo isolado
+usa somente a permissão da ação. Intenção negada, falha, incerta ou não terminal nunca pode ser
+escondida por uma decisão GUIDE. O renderer resolve todo texto técnico somente
+no ledger. Draft, atestado e resposta são recompostos ao restaurar o estado, de
+modo que adulteração do checkpoint falha fechada mesmo com digests recalculados.
+
+**Decisão local de segurança:** enquanto não existir claim-scope tipado, o gate
+trata qualquer lacuna, item parcial ou obsoleto e qualquer conflito da request
+atual como bloqueante para uma resposta técnica. Isso pode pedir revisão em
+casos conservadores, mas impede que o writer esconda uma lacuna fora da seleção.
+IDs de limitações derivam de tipo, request, todas as fontes/referências, razão e
+detalhe canônicos; IDs de conflito são únicos, ordenados e deduplicados antes do
+hash. Lacunas também precisam pertencer à request atual. O planner passa a reservar writer, um possível repair e gate
+dentro do teto de 24 passos; o fallback sem planner conserva os budgets exatos
+3/5 e a resposta determinística legada. O contador, o resultado, a âncora e o
+próximo nó do writer são validados juntos, de modo que nenhum checkpoint permita
+uma terceira chamada ao modelo.
+
+**Decisão local de segurança — Ruling 9:** a assinatura `write-scope-v1`
+vincula estruturalmente ação, alvo canônico, parâmetros materiais e justificativa
+à intenção. O contexto confiável é persistido no mesmo superstep que aceita a
+primeira proposal e deve coincidir com o runtime atual antes de política,
+confirmação, preparação, efeito e replay. Esses hashes detectam divergências e
+corrupção acidental; não são MACs e não autenticam o checkpoint contra alguém
+capaz de reescrever coordenadamente o banco e recalcular todos os hashes. Não foi
+inventada chave criptográfica: o armazenamento do checkpoint continua sendo uma
+fronteira confiável que precisa de controle de acesso operacional.
+
+**Decisão local de segurança — round 4:** qualquer resultado técnico de ação
+concluída, tanto no terminal legado `EXECUTE_ACTION` quanto em `RELEASE_GATE`,
+exige uma aprovação cuja ação, alvo, parâmetros materiais e origem coincidam
+com proposal, intenção e contexto confiável. A origem autorizadora é persistida
+na intenção para não ser autoatestada pela própria aprovação. Nas quatro ações
+não idempotentes, uma intenção `PREPARED` por outro `execution_id` termina
+primeiro em `uncertain/0`, inclusive se ativo, caso ou modelo atuais divergirem.
+A exceção da fronteira vale somente para a aresta pendente
+`prepare_intent → execute_action`, sem nova proposal, aprovação ou confirmação;
+execução normal, confirmação, mesma execução e replay terminal continuam
+revalidando todo o escopo.
+
+**Decisão local de segurança — round 5:** no grafo com planner, somente o
+terminal criado pelo código exato
+`NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME` preserva a resposta determinística
+de `execute_action` e segue diretamente para `END`. Esse caminho não consulta
+writer, repair ou gate e não contém afirmação técnica. Falhas, incertezas com
+qualquer outro código e resultados normais continuam obrigatoriamente em
+`writer → release_gate`.
+
+**Decisão local de segurança — escalação da Task 16:** o terminal conservador
+é reconhecido primeiro pela estrutura independente do código — ação não
+idempotente, intenção `UNCERTAIN` preparada por outra execução, zero tentativas,
+nenhum recibo e âncora `EXECUTE_ACTION`. Um único contrato puro compartilhado
+pelo estado e pela aresta do grafo exige então o erro local completo e o
+`FinalResult` sanitizado exato, sem referências, próximo passo, status HTTP ou
+afirmação técnica. O fast replay rejeita qualquer divergência antes de invocar
+o grafo, inclusive ausência do resultado final. Contadores e o discriminador
+booleano do erro são estritos no wire, de modo que strings, inteiros e booleanos
+não sejam normalizados antes da igualdade canônica. Essa validação continua
+sendo integridade estrutural dentro da fronteira confiável do checkpoint; ela
+não acrescenta MAC nem autenticação criptográfica.
+
+As cinco ações passaram por interrupção após o efeito, fechamento/reabertura do
+SQLite, retomada somente em writer/gate e replay sem novo HTTP ou modelo. A
+confirmação estruturada também terminou no gate sem repetir efeito. As suítes
+focadas da Fase 8 cobrem writer, gate, estado, contratos, planner e fronteira;
+as regressões dos fluxos de escrita somam 235 testes. A suíte completa do agente
+tem 1.624 testes e o `make test` confirmou 99 testes da API + 1.624 do agente =
+1.723 testes. `uv lock --check --offline` resolveu 49
+pacotes; permaneceu apenas o warning conhecido de `python_multipart`.
 
 ## Fase 9 — revisão humana
 

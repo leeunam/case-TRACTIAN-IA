@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner LLM opt-in, ledger determinístico de evidências e checkpointer SQLite de desenvolvimento. Em 02/09/2026, `make test` passou com 99 testes da API e 1.463 do agente (1.562 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 7 estão concluídas. O grafo atual não é um agente de produção: writer, resposta gerada ao cliente, gate de liberação, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação e checkpointer SQLite de desenvolvimento. Em 02/09/2026, `make test` passou com 99 testes da API e 1.624 do agente (1.723 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 8 estão concluídas. O grafo atual ainda não é um agente de produção: revisão humana retomável, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -16,7 +16,7 @@ O agente atende três tipos de solicitação:
 
 Se faltarem evidências, houver conflito ou a ação ultrapassar a permissão do usuário, o agente não inventa uma conclusão. Ele solicita dados, confirmação ou revisão humana.
 
-## Arquitetura planejada
+## Arquitetura atual e evolução planejada
 
 ```mermaid
 flowchart TD
@@ -29,7 +29,8 @@ flowchart TD
     G --> D
     D --> H[Writer: redige com base no ledger]
     H --> I[Gate determinístico de segurança]
-    I --> J[Resposta, confirmação ou revisão humana]
+    I --> J[Resposta ou pedido seguro]
+    I -. futura fila retomável .-> L[Revisão humana]
     C -. traces e métricas .-> K[Logfire]
 ```
 
@@ -42,6 +43,19 @@ Essa separação reduz contexto, facilita testes e impede que a redação altere
 
 No MVP, planner e writer podem usar o mesmo modelo com prompts e contratos diferentes. A separação é de responsabilidade, não uma obrigação de contratar dois modelos.
 
+O writer usa o prompt `writer-v1`, não recebe tools e devolve somente um draft
+estruturado com a decisão imutável, IDs ordenados e próximo passo enumerado. Seu
+contexto usa um orçamento total de 64 referências e somente IDs e categorias
+fechadas: alvos, valores, timestamps e caminhos técnicos permanecem no ledger.
+O gate deriva a decisão e o alvo da ação da request confiável, da proposal, da
+intenção, da aprovação e do recibo atuais; recompõe IDs e conflitos e exige
+`read` sempre que o draft cita um fato de tool. Apenas um atestado `release`
+permite ao renderer buscar os valores no ledger; a mensagem técnica não vem do
+modelo e é revalidada ao restaurar o checkpoint. Uma saída de formato inválido
+admite somente um repair; contador, âncora e próximo nó impedem uma terceira
+chamada. Duas falhas, erro de provider ou qualquer incerteza terminam em aviso
+sanitizado e seguro para futura revisão.
+
 O **ledger de evidências** associa fatos às fontes consultadas no estado da execução. Ele recebe somente observações de leitura validadas e recibos tipados de intenções terminais; texto livre de LLM, proposals e mensagens de recibo não viram fatos. O Logfire receberá traces e métricas para consulta humana e operação; ele não será o banco principal do ledger nem uma fonte que o agente consulta durante o atendimento. Logfire ainda não está implementado.
 
 ### Persistência e idempotência
@@ -49,7 +63,9 @@ O **ledger de evidências** associa fatos às fontes consultadas no estado da ex
 Há dois armazenamentos SQLite independentes no desenvolvimento. A API usa `IDEMPOTENCY_DB_PATH` (padrão `.run/idempotency.sqlite3`) para a idempotência de reprocesso; `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS` altera seu limite de processamento, cujo padrão é 300 segundos. O grafo usa `.run/agent-checkpoints.sqlite3` por `AsyncSqliteSaver`, com serializer restrito e sem remoção automática de threads; a exclusão é explícita. PostgreSQL continua sendo a evolução futura, não uma implementação atual.
 
 - `thread_id` identifica a linha persistida; um thread pode receber novos `request_id`, e cada execução ou retomada recebe novo `execution_id`. Mudança de caso, empresa, pessoa usuária ou alvo confiável falha fechada.
-- A intenção persistida registra ID, request, escopo imutável, hash, decisão/status, tentativas, execução preparadora e recibo ou erro; runtime, cliente, credenciais, seed, golden set, resposta HTTP bruta e raciocínio não entram no checkpoint.
+- A intenção persistida registra ID, request, escopo imutável, hash, decisão/status, origem da aprovação autorizadora, tentativas, execução preparadora e recibo ou erro; runtime, cliente, credenciais, seed, golden set, resposta HTTP bruta e raciocínio não entram no checkpoint.
+- O estado persiste somente os três alvos confiáveis necessários à escrita — ativo central, caso atual e modelo industrial configurado — e os vincula novamente à request, à intenção e ao atestado; esse contexto nunca é enviado ao writer.
+- A assinatura estrutural da intenção inclui ação, alvo canônico, parâmetros materiais e justificativa, e o runtime precisa coincidir com o contexto persistido em cada retomada. Esse hash detecta divergência, mas não é um MAC nem prova autenticidade contra alguém com escrita arbitrária no SQLite e capacidade de recalcular todo o checkpoint; por isso o banco de checkpoints permanece uma fronteira confiável e deve ter acesso controlado.
 - Criação e retomada que podem escrever usam `durability="sync"`; `prepare_intent` fica em superstep distinto e é persistido antes de `execute_action`. Confirmações usam `interrupt()` estruturado e `Command` pelo ID na fronteira confiável.
 - O primeiro alvo de idempotência é `POST /analyses/{analysisId}/reprocess`.
 - A API exige uma `Idempotency-Key` de 1 a 255 caracteres sem espaços, reserva a intenção antes da ação, persiste respostas concluídas em SQLite e faz replay mesmo após recriar o armazenamento; mesma chave com payload diferente retorna `409 Conflict`.
@@ -58,7 +74,8 @@ Há dois armazenamentos SQLite independentes no desenvolvimento. A API usa `IDEM
 - Um registro `processing` com mais de 300 segundos, ou o limite definido em `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS`, muda para `uncertain` sem repetir a ação.
 - Registros vencidos são removidos sob demanda depois de 7 dias; a mesma chave, após esse prazo, inicia uma nova execução. O horário de criação identifica cada geração e impede que um trabalho antigo altere a reserva nova.
 - Se a resposta se perde depois do commit, o retry recupera a resposta persistida sem repetir a ação.
-- Especialista, criticidade, retreinamento e escalonamento não usam chave nem retry automático: têm no máximo um despacho. Em retomada de uma intenção `prepared` por outro `execution_id`, terminam conservadoramente em `uncertain/0` sem tocar a rede. Isso pode produzir falso incerto e `attempts` pode subcontar um crash pós-efeito; o lock por `thread_id` é local ao processo/event loop e o preflight do especialista é opaco.
+- Especialista, criticidade, retreinamento e escalonamento não usam chave nem retry automático: têm no máximo um despacho. Em retomada de uma intenção `prepared` por outro `execution_id`, terminam conservadoramente em `uncertain/0` sem tocar a rede, antes de revalidar escopo, política ou preflight; somente a transição exata `prepare_intent → execute_action` recebe essa exceção na fronteira, mesmo se ativo, caso ou modelo do runtime mudaram. Isso pode produzir falso incerto e `attempts` pode subcontar um crash pós-efeito; o lock por `thread_id` é local ao processo/event loop e o preflight do especialista é opaco.
+- No grafo com planner, esse único terminal de retomada é derivado do shape estrutural completo — ação não idempotente, intenção `uncertain/0` preparada por outra execução, sem recibo e com âncora `execute_action` — e exige erro `NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME` e resultado final canônicos. Somente ele segue diretamente para `END`, com mensagem determinística e sem writer/gate; qualquer outro erro ou resultado continua no writer e na porta de segurança.
 - A API aplica uma segunda barreira de empresa nas ações ligadas a ativo, análise e chamado. Os cinco endpoints de ação retornam recibos sem reescrever os fixtures; o PATCH aceita somente o formulário técnico documentado e falha fechado para campos, tipos ou valores inválidos.
 - O processo da API abre somente uma allowlist de Parquets operacionais e lê chamados do pacote público sanitizado em `agent-input/`. O `data/cases.parquet`, o gabarito em `eval/` e os cenários de teste não entram no runtime.
 
@@ -78,8 +95,8 @@ os validators e as regras de coerência do contrato continuam falhando fechados.
 O planner e seu contrato permanecem independentes desse detalhe de transporte.
 O modelo, credenciais e respostas brutas não entram no estado. IDs persistidos
 de tool call são derivados pelo runtime de `request_id` e do ordinal, nunca do
-ID externo do provider. NVIDIA NIM continua alternativa futura; writer poderá
-usar outro modelo quando existir, sem mudar as regras de negócio.
+ID externo do provider. NVIDIA NIM continua alternativa futura; o writer pode
+usar outro modelo sem mudar as regras de negócio ou o gate determinístico.
 
 O smoke opt-in `make smoke-groq` compara `openai/gpt-oss-120b` e
 `openai/gpt-oss-20b` com dados sintéticos, sem retry e com o mesmo orçamento de
@@ -197,7 +214,7 @@ Prompt curto recomendado:
 ├── CONTEXT.md
 ├── LICENSE
 ├── Makefile
-├── agent/                   # contratos, cliente, tools, política, operações, estado, grafo e checkpointer
+├── agent/                   # contratos, tools, planner, writer, gate, grafo e checkpointer
 ├── agent-input/             # entradas permitidas ao agente
 ├── api/                     # simulador FastAPI e testes
 ├── data/                    # dados do simulador
@@ -207,7 +224,7 @@ Prompt curto recomendado:
 
 ## Limitações atuais
 
-- Existe um grafo LangGraph com planner LLM opt-in, ledger de evidências, fluxos de escrita determinísticos e checkpointer. Ele ainda não possui writer, resposta gerada ao cliente, gate de segurança de liberação, Logfire nem runner Pydantic Evals; portanto não é um agente de produção.
+- Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, fluxos de escrita e checkpointer. Ele ainda não possui revisão humana retomável, Logfire nem runner Pydantic Evals; portanto não é um agente de produção.
 - As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
 - O simulador não representa todas as garantias transacionais de produção.
 - As rotas de ação do simulador devolvem recibos, mas não alteram os recursos Parquet; um novo GET não comprova a mutação solicitada.

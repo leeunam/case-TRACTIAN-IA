@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 import json
@@ -21,7 +22,13 @@ from pydantic import (
     model_validator,
 )
 
-from tractian_agent.contracts import ResponseMode, StrictModel, SupportRequest, ToolCall
+from tractian_agent.contracts import (
+    ApiErrorCategory,
+    ResponseMode,
+    StrictModel,
+    SupportRequest,
+    ToolCall,
+)
 from tractian_agent.tools.analyses import (
     AnalysisDetailToolArtifact,
     AnalysisListToolArtifact,
@@ -41,29 +48,18 @@ from tractian_agent.tools.technical import (
     SpectrumToolArtifact,
 )
 from tractian_agent.write_contracts import (
-    EscalateCaseIntentScope,
     IntentStatus,
     PersistedApiError,
-    ReprocessIntentScope,
-    RequestModelRetrainingIntentScope,
-    RequestSpecialistAnalysisIntentScope,
-    UpdateAssetCriticalityIntentScope,
     WriteIntent,
     WriteIntentScope,
-    intent_scope_material_parameters,
-    intent_scope_target_id,
+    approval_matches_write_intent,
+    proposal_matches_intent_scope,
 )
 from tractian_agent.write_policy import (
-    EscalateCaseProposal,
     PolicyDecision,
-    ReprocessProposal,
-    RequestModelRetrainingProposal,
-    RequestSpecialistAnalysisProposal,
     TrustedActionApproval,
-    UpdateAssetCriticalityProposal,
-    WriteMaterialParameters,
+    TrustedWriteContext,
     WriteProposal,
-    canonical_write_payload_hash,
 )
 
 
@@ -77,46 +73,23 @@ def _proposal_matches_persisted_intent(
     *,
     request: PersistedSupportRequest,
     payload_hash: str,
+    trusted_context: TrustedWriteContext | None,
 ) -> bool:
     """Vincula o efeito terminal à proposal sem recuperar runtime no estado."""
-    if (
-        proposal.action != scope.action
-        or canonical_write_payload_hash(proposal) != payload_hash
-    ):
+    if trusted_context is None:
         return False
-    persisted_target = intent_scope_target_id(scope)
-    persisted_material = intent_scope_material_parameters(scope)
-    if isinstance(proposal, ReprocessProposal):
-        return (
-            isinstance(scope, ReprocessIntentScope)
-            and proposal.analysis_id == persisted_target
-            and persisted_material == WriteMaterialParameters()
-        )
-    if isinstance(proposal, RequestSpecialistAnalysisProposal):
-        return (
-            isinstance(scope, RequestSpecialistAnalysisIntentScope)
-            and proposal.analysis_id == persisted_target
-            and persisted_material == WriteMaterialParameters()
-        )
-    if isinstance(proposal, UpdateAssetCriticalityProposal):
-        return (
-            isinstance(scope, UpdateAssetCriticalityIntentScope)
-            and request.asset_id is not None
-            and persisted_target == request.asset_id
-            and persisted_material
-            == WriteMaterialParameters(criticality=proposal.criticality)
-        )
-    if isinstance(proposal, RequestModelRetrainingProposal):
-        # O model_id é confiável, mas não pertence ao estado persistível.
-        return (
-            isinstance(scope, RequestModelRetrainingIntentScope)
-            and persisted_material == WriteMaterialParameters()
-        )
     return (
-        isinstance(proposal, EscalateCaseProposal)
-        and isinstance(scope, EscalateCaseIntentScope)
-        and persisted_target == request.case_id
-        and persisted_material == WriteMaterialParameters()
+        trusted_context.current_case_id == request.case_id
+        and (
+            request.asset_id is None
+            or trusted_context.central_asset_id == request.asset_id
+        )
+        and proposal_matches_intent_scope(
+            proposal,
+            scope,
+            payload_hash=payload_hash,
+            trusted_context=trusted_context,
+        )
     )
 
 
@@ -645,6 +618,111 @@ class AgentDecision(str, Enum):
     REQUIRE_HUMAN_REVIEW = "require_human_review"
 
 
+class WriterNextStep(str, Enum):
+    """Próximo passo fechado; o modelo não produz instruções livres."""
+
+    MONITOR = "monitor"
+    VERIFY_ACTION = "verify_action"
+    AWAIT_ESCALATION = "await_escalation"
+    PROVIDE_INFORMATION = "provide_information"
+    CONFIRM_ACTION = "confirm_action"
+    AWAIT_HUMAN_REVIEW = "await_human_review"
+
+
+class WriterDraft(FrozenStateModel):
+    """Seleção estruturada do writer, sem fatos, valores ou prosa técnica."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    decision: AgentDecision
+    evidence_ids: tuple[str, ...] = ()
+    limitation_refs: tuple[str, ...] = ()
+    next_step: WriterNextStep
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def _require_ordered_evidence_ids(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if tuple(sorted(value)) != value or len(value) != len(set(value)):
+            raise ValueError("IDs de evidência devem ser únicos e ordenados")
+        if any(not re.fullmatch(r"sha256:v1:[0-9a-f]{64}", item) for item in value):
+            raise ValueError("ID de evidência inválido")
+        return value
+
+    @field_validator("limitation_refs")
+    @classmethod
+    def _require_ordered_limitation_refs(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if tuple(sorted(value)) != value or len(value) != len(set(value)):
+            raise ValueError("referências de limitação devem ser únicas e ordenadas")
+        if any(
+            not re.fullmatch(r"limitation:v1:[0-9a-f]{64}", item)
+            for item in value
+        ):
+            raise ValueError("referência de limitação inválida")
+        return value
+
+
+class WriterFailureCode(str, Enum):
+    INVALID_STRUCTURED_OUTPUT = "invalid_structured_output"
+    MODEL_FAILURE = "model_failure"
+
+
+class WriterFailureRecord(FrozenStateModel):
+    code: WriterFailureCode
+    attempts: int = Field(ge=1, le=2, strict=True)
+    repairable: bool = Field(strict=True)
+
+    @model_validator(mode="after")
+    def _require_closed_retry_semantics(self) -> WriterFailureRecord:
+        expected = self.code is WriterFailureCode.INVALID_STRUCTURED_OUTPUT
+        if self.repairable is not expected:
+            raise ValueError("repairable diverge do código da falha do writer")
+        return self
+
+
+class ReleaseGateOutcome(str, Enum):
+    RELEASE = "release"
+    REQUEST_INFORMATION = "request_information"
+    REQUEST_CONFIRMATION = "request_confirmation"
+    REQUIRE_HUMAN_REVIEW = "require_human_review"
+
+
+class ReleaseGateReason(str, Enum):
+    PASSED = "passed"
+    INFORMATION_REQUIRED = "information_required"
+    CONFIRMATION_REQUIRED = "confirmation_required"
+    HUMAN_REVIEW_REQUESTED = "human_review_requested"
+    WRITER_FAILURE = "writer_failure"
+    REQUEST_MISMATCH = "request_mismatch"
+    DECISION_MISMATCH = "decision_mismatch"
+    EVIDENCE_REFERENCE_MISMATCH = "evidence_reference_mismatch"
+    LIMITATION_REFERENCE_MISMATCH = "limitation_reference_mismatch"
+    NEXT_STEP_MISMATCH = "next_step_mismatch"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    PERMISSION_INCOMPATIBLE = "permission_incompatible"
+    INTENT_MISSING = "intent_missing"
+    INTENT_UNCERTAIN = "intent_uncertain"
+    INTENT_NOT_COMPLETED = "intent_not_completed"
+    INTENT_POLICY_MISMATCH = "intent_policy_mismatch"
+    APPROVAL_MISMATCH = "approval_mismatch"
+    ACTION_EVIDENCE_MISSING = "action_evidence_missing"
+    MISSING_INFORMATION_INVALID = "missing_information_invalid"
+
+
+class ReleaseGateRecord(FrozenStateModel):
+    subject_decision: AgentDecision
+    outcome: ReleaseGateOutcome
+    reason: ReleaseGateReason
+    draft_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    ledger_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    context_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+
+
 class ReviewStatus(str, Enum):
     NOT_REQUIRED = "not_required"
     REQUIRED = "required"
@@ -662,6 +740,8 @@ class ResumeAnchor(str, Enum):
     PLANNER_SELECT = "planner_select"
     PLANNER_TOOL = "planner_tool"
     PLANNER_FINALIZE = "planner_finalize"
+    WRITER = "writer"
+    RELEASE_GATE = "release_gate"
     WRITE_POLICY = "write_policy"
     CONFIRMATION_GATE = "confirmation_gate"
     PREPARE_INTENT = "prepare_intent"
@@ -842,6 +922,23 @@ class EvidenceConflict(FrozenStateModel):
     evidence_ids: tuple[str, ...] = Field(min_length=2)
     blocking: Literal[True] = True
 
+    @field_validator("evidence_ids")
+    @classmethod
+    def _require_canonical_evidence_ids(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("IDs do conflito devem ser únicos")
+        if tuple(sorted(value)) != value:
+            raise ValueError("IDs do conflito devem ser ordenados")
+        if any(
+            not re.fullmatch(r"sha256:v1:[0-9a-f]{64}", item)
+            for item in value
+        ):
+            raise ValueError("ID de evidência inválido no conflito")
+        return value
+
 
 class EvidenceLedger(FrozenStateModel):
     """Ledger atual de uma request; histórico permanece em ``ledger_history``."""
@@ -864,6 +961,87 @@ class EvidenceAssessment(FrozenStateModel):
 class FinalResult(FrozenStateModel):
     decision: AgentDecision
     message: str = Field(min_length=1, pattern=r"\S")
+    evidence_ids: tuple[str, ...] = ()
+    limitation_refs: tuple[str, ...] = ()
+    next_step: WriterNextStep | None = None
+
+
+@dataclass(frozen=True)
+class ConservativeNonIdempotentResumeTerminal:
+    """Contrato único do terminal local que proíbe um segundo despacho."""
+
+    error: PersistedApiError
+    final_result: FinalResult
+
+    def matches_state(self, state: AgentState) -> bool | None:
+        """Retorna ``None`` fora do caso; ``False`` denuncia shape adulterado."""
+
+        current_intents = tuple(
+            intent
+            for intent in state.intents
+            if intent.request_id == state.request_id
+        )
+        if len(current_intents) != 1:
+            return None
+        intent = current_intents[0]
+        structural_case = (
+            state.resume_anchor is ResumeAnchor.EXECUTE_ACTION
+            and intent.scope.action != "reprocess_analysis"
+            and intent.status is IntentStatus.UNCERTAIN
+            and intent.attempts == 0
+            and intent.receipt is None
+            and intent.prepared_execution_id is not None
+            and intent.prepared_execution_id != state.execution_id
+        )
+        claims_canonical_error = (
+            intent.error is not None and intent.error.code == self.error.code
+        )
+        if not structural_case and not claims_canonical_error:
+            return None
+        return (
+            structural_case
+            and intent.error == self.error
+            and state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+            and state.final_result == self.final_result
+            and state.review is None
+            and state.planner_terminal is None
+            and state.planner_failure is None
+            and state.writer_draft is None
+            and state.writer_failure is None
+            and state.writer_attempts == 0
+            and state.release_gate is None
+        )
+
+
+_CONSERVATIVE_NON_IDEMPOTENT_RESUME_TERMINAL = (
+    ConservativeNonIdempotentResumeTerminal(
+        error=PersistedApiError(
+            category=ApiErrorCategory.API,
+            code="NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME",
+            message=(
+                "A execução preparadora terminou sem resultado terminal observável."
+            ),
+            status_code=None,
+        ),
+        final_result=FinalResult(
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            message=(
+                "O resultado remoto da ação é desconhecido e ela não será "
+                "reenviada automaticamente."
+            ),
+            evidence_ids=(),
+            limitation_refs=(),
+            next_step=None,
+        ),
+    )
+)
+
+
+def canonical_non_idempotent_resume_terminal(
+) -> ConservativeNonIdempotentResumeTerminal:
+    """Fornece erro e resposta fixos, além do predicado estrutural compartilhado."""
+
+    return _CONSERVATIVE_NON_IDEMPOTENT_RESUME_TERMINAL
 
 
 class ReviewRecord(FrozenStateModel):
@@ -936,6 +1114,7 @@ class AgentState(FrozenStateModel):
     thread_id: str = Field(min_length=1, pattern=r"^\S+$")
     execution_id: str = Field(min_length=1, pattern=r"^\S+$")
     thread_scope: ThreadScope
+    trusted_write_context: TrustedWriteContext | None = None
     messages: tuple[PersistedMessage, ...] = ()
     tool_calls: tuple[PersistedToolCall, ...] = ()
     tool_observations: tuple[ToolObservation, ...] = ()
@@ -954,9 +1133,18 @@ class AgentState(FrozenStateModel):
     resume_anchor: ResumeAnchor = ResumeAnchor.START
     planner_terminal: PlannerTerminalRecord | None = None
     planner_failure: PlannerFailureRecord | None = None
+    writer_draft: WriterDraft | None = None
+    writer_failure: WriterFailureRecord | None = None
+    writer_attempts: int = Field(default=0, ge=0, le=2, strict=True)
+    release_gate: ReleaseGateRecord | None = None
 
     def has_coherent_terminal_result(self) -> bool:
         """Confere a matriz fechada dos resultados terminais persistidos."""
+        conservative_match = (
+            canonical_non_idempotent_resume_terminal().matches_state(self)
+        )
+        if conservative_match is not None:
+            return conservative_match
         if self.final_result is None:
             return True
         if self.decision is None or self.final_result.decision is not self.decision:
@@ -1002,6 +1190,48 @@ class AgentState(FrozenStateModel):
                 )
             return self.review is None
 
+        if self.resume_anchor is ResumeAnchor.RELEASE_GATE:
+            gate = self.release_gate
+            if gate is None:
+                return False
+            if gate.outcome is ReleaseGateOutcome.RELEASE:
+                coherent_release = (
+                    self.writer_draft is not None
+                    and self.writer_failure is None
+                    and self.decision is self.writer_draft.decision
+                    and self.review is None
+                )
+                if not coherent_release:
+                    return False
+                if self.decision not in {AgentDecision.ACT, AgentDecision.ESCALATE}:
+                    return True
+                return (
+                    self.pending_proposal is not None
+                    and len(current_intents) == 1
+                    and current_intents[0].status is IntentStatus.COMPLETED
+                    and approval_matches_write_intent(
+                        self.pending_proposal,
+                        current_intents[0],
+                        approval=self.approval,
+                        trusted_context=self.trusted_write_context,
+                    )
+                )
+            if gate.outcome is ReleaseGateOutcome.REQUEST_INFORMATION:
+                return (
+                    self.decision is AgentDecision.REQUEST_INFORMATION
+                    and self.review is None
+                )
+            if gate.outcome is ReleaseGateOutcome.REQUEST_CONFIRMATION:
+                return (
+                    self.decision is AgentDecision.REQUEST_CONFIRMATION
+                    and self.review is None
+                )
+            return (
+                self.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+                and self.review is not None
+                and self.review.status is ReviewStatus.REQUIRED
+            )
+
         if self.resume_anchor in {
             ResumeAnchor.WRITE_POLICY,
             ResumeAnchor.CONFIRMATION_GATE,
@@ -1031,6 +1261,14 @@ class AgentState(FrozenStateModel):
                     intent.scope,
                     request=self.request,
                     payload_hash=intent.payload_hash,
+                    trusted_context=self.trusted_write_context,
+                ):
+                    return False
+                if not approval_matches_write_intent(
+                    self.pending_proposal,
+                    intent,
+                    approval=self.approval,
+                    trusted_context=self.trusted_write_context,
                 ):
                     return False
                 expected_decision = (
@@ -1081,6 +1319,22 @@ class AgentState(FrozenStateModel):
             }
         return value
 
+    @field_validator("writer_draft", mode="before")
+    @classmethod
+    def _restore_strict_writer_draft(cls, value: object) -> object:
+        """Restaura o wire JSON sem afrouxar o contrato Python do draft."""
+        if isinstance(value, Mapping):
+            return WriterDraft.model_validate_json(
+                json.dumps(
+                    value,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+        return value
+
     @model_validator(mode="after")
     def _validate_scope_and_budget(self) -> AgentState:
         expected_scope = (
@@ -1102,6 +1356,30 @@ class AgentState(FrozenStateModel):
             or self.request.identity.user_id != self.identity.user_id
         ):
             raise ValueError("identidade da solicitação diverge da fronteira confiável")
+        if self.trusted_write_context is not None and (
+            self.trusted_write_context.current_case_id != self.request.case_id
+            or (
+                self.request.asset_id is not None
+                and self.trusted_write_context.central_asset_id
+                != self.request.asset_id
+            )
+        ):
+            raise ValueError("escopo confiável diverge da solicitação")
+        write_anchors = {
+            ResumeAnchor.WRITE_POLICY,
+            ResumeAnchor.CONFIRMATION_GATE,
+            ResumeAnchor.PREPARE_INTENT,
+            ResumeAnchor.EXECUTE_ACTION,
+        }
+        if self.trusted_write_context is None and (
+            self.pending_proposal is not None
+            or self.approval is not None
+            or bool(self.intents)
+            or self.resume_anchor in write_anchors
+        ):
+            raise ValueError(
+                "o ciclo de escrita exige contexto confiável persistido"
+            )
         thread_intent_scope = (
             self.thread_scope.case_id,
             self.thread_scope.company_id,
@@ -1133,6 +1411,25 @@ class AgentState(FrozenStateModel):
         ]
         if len(active_request_ids) != len(set(active_request_ids)):
             raise ValueError("cada request_id aceita no máximo uma intenção ativa")
+        current_intents = tuple(
+            intent
+            for intent in self.intents
+            if intent.request_id == self.request_id
+        )
+        if self.pending_proposal is not None and current_intents:
+            if (
+                len(current_intents) != 1
+                or not _proposal_matches_persisted_intent(
+                    self.pending_proposal,
+                    current_intents[0].scope,
+                    request=self.request,
+                    payload_hash=current_intents[0].payload_hash,
+                    trusted_context=self.trusted_write_context,
+                )
+            ):
+                raise ValueError(
+                    "ciclo de escrita diverge da assinatura canônica persistida"
+                )
         if self.step_count > self.step_limit:
             raise ValueError("contador de passos excede o orçamento")
         if self.planner_usage.request_id != self.request_id:
@@ -1169,21 +1466,92 @@ class AgentState(FrozenStateModel):
             raise ValueError(
                 "falha do planner exige encerramento seguro e revisão humana"
             )
+        if self.writer_draft is not None and self.writer_failure is not None:
+            raise ValueError("draft e falha do writer são mutuamente exclusivos")
+        if self.writer_attempts == 0 and (
+            self.writer_draft is not None or self.writer_failure is not None
+        ):
+            raise ValueError("resultado do writer exige tentativa persistida")
+        if self.writer_attempts > 0 and (
+            self.writer_draft is None and self.writer_failure is None
+        ):
+            raise ValueError("tentativa do writer exige draft ou falha")
+        if self.writer_failure is not None and (
+            self.writer_failure.attempts != self.writer_attempts
+        ):
+            raise ValueError("falha do writer diverge do contador persistido")
+        if self.resume_anchor is ResumeAnchor.WRITER and self.writer_attempts == 0:
+            raise ValueError("âncora do writer exige tentativa persistida")
+        if self.writer_attempts > 0 and self.resume_anchor not in {
+            ResumeAnchor.WRITER,
+            ResumeAnchor.RELEASE_GATE,
+        }:
+            raise ValueError("resultado do writer diverge da âncora persistida")
+        if self.release_gate is not None and self.resume_anchor is not ResumeAnchor.RELEASE_GATE:
+            raise ValueError("atestado do gate exige sua âncora persistida")
         terminal_anchors = {
             ResumeAnchor.FINISH,
             ResumeAnchor.PLANNER_FINALIZE,
             ResumeAnchor.WRITE_POLICY,
             ResumeAnchor.CONFIRMATION_GATE,
             ResumeAnchor.EXECUTE_ACTION,
+            ResumeAnchor.RELEASE_GATE,
         }
         if (
-            self.final_result is not None
-            and self.resume_anchor in terminal_anchors
+            self.resume_anchor in terminal_anchors
             and not self.has_coherent_terminal_result()
         ):
             raise ValueError("resultado terminal diverge da âncora persistida")
         self._validate_current_ledger()
+        self._validate_release_attestation()
         return self
+
+    def _validate_release_attestation(self) -> None:
+        """Recalcula o gate e a resposta; checkpoint não pode inventar prosa."""
+        if self.release_gate is None:
+            return
+        if self.final_result is None:
+            raise ValueError("atestado do gate exige resultado final")
+
+        from tractian_agent.release_gate import (
+            ReleaseGateContext,
+            evaluate_release,
+            render_non_release_result,
+            render_released_result,
+        )
+
+        context = ReleaseGateContext(
+            request_id=self.request_id,
+            decision=self.release_gate.subject_decision,
+            ledger=self.ledger,
+            draft=self.writer_draft,
+            permissions=self.permissions,
+            intents=tuple(
+                intent
+                for intent in self.intents
+                if intent.request_id == self.request_id
+            ),
+            proposal=self.pending_proposal,
+            trusted_write_context=self.trusted_write_context,
+            planner_terminal=self.planner_terminal,
+            approval=self.approval,
+            missing_information=(
+                self.planner_terminal.missing_information
+                if self.planner_terminal is not None
+                else None
+            ),
+            writer_failure=self.writer_failure,
+        )
+        expected_gate = evaluate_release(context)
+        if self.release_gate != expected_gate:
+            raise ValueError("atestado do gate diverge da recomputação")
+        expected_result = (
+            render_released_result(context, expected_gate)
+            if expected_gate.outcome is ReleaseGateOutcome.RELEASE
+            else render_non_release_result(context, expected_gate)
+        )
+        if self.final_result != expected_result:
+            raise ValueError("resultado final diverge do renderer determinístico")
 
     def _validate_current_ledger(self) -> None:
         """Recompila integralmente o ledger atual e o histórico, sem subconjuntos."""
@@ -1307,6 +1675,7 @@ class AgentState(FrozenStateModel):
         request_id: str,
         execution_id: str,
         step_limit: int | None = None,
+        trusted_write_context: TrustedWriteContext | None = None,
     ) -> AgentState:
         """Cria uma invocação no mesmo thread, validando novamente seu escopo."""
         if execution_id == self.execution_id:
@@ -1325,6 +1694,11 @@ class AgentState(FrozenStateModel):
             permissions=permissions,
             request_id=request_id,
             execution_id=execution_id,
+            trusted_write_context=(
+                self.trusted_write_context
+                if same_request
+                else trusted_write_context
+            ),
         )
         if not same_request:
             history = self.ledger_history
@@ -1342,6 +1716,10 @@ class AgentState(FrozenStateModel):
                 resume_anchor=ResumeAnchor.START,
                 planner_terminal=None,
                 planner_failure=None,
+                writer_draft=None,
+                writer_failure=None,
+                writer_attempts=0,
+                release_gate=None,
                 ledger=EvidenceLedger(),
                 ledger_history=history,
             )

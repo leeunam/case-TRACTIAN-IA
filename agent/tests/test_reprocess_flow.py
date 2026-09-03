@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-import hashlib
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 import tractian_agent.graph as graph_module
 from tractian_agent.checkpoint import open_checkpointer
@@ -38,7 +37,9 @@ from tractian_agent.write_policy import (
     ReprocessProposal,
     RequestSpecialistAnalysisProposal,
     TrustedActionApproval,
+    TrustedWriteContext,
     WritePolicyResult,
+    canonical_write_payload_hash,
 )
 
 
@@ -129,13 +130,18 @@ def _runtime(
 
 
 def _expected_payload_hash() -> str:
-    body = json.dumps(
-        {"justification": JUSTIFICATION},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    return f"sha256:v1:{hashlib.sha256(body).hexdigest()}"
+    return canonical_write_payload_hash(
+        _proposal(),
+        trusted_context=_trusted_context(),
+    )
+
+
+def _trusted_context() -> TrustedWriteContext:
+    return TrustedWriteContext(
+        central_asset_id="asset_M101",
+        current_case_id="case_tkt_exe_12",
+        configured_model_id="mdl_vib_v3",
+    )
 
 
 def test_original_approval_completes_reprocess_in_five_steps(tmp_path: Path):
@@ -167,6 +173,7 @@ def test_original_approval_completes_reprocess_in_five_steps(tmp_path: Path):
     intent = state.intents[0]
     assert intent.request_id == "req_reprocess_direct"
     assert intent.status is IntentStatus.COMPLETED
+    assert intent.approval_source is ApprovalSource.ORIGINAL_REQUEST
     assert intent.payload_hash == _expected_payload_hash()
     assert intent.idempotency_key == f"tractian-agent:{intent.intent_id}"
     assert intent.attempts == 1
@@ -325,6 +332,9 @@ def test_confirmation_resume_approves_with_trusted_scope_and_completes(
     assert completed.approval.source is ApprovalSource.CONFIRMATION
     assert completed.approval.target_id == "an_9901"
     assert completed.intents[0].status is IntentStatus.COMPLETED
+    assert (
+        completed.intents[0].approval_source is ApprovalSource.CONFIRMATION
+    )
     assert len(requests) == 2
 
 
@@ -1123,6 +1133,7 @@ def test_active_legacy_intent_blocks_write_without_adoption_or_http(tmp_path: Pa
                             company_id="comp_forja_br",
                             user_id="usr_ana",
                         ),
+                        trusted_write_context=_trusted_context(),
                         step_limit=3,
                         intents=(
                             _legacy_intent(IntentStatus.AWAITING_CONFIRMATION),
@@ -1736,7 +1747,7 @@ def test_pre_dispatch_integrity_mismatch_fails_with_zero_http(
         expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
         prepared_execution_id="exec_integrity",
     )
-    state = AgentState(
+    state_data = dict(
         request=_request(),
         identity=runtime.identity,
         permissions=runtime.permissions,
@@ -1754,7 +1765,15 @@ def test_pre_dispatch_integrity_mismatch_fails_with_zero_http(
         pending_proposal=_proposal(),
         approval=_approval(),
         intents=(intent,),
+        trusted_write_context=_trusted_context(),
     )
+    if mismatch in {"scope", "hash"}:
+        with pytest.raises(ValidationError, match="ciclo de escrita"):
+            AgentState(**state_data)
+        asyncio.run(runtime.client.aclose())
+        assert requests == []
+        return
+    state = AgentState(**state_data)
 
     async def scenario():
         try:
@@ -1827,6 +1846,7 @@ def test_same_execution_authorization_change_fails_before_operation(
         pending_proposal=_proposal(),
         approval=(None if change == "approval" else _approval()),
         intents=(intent,),
+        trusted_write_context=_trusted_context(),
     )
 
     async def scenario():

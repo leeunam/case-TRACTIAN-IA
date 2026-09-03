@@ -94,25 +94,6 @@ WriteProposal = Annotated[
 ]
 
 
-def canonical_write_payload_hash(proposal: WriteProposal) -> str:
-    """Gera o hash do corpo que será enviado, sem incluir o alvo confiável."""
-    body: dict[str, object]
-    if isinstance(proposal, UpdateAssetCriticalityProposal):
-        body = {
-            "changes": {"criticality": proposal.criticality},
-            "justification": proposal.justification,
-        }
-    else:
-        body = {"justification": proposal.justification}
-    encoded = json.dumps(
-        body,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return f"sha256:v1:{hashlib.sha256(encoded).hexdigest()}"
-
-
 class WriteMaterialParameters(StrictModel):
     """Parâmetros cujo valor faz parte do escopo aprovado."""
 
@@ -224,6 +205,30 @@ def resolve_action_scope(
         action=proposal.action,
         target_id=trusted_context.current_case_id,
     )
+
+
+def canonical_write_payload_hash(
+    proposal: WriteProposal,
+    *,
+    trusted_context: TrustedWriteContext | None = None,
+) -> str:
+    """Assina estruturalmente ação, alvo e corpo material já normalizados."""
+
+    scope = resolve_action_scope(proposal, trusted_context=trusted_context)
+    structural_payload = {
+        "version": "write-scope-v1",
+        "action": scope.action,
+        "target_id": scope.target_id,
+        "material_parameters": scope.material_parameters.model_dump(mode="json"),
+        "justification": proposal.justification,
+    }
+    encoded = json.dumps(
+        structural_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:v1:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def evaluate_write_policy(

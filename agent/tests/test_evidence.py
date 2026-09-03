@@ -11,7 +11,7 @@ from tractian_agent.evidence import (
     assess_evidence,
     compile_observations,
 )
-from tractian_agent.state import ToolObservation
+from tractian_agent.state import EvidenceConflict, ToolObservation
 from tractian_agent.tools.technical import (
     BaselineArtifact,
     BaselineToolArtifact,
@@ -45,6 +45,23 @@ from tractian_agent.tools.observations import ToolSource
 
 
 RECORDED_AT = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+
+
+def test_conflict_references_must_be_unique_and_canonically_ordered() -> None:
+    first = "sha256:v1:" + "a" * 64
+    second = "sha256:v1:" + "b" * 64
+
+    with pytest.raises(ValidationError, match="ordenad"):
+        EvidenceConflict(
+            canonical_key="tool:get_asset:/assets/asset_G501:asset.criticality",
+            evidence_ids=(second, first),
+        )
+
+    with pytest.raises(ValidationError, match="únic"):
+        EvidenceConflict(
+            canonical_key="tool:get_asset:/assets/asset_G501:asset.criticality",
+            evidence_ids=(first, first),
+        )
 
 
 def _quality_observation(
