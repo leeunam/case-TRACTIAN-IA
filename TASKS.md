@@ -449,7 +449,7 @@ writer, mas sempre volta ao mesmo gate; se continuar bloqueada, encerra com
 aviso seguro e não abre uma segunda revisão.
 
 **Evidência de aceite (03/09/2026):** `make test` passou com 99 testes da API e
-1.681 do agente; os 235 fluxos de escrita passaram separadamente, assim como
+1.689 do agente; os 235 fluxos de escrita passaram separadamente, assim como
 Ruff e `uv lock --check --offline`. A retomada com SQLite reaberto preservou
 planner, writer, tools e ações já concluídos sem nova chamada. Testes adversariais
 adicionais cobrem perda de `read` em todas as operações e replay, terminais
@@ -460,9 +460,11 @@ falha do writer, seleção de evidência ou próximo passo; motivos duros aceita
 somente rejeição. Expiração tem precedência sobre a operação e é fechada antes
 de uma nova solicitação, enquanto `ACT`/`ESCALATE` revisado preserva o recibo
 `accepted` da intenção atual. A autorização read-only de thread, tenant, caso,
-alvo, request e execução ocorre antes de qualquer escrita no checkpoint; o
-marcador `release_gate=None` só é válido durante drift real de permissão, nos
-dois estados fechados de continuação anteriores ao segundo gate.
+alvo central, modelo configurado, request e execução ocorre antes de qualquer
+escrita no checkpoint, inclusive quando a request omite o ativo. O gate-base
+original nunca é removido durante drift de permissão: um marcador estrito e
+derivado vincula permissões de base/atuais, decisão e a fase exata anterior ao
+julgamento ou posterior à auditoria, até o segundo gate.
 
 ## Fase 10 — Logfire
 

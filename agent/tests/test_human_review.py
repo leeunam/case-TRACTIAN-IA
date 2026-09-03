@@ -40,12 +40,14 @@ from tractian_agent.state import (
     JsonSnapshot,
     ReleaseGateOutcome,
     ReleaseGateReason,
+    ReviewContinuation,
     ThreadScope,
     WriterDraft,
     WriterFailureCode,
     WriterFailureRecord,
     WriterNextStep,
     allowed_review_operations,
+    build_review_continuation,
 )
 
 
@@ -177,6 +179,14 @@ def test_review_request_is_deterministic_strict_frozen_and_exactly_24_hours():
 
 def test_review_contracts_reject_python_coercions_but_round_trip_json():
     request = _request()
+    continuation = build_review_continuation(
+        request=request,
+        permissions=frozenset(),
+        reviewed_draft=None,
+        resolution=None,
+        audit=None,
+    )
+    assert isinstance(continuation, ReviewContinuation)
     payload = review_interrupt_payload(request)
     edit = ReviewEditReply(
         review_id=request.review_id,
@@ -197,7 +207,16 @@ def test_review_contracts_reject_python_coercions_but_round_trip_json():
         expired_at=request.expires_at,
     )
     resolution = _resolution(request, edit)
-    models = (request, payload, edit, reviewed, audit, expiry, resolution)
+    models = (
+        request,
+        payload,
+        edit,
+        reviewed,
+        audit,
+        expiry,
+        resolution,
+        continuation,
+    )
     for model in models:
         assert type(model).model_validate_json(model.model_dump_json()) == model
 
@@ -209,6 +228,7 @@ def test_review_contracts_reject_python_coercions_but_round_trip_json():
         (ReviewAudit, {**audit.model_dump(), "received_at": audit.received_at.isoformat()}),
         (ReviewExpiry, {**expiry.model_dump(), "expired_at": expiry.expired_at.isoformat()}),
         (ReviewResolution, {**resolution.model_dump(), "received_at": resolution.received_at.isoformat()}),
+        (ReviewContinuation, {**continuation.model_dump(), "current_permissions": []}),
     )
     for model_type, value in coercions:
         with pytest.raises(ValidationError):

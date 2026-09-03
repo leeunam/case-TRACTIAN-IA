@@ -76,6 +76,7 @@ from tractian_agent.state import (
     ToolObservation,
     WriterFailureCode,
     WriterFailureRecord,
+    build_review_continuation,
     canonical_non_idempotent_resume_terminal,
     validate_exact_json_model,
     validate_exact_read_artifact,
@@ -994,6 +995,7 @@ def _release_gate(state: AgentState) -> dict[str, object]:
                     reason="release_gate:step_budget_exhausted",
                 ),
                 release_gate=attestation,
+                review_continuation=None,
             )
         )
     context = _release_gate_context(advanced)
@@ -1042,6 +1044,7 @@ def _release_gate(state: AgentState) -> dict[str, object]:
             review=review,
             release_gate=attestation,
             review_request=review_request,
+            review_continuation=None,
         )
     )
 
@@ -1094,6 +1097,7 @@ def _await_human_review(state: AgentState) -> dict[str, object]:
                     ),
                     expired_at=envelope.received_at,
                 ),
+                review_continuation=None,
             )
         )
     if envelope.reply.operation == "reject":
@@ -1115,6 +1119,7 @@ def _await_human_review(state: AgentState) -> dict[str, object]:
                 ),
                 review_audit=audit,
                 review_resolution=resolution,
+                review_continuation=None,
             )
         )
     if not isinstance(envelope.reply, (ReviewApproveReply, ReviewEditReply)):
@@ -1125,6 +1130,13 @@ def _await_human_review(state: AgentState) -> dict[str, object]:
         resolution=resolution,
         reviewed_draft=reviewed_draft,
     )
+    continuation = build_review_continuation(
+        request=request,
+        permissions=advanced.permissions,
+        reviewed_draft=reviewed_draft,
+        resolution=resolution,
+        audit=audit,
+    )
     return _checkpoint_update(
         _replace_state(
             advanced,
@@ -1133,6 +1145,7 @@ def _await_human_review(state: AgentState) -> dict[str, object]:
             reviewed_draft=reviewed_draft,
             review_audit=audit,
             review_resolution=resolution,
+            review_continuation=continuation,
             review=ReviewRecord(
                 status=ReviewStatus.APPROVED,
                 reason=f"human_review:{envelope.reply.operation}",

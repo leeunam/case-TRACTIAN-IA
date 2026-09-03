@@ -434,6 +434,7 @@ def _validate_persisted_thread_boundary(
     thread_id: str,
     request_id: str,
     execution_id: str,
+    allow_conservative_target_drift: bool,
 ) -> None:
     """Autoriza a continuação sem alterar ou revelar o checkpoint restaurado."""
     scope = state.thread_scope
@@ -458,14 +459,35 @@ def _validate_persisted_thread_boundary(
             "THREAD_SCOPE_MISMATCH",
             "a solicitação não pode continuar este thread",
         )
-    if (
-        request.asset_id is not None
-        and state.trusted_write_context is not None
-        and request.asset_id != state.trusted_write_context.central_asset_id
+    trusted_context = state.trusted_write_context
+    if trusted_context is None:
+        raise AgentInvocationProtocolError(
+            "TRUSTED_WRITE_CONTEXT_MISSING",
+            "o checkpoint não possui o alvo confiável persistido",
+        )
+    if request.asset_id is not None and (
+        request.asset_id != trusted_context.central_asset_id
     ):
         raise AgentInvocationProtocolError(
             "THREAD_SCOPE_MISMATCH",
             "o alvo não pode mudar dentro deste thread",
+        )
+    if (
+        not allow_conservative_target_drift
+        and request.asset_id is not None
+        and runtime.central_asset_id != request.asset_id
+    ):
+        raise AgentInvocationProtocolError(
+            "RUNTIME_ASSET_SCOPE_MISMATCH",
+            "o ativo central do runtime diverge da solicitação",
+        )
+    if not allow_conservative_target_drift and (
+        runtime.central_asset_id != trusted_context.central_asset_id
+        or runtime.configured_model_id != trusted_context.configured_model_id
+    ):
+        raise AgentInvocationProtocolError(
+            "TRUSTED_WRITE_CONTEXT_DRIFT",
+            "o runtime atual diverge do alvo ou modelo persistido",
         )
     if request_id == state.request_id and type(state.request).model_validate(
         request
@@ -728,6 +750,7 @@ def _expire_review_for_new_request(
             resolution_digest=None,
             expired_at=expired_at,
         ).model_dump(mode="json"),
+        review_continuation=None,
     )
     return AgentState.model_validate(data)
 
@@ -803,6 +826,16 @@ async def invoke_agent(
             checkpoint_anchor = _required_resume_anchor(persisted_values)
             persisted = AgentState.model_validate(persisted_values)
             new_request = request_id != persisted.request_id
+            conservative_resume = _is_conservative_non_idempotent_resume(
+                persisted,
+                checkpoint_anchor=checkpoint_anchor,
+                pending_nodes=snapshot.next,
+                execution_id=execution_id,
+                new_request=new_request,
+                proposal=proposal,
+                original_approval=original_approval,
+                confirmation=confirmation,
+            )
             _validate_persisted_thread_boundary(
                 state=persisted,
                 request=request,
@@ -810,6 +843,7 @@ async def invoke_agent(
                 thread_id=thread_id,
                 request_id=request_id,
                 execution_id=execution_id,
+                allow_conservative_target_drift=conservative_resume,
             )
             if (
                 not new_request
@@ -867,16 +901,6 @@ async def invoke_agent(
                     if snapshot.next
                     else None
                 )
-            conservative_resume = _is_conservative_non_idempotent_resume(
-                persisted,
-                checkpoint_anchor=checkpoint_anchor,
-                pending_nodes=snapshot.next,
-                execution_id=execution_id,
-                new_request=new_request,
-                proposal=proposal,
-                original_approval=original_approval,
-                confirmation=confirmation,
-            )
             if not conservative_resume:
                 _validate_runtime_request_scope(request, runtime)
             _validate_current_read_access(

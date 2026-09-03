@@ -89,12 +89,14 @@ def _runtime(
     company_id: str = "comp_mineracao_andes",
     permissions: frozenset[str] = frozenset({"read"}),
     central_asset_id: str = "asset_G501",
+    configured_model_id: str = "mdl_vib_v3",
 ) -> ReadToolRuntime:
     return ReadToolRuntime.create(
         user_id=user_id,
         company_id=company_id,
         permissions=permissions,
         central_asset_id=central_asset_id,
+        configured_model_id=configured_model_id,
         client=client,
     )
 
@@ -605,6 +607,50 @@ def test_terminal_read_replay_revalidates_current_runtime_before_return(
     error = asyncio.run(scenario())
 
     assert error.code == expected_code
+    assert graph.values == persisted_values
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+@pytest.mark.parametrize(
+    ("runtime_overrides", "permissions"),
+    [
+        ({"central_asset_id": "asset_OTHER"}, frozenset({"read"})),
+        ({"central_asset_id": "asset_OTHER"}, frozenset()),
+        ({"configured_model_id": "mdl_other"}, frozenset({"read"})),
+        ({"configured_model_id": "mdl_other"}, frozenset()),
+    ],
+)
+def test_terminal_read_replay_binds_hidden_target_and_model_before_return(
+    runtime_overrides: dict[str, str],
+    permissions: frozenset[str],
+):
+    state_data = _terminal_read_state().model_dump(mode="python")
+    state_data["request"]["asset_id"] = None
+    state = AgentState.model_validate(state_data)
+    persisted_values = state.model_dump(mode="json")
+    graph = _RecordingGraph(persisted_values)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(asset_id=None),
+                    runtime=_runtime(
+                        client,
+                        permissions=permissions,
+                        **runtime_overrides,
+                    ),
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_hidden_read_scope_recheck",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == "TRUSTED_WRITE_CONTEXT_DRIFT"
     assert graph.values == persisted_values
     assert graph.as_node is None
     assert graph.invoke_config is None

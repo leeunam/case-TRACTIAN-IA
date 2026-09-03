@@ -297,11 +297,15 @@ def _build_planner_graph(saver: object, model: BaseChatModel):
     )
 
 
-def _request(*, message: str = "Consulte o cadastro deste ativo.") -> SupportRequest:
+def _request(
+    *,
+    message: str = "Consulte o cadastro deste ativo.",
+    asset_id: str | None = "asset_G501",
+) -> SupportRequest:
     return SupportRequest(
         case_id="case_tkt_inv_04",
         ticket_id="TKT-INV-04",
-        asset_id="asset_G501",
+        asset_id=asset_id,
         message=message,
         identity=Identity(
             user_id="usr_pedro",
@@ -347,6 +351,8 @@ async def _start_human_review(
     terminal_decision=None,
     step_limit=None,
     thread_id="thread_review_boundaries",
+    support_request=None,
+    selector_responses=None,
 ):
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -361,18 +367,22 @@ async def _start_human_review(
     )
     planner_model = _ScriptedPlannerModel(
         selector_responses=(
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "get_asset",
-                        "args": {"asset_id": "asset_G501"},
-                        "id": "external_review_call",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(content="done"),
+            (
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "get_asset",
+                            "args": {"asset_id": "asset_G501"},
+                            "id": "external_review_call",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="done"),
+            )
+            if selector_responses is None
+            else selector_responses
         ),
         terminal_responses=(terminal_decision,),
     )
@@ -396,7 +406,7 @@ async def _start_human_review(
         )
         waiting = await invoke_agent(
             graph,
-            request=_request(),
+            request=_request() if support_request is None else support_request,
             runtime=runtime,
             thread_id=thread_id,
             request_id="req_review_boundaries",
@@ -1382,7 +1392,9 @@ def test_new_request_closes_expired_review_before_starting_fresh_work(
             execution_id="exec_review_permission_drift",
             trusted_write_context=waiting.trusted_write_context,
         )
-        assert drifted.release_gate is None
+        assert drifted.release_gate == waiting.review_request.gate_basis
+        assert drifted.review_continuation is not None
+        assert drifted.review_continuation.phase == "pre_judgment"
         assert AgentState.model_validate_json(drifted.model_dump_json()) == drifted
         for field, value in (
             ("permissions", ["read"]),
@@ -1395,8 +1407,12 @@ def test_new_request_closes_expired_review_before_starting_fresh_work(
         ):
             forged_drift = drifted.model_dump(mode="json")
             forged_drift[field] = value
-            with pytest.raises(ValidationError, match="gate suspenso"):
+            with pytest.raises(ValidationError):
                 AgentState.model_validate(forged_drift)
+        forged_decision = drifted.model_dump(mode="json")
+        forged_decision["decision"] = AgentDecision.ACT.value
+        with pytest.raises(ValidationError, match="decisão da revisão"):
+            AgentState.model_validate(forged_decision)
         old_review_id = waiting.review_request.review_id
         expired_at = waiting.review_request.expires_at
         monkeypatch.setattr(graph_module, "_utc_now", lambda: expired_at)
@@ -1599,6 +1615,111 @@ def test_new_request_closes_expired_review_before_starting_fresh_work(
     assert fresh.review_request is not None
     assert fresh.review_request.review_id != old_review_id
     assert len(requests) == 2
+
+
+@pytest.mark.parametrize("permissions", [frozenset({"read"}), frozenset()])
+@pytest.mark.parametrize(
+    "runtime_overrides",
+    [
+        {"central_asset_id": "asset_OTHER"},
+        {"configured_model_id": "mdl_other"},
+    ],
+)
+def test_pending_review_with_hidden_target_rejects_runtime_drift_before_expiry(
+    tmp_path,
+    monkeypatch,
+    runtime_overrides,
+    permissions,
+):
+    created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
+    monkeypatch.setattr(entrypoint_module, "_utc_now", lambda: created_at)
+    requests: list[httpx.Request] = []
+
+    async def scenario():
+        checkpoint_path = tmp_path / "hidden-review-scope.sqlite3"
+        waiting, runtime, client, planner_model, writer_model = (
+            await _start_human_review(
+                checkpoint_path,
+                requests,
+                support_request=_request(asset_id=None),
+                selector_responses=(AIMessage(content="done"),),
+            )
+        )
+        assert waiting.review_request is not None
+        expires_at = waiting.review_request.expires_at
+        monkeypatch.setattr(graph_module, "_utc_now", lambda: expires_at)
+        monkeypatch.setattr(entrypoint_module, "_utc_now", lambda: expires_at)
+        wrong_runtime = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=permissions,
+            central_asset_id=runtime_overrides.get(
+                "central_asset_id", "asset_G501"
+            ),
+            configured_model_id=runtime_overrides.get(
+                "configured_model_id", "mdl_vib_v3"
+            ),
+            client=client,
+        )
+        try:
+            async with open_checkpointer(checkpoint_path) as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=Writer(writer_model),
+                )
+                before = await graph.aget_state(
+                    {"configurable": {"thread_id": waiting.thread_id}}
+                )
+                before_json = json.dumps(before.values, sort_keys=True)
+                with pytest.raises(AgentInvocationProtocolError) as denied:
+                    await invoke_agent(
+                        graph,
+                        request=_request(asset_id=None),
+                        runtime=wrong_runtime,
+                        thread_id=waiting.thread_id,
+                        request_id=waiting.request_id,
+                        execution_id="exec_hidden_scope_denied",
+                        review_reply=ReviewRejectReply(
+                            review_id=waiting.review_request.review_id,
+                            operation="reject",
+                        ),
+                        reviewer=ReviewerIdentity(
+                            reviewer_id="reviewer_hidden_scope",
+                            company_id="comp_mineracao_andes",
+                            permission="review",
+                        ),
+                    )
+                after = await graph.aget_state(
+                    {"configurable": {"thread_id": waiting.thread_id}}
+                )
+                expired = await invoke_agent(
+                    graph,
+                    request=_request(asset_id=None),
+                    runtime=runtime,
+                    thread_id=waiting.thread_id,
+                    request_id=waiting.request_id,
+                    execution_id="exec_hidden_scope_valid",
+                    review_reply=ReviewRejectReply(
+                        review_id=waiting.review_request.review_id,
+                        operation="reject",
+                    ),
+                    reviewer=ReviewerIdentity(
+                        reviewer_id="reviewer_hidden_scope",
+                        company_id="comp_mineracao_andes",
+                        permission="review",
+                    ),
+                )
+            return denied.value, before_json, after, expired
+        finally:
+            await client.aclose()
+
+    denied, before_json, after, expired = asyncio.run(scenario())
+    assert denied.code == "TRUSTED_WRITE_CONTEXT_DRIFT"
+    assert json.dumps(after.values, sort_keys=True) == before_json
+    assert expired.review_expiry is not None
+    assert expired.review_expiry.expired_at == expired.review_request.expires_at
 
 
 def test_human_edit_preserves_selected_order_and_releases_through_gate(
@@ -2087,6 +2208,23 @@ def test_crash_after_review_audit_with_revoked_read_regates_without_duplicate(
                 )
                 assert audited.review_audit is not None
                 assert audited.permissions == frozenset({"read"})
+                drifted_after_audit = audited.continue_with(
+                    request=_request(),
+                    identity=runtime.identity,
+                    permissions=frozenset(),
+                    request_id=audited.request_id,
+                    execution_id="exec_post_audit_drift_probe",
+                    trusted_write_context=audited.trusted_write_context,
+                )
+                assert drifted_after_audit.release_gate == (
+                    audited.review_request.gate_basis
+                )
+                assert drifted_after_audit.review_continuation is not None
+                assert drifted_after_audit.review_continuation.phase == "post_audit"
+                forged_decision = drifted_after_audit.model_dump(mode="json")
+                forged_decision["decision"] = AgentDecision.ACT.value
+                with pytest.raises(ValidationError, match="decisão da revisão"):
+                    AgentState.model_validate(forged_decision)
                 forged_audited = audited.model_dump(mode="json")
                 forged_audited["release_gate"] = None
                 with pytest.raises(ValidationError, match="gate suspenso"):
@@ -2224,6 +2362,11 @@ def test_planner_rejects_coerced_rotation_in_raw_read_artifact(
                 case_id=request.case_id,
                 company_id=runtime.identity.company_id,
                 user_id=runtime.identity.user_id,
+            ),
+            trusted_write_context=TrustedWriteContext(
+                central_asset_id=runtime.central_asset_id,
+                current_case_id=request.case_id,
+                configured_model_id=runtime.configured_model_id,
             ),
             step_limit=20,
         )
@@ -2372,7 +2515,7 @@ def test_each_planner_proposal_runs_through_tool_node_without_effect(
             request_id=request_id,
             thread_id=f"thread_{tool_name}",
             execution_id=f"exec_{tool_name}",
-            thread_scope=ThreadScope(
+                thread_scope=ThreadScope(
                 thread_id=f"thread_{tool_name}",
                 case_id=request.case_id,
                 company_id=runtime.identity.company_id,
@@ -2622,6 +2765,11 @@ def test_planner_cycle_resumes_from_each_new_nonterminal_node(
                 case_id=request.case_id,
                 company_id=runtime.identity.company_id,
                 user_id=runtime.identity.user_id,
+            ),
+            trusted_write_context=TrustedWriteContext(
+                central_asset_id=runtime.central_asset_id,
+                current_case_id=request.case_id,
+                configured_model_id=runtime.configured_model_id,
             ),
             step_limit=20,
         )
@@ -3523,6 +3671,11 @@ def test_writer_format_repair_survives_checkpoint_without_repeating_planner(
                 case_id=request.case_id,
                 company_id=runtime.identity.company_id,
                 user_id=runtime.identity.user_id,
+            ),
+            trusted_write_context=TrustedWriteContext(
+                central_asset_id=runtime.central_asset_id,
+                current_case_id=request.case_id,
+                configured_model_id=runtime.configured_model_id,
             ),
             step_limit=24,
         )

@@ -1027,6 +1027,95 @@ class ReviewExpiry(ReviewStateModel):
         return self
 
 
+class ReviewContinuation(ReviewStateModel):
+    """Marca drift de permissão sem apagar o gate-base imutável."""
+
+    review_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    phase: Literal["pre_judgment", "post_audit"]
+    basis_permissions: tuple[Permission, ...]
+    current_permissions: tuple[Permission, ...]
+    subject_decision: AgentDecision
+    reviewed_draft_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256:v1:[0-9a-f]{64}$",
+    )
+    resolution_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256:v1:[0-9a-f]{64}$",
+    )
+    audit_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256:v1:[0-9a-f]{64}$",
+    )
+
+    @field_validator("basis_permissions", "current_permissions")
+    @classmethod
+    def _require_sorted_permissions(
+        cls, value: tuple[Permission, ...]
+    ) -> tuple[Permission, ...]:
+        if value != tuple(sorted(set(value))):
+            raise ValueError("permissões da continuação devem ser únicas e ordenadas")
+        return value
+
+    @model_validator(mode="after")
+    def _bind_phase_payload(self) -> ReviewContinuation:
+        digests = (
+            self.reviewed_draft_digest,
+            self.resolution_digest,
+            self.audit_digest,
+        )
+        if (
+            self.phase == "pre_judgment"
+            and any(digest is not None for digest in digests)
+        ) or (
+            self.phase == "post_audit"
+            and not all(digest is not None for digest in digests)
+        ):
+            raise ValueError("fase da continuação diverge dos artefatos")
+        if self.basis_permissions == self.current_permissions:
+            raise ValueError("continuação exige drift real de permissão")
+        return self
+
+
+def build_review_continuation(
+    *,
+    request: ReviewRequest,
+    permissions: frozenset[Permission],
+    reviewed_draft: ReviewedDraft | None,
+    resolution: ReviewResolution | None,
+    audit: ReviewAudit | None,
+) -> ReviewContinuation | None:
+    """Deriva o marcador estrito da única continuação revisável permitida."""
+
+    basis_permissions = tuple(request.basis_permissions)
+    current_permissions = tuple(sorted(permissions))
+    if current_permissions == basis_permissions:
+        return None
+    artifacts = (reviewed_draft, resolution, audit)
+    if all(artifact is None for artifact in artifacts):
+        phase: Literal["pre_judgment", "post_audit"] = "pre_judgment"
+    elif all(artifact is not None for artifact in artifacts):
+        phase = "post_audit"
+    else:
+        raise ValueError("continuação de revisão possui artefatos parciais")
+    return ReviewContinuation(
+        review_id=request.review_id,
+        phase=phase,
+        basis_permissions=basis_permissions,
+        current_permissions=current_permissions,
+        subject_decision=request.subject_decision,
+        reviewed_draft_digest=(
+            _review_contract_digest(reviewed_draft)
+            if reviewed_draft is not None
+            else None
+        ),
+        resolution_digest=(
+            _review_contract_digest(resolution) if resolution is not None else None
+        ),
+        audit_digest=_review_contract_digest(audit) if audit is not None else None,
+    )
+
+
 class ReviewStatus(str, Enum):
     NOT_REQUIRED = "not_required"
     REQUIRED = "required"
@@ -1447,6 +1536,7 @@ class AgentState(FrozenStateModel):
     reviewed_draft: ReviewedDraft | None = None
     review_audit: ReviewAudit | None = None
     review_expiry: ReviewExpiry | None = None
+    review_continuation: ReviewContinuation | None = None
 
     def has_coherent_terminal_result(self) -> bool:
         """Confere a matriz fechada dos resultados terminais persistidos."""
@@ -1695,6 +1785,7 @@ class AgentState(FrozenStateModel):
         "reviewed_draft",
         "review_audit",
         "review_expiry",
+        "review_continuation",
         mode="before",
     )
     @classmethod
@@ -1711,6 +1802,7 @@ class AgentState(FrozenStateModel):
             "reviewed_draft": ReviewedDraft,
             "review_audit": ReviewAudit,
             "review_expiry": ReviewExpiry,
+            "review_continuation": ReviewContinuation,
         }[info.field_name]
         return model.model_validate_json(
             json.dumps(
@@ -1908,6 +2000,7 @@ class AgentState(FrozenStateModel):
                     self.review_resolution,
                     self.review_audit,
                     self.review_expiry,
+                    self.review_continuation,
                 )
             ):
                 raise ValueError("resultado de revisão exige solicitação persistida")
@@ -1998,18 +2091,31 @@ class AgentState(FrozenStateModel):
                 reason=f"human_review:{self.review_audit.operation.value}",
             )
         )
-        cleared_gate_is_canonical = (
-            self.release_gate is None
-            and permission_drift
-            and (
-                pre_judgment_continuation or post_judgment_continuation
-            )
-        )
-        if not second_gate_completed and (
-            self.release_gate != request.gate_basis
-            and not cleared_gate_is_canonical
-        ):
+        if not second_gate_completed and self.release_gate != request.gate_basis:
             raise ValueError("gate suspenso diverge da base da revisão")
+        if self.final_result is None and self.decision is not request.subject_decision:
+            raise ValueError("decisão da revisão diverge do sujeito persistido")
+        if (
+            post_judgment_continuation
+            and self.reviewed_draft is not None
+            and self.reviewed_draft.decision is not request.subject_decision
+        ):
+            raise ValueError("draft revisado diverge da decisão da revisão")
+        expected_continuation = None
+        if (
+            self.final_result is None
+            and permission_drift
+            and (pre_judgment_continuation or post_judgment_continuation)
+        ):
+            expected_continuation = build_review_continuation(
+                request=request,
+                permissions=self.permissions,
+                reviewed_draft=self.reviewed_draft,
+                resolution=self.review_resolution,
+                audit=self.review_audit,
+            )
+        if self.review_continuation != expected_continuation:
+            raise ValueError("continuação da revisão diverge do drift canônico")
         if self.review_audit is not None and self.review_expiry is not None:
             raise ValueError("auditoria e expiração são mutuamente exclusivas")
         resolution = self.review_resolution
@@ -2073,6 +2179,11 @@ class AgentState(FrozenStateModel):
     def _validate_release_attestation(self) -> None:
         """Recalcula o gate e a resposta; checkpoint não pode inventar prosa."""
         if self.release_gate is None:
+            return
+        if self.review_request is not None and self.final_result is None:
+            # Enquanto a revisão está pendente ou auditada, o gate no topo é
+            # deliberadamente a base original, já recalculada acima com as
+            # permissões históricas da solicitação de revisão.
             return
         if self.resume_anchor is ResumeAnchor.AWAIT_HUMAN_REVIEW:
             return
@@ -2298,11 +2409,16 @@ class AgentState(FrozenStateModel):
             same_request
             and self.review_request is not None
             and self.final_result is None
-            and permissions != self.permissions
         ):
-            # O atestado anterior é apenas a base imutável da revisão. A
-            # permissão atual será atestada novamente depois do julgamento.
-            data["release_gate"] = None
+            # O gate original continua imutável. O marcador derivado distingue
+            # o drift antes do julgamento daquele já vinculado à auditoria.
+            data["review_continuation"] = build_review_continuation(
+                request=self.review_request,
+                permissions=permissions,
+                reviewed_draft=self.reviewed_draft,
+                resolution=self.review_resolution,
+                audit=self.review_audit,
+            )
         if not same_request:
             history = self.ledger_history
             if self.ledger.request_id is not None:
@@ -2328,6 +2444,7 @@ class AgentState(FrozenStateModel):
                 reviewed_draft=None,
                 review_audit=None,
                 review_expiry=None,
+                review_continuation=None,
                 ledger=EvidenceLedger(),
                 ledger_history=history,
             )

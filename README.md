@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável e checkpointer SQLite de desenvolvimento. Em 03/09/2026, `make test` passou com 99 testes da API e 1.681 do agente (1.780 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 9 estão concluídas. O grafo atual ainda não é um agente de produção: Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável e checkpointer SQLite de desenvolvimento. Em 03/09/2026, `make test` passou com 99 testes da API e 1.689 do agente (1.788 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 9 estão concluídas. O grafo atual ainda não é um agente de produção: Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -79,9 +79,11 @@ revisáveis; checkpoints legados sem essa reserva terminam por contrato próprio
 No vencimento, a expiração precede a semântica da operação; uma nova solicitação
 encerra primeiro a revisão vencida, sem reexecutar trabalho antigo. Antes de
 qualquer mutação do checkpoint, a fronteira vincula novamente thread, caso,
-empresa, pessoa, alvo, request e execução ao escopo persistido. A remoção
-temporária do gate-base só representa drift real de permissão no estado exato
-de continuação anterior ao segundo gate.
+empresa, pessoa, alvo central, modelo configurado, request e execução ao escopo
+persistido, mesmo quando a request não declarou ativo. O gate-base original
+permanece imutável durante drift de permissão; um contrato estrito derivado
+distingue a continuação anterior ao julgamento daquela posterior à auditoria e
+é removido depois do segundo gate.
 
 O **ledger de evidências** associa fatos às fontes consultadas no estado da execução. Ele recebe somente observações de leitura validadas e recibos tipados de intenções terminais; texto livre de LLM, proposals e mensagens de recibo não viram fatos. O Logfire receberá traces e métricas para consulta humana e operação; ele não será o banco principal do ledger nem uma fonte que o agente consulta durante o atendimento. Logfire ainda não está implementado.
 
