@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from langgraph.runtime import Runtime
+from pydantic import ValidationError
 
 import tractian_agent.graph as graph_module
 from tractian_agent.checkpoint import open_checkpointer
@@ -22,7 +23,7 @@ from tractian_agent.contracts import (
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
 from tractian_agent.graph import build_agent_graph
 from tractian_agent.state import AgentDecision, AgentState
-from tractian_agent.tools.runtime import WriteToolRuntime
+from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.write_contracts import (
     ConfirmationReply,
     EscalateCaseIntentScope,
@@ -38,8 +39,10 @@ from tractian_agent.write_policy import (
     RequestModelRetrainingProposal,
     RequestSpecialistAnalysisProposal,
     TrustedActionApproval,
+    TrustedWriteContext,
     UpdateAssetCriticalityProposal,
     WriteMaterialParameters,
+    canonical_write_payload_hash,
 )
 
 
@@ -220,14 +223,15 @@ def _runtime(
     )
 
 
-def _canonical_hash(body: dict[str, object]) -> str:
-    encoded = json.dumps(
-        body,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return f"sha256:v1:{hashlib.sha256(encoded).hexdigest()}"
+def _canonical_hash(case: ActionCase) -> str:
+    return canonical_write_payload_hash(
+        case.proposal,
+        trusted_context=TrustedWriteContext(
+            central_asset_id="asset_M101",
+            current_case_id="case_tkt_exe_12",
+            configured_model_id="mdl_vib_v3",
+        ),
+    )
 
 
 def _success_handler(
@@ -340,7 +344,7 @@ def test_original_approval_executes_each_non_idempotent_action_once(
     assert state.decision is case.final_decision
     assert intent.status is IntentStatus.COMPLETED
     assert type(intent.scope) is case.scope_type
-    assert intent.payload_hash == _canonical_hash(case.body)
+    assert intent.payload_hash == _canonical_hash(case)
     assert intent.prepared_execution_id == f"exec_allowed_{case.slug}"
     assert intent.idempotency_key is None
     assert intent.expires_at is None
@@ -548,7 +552,7 @@ def test_interrupt_approve_uses_persisted_scope_and_flat_prompt(
         "action": case.approval.action,
         "target_id": case.target_id,
         "justification": JUSTIFICATION,
-        "payload_hash": _canonical_hash(case.body),
+        "payload_hash": _canonical_hash(case),
     }
     if case.slug == "criticality":
         expected_prompt["criticality"] = "critical"
@@ -907,8 +911,11 @@ def test_same_execution_revalidation_fails_before_operation_with_real_checkpoint
     requests: list[httpx.Request] = []
     original_prepare = graph_module._prepare_intent
 
-    def prepare_with_drift(state: AgentState) -> dict[str, object]:
-        prepared = AgentState.model_validate(original_prepare(state))
+    def prepare_with_drift(
+        state: AgentState,
+        runtime: Runtime[ReadToolRuntime],
+    ) -> dict[str, object]:
+        prepared = AgentState.model_validate(original_prepare(state, runtime))
         intent = prepared.intents[-1]
         intent_data = intent.model_dump(mode="python")
         state_data = prepared.model_dump(mode="python")
@@ -942,7 +949,7 @@ def test_same_execution_revalidation_fails_before_operation_with_real_checkpoint
             async with open_checkpointer(
                 tmp_path / f"checkpoints-{case.slug}-{drift}.sqlite3"
             ) as saver:
-                return await invoke_agent(
+                invocation = invoke_agent(
                     build_agent_graph(saver),
                     request=_request(),
                     runtime=runtime,
@@ -952,10 +959,19 @@ def test_same_execution_revalidation_fails_before_operation_with_real_checkpoint
                     proposal=case.proposal,
                     original_approval=case.approval,
                 )
+                if drift in {"scope", "hash"}:
+                    with pytest.raises(ValidationError) as error:
+                        await invocation
+                    return error.value
+                return await invocation
         finally:
             await runtime.client.aclose()
 
     state = asyncio.run(scenario())
+    if drift in {"scope", "hash"}:
+        assert "ciclo de escrita" in str(state)
+        assert requests == []
+        return
     intent = state.intents[0]
 
     assert intent.status is IntentStatus.FAILED
@@ -979,21 +995,24 @@ def test_same_execution_trusted_target_drift_fails_before_operation(
 ):
     requests: list[httpx.Request] = []
     original_prepare = graph_module._prepare_intent
-    runtime: WriteToolRuntime
+    write_runtime: WriteToolRuntime
 
-    def prepare_then_change_trusted_target(state: AgentState) -> dict[str, object]:
-        prepared = original_prepare(state)
+    def prepare_then_change_trusted_target(
+        state: AgentState,
+        runtime: Runtime[ReadToolRuntime],
+    ) -> dict[str, object]:
+        prepared = original_prepare(state, runtime)
         if case.slug in {"specialist", "criticality"}:
-            object.__setattr__(runtime, "central_asset_id", "asset_other")
+            object.__setattr__(write_runtime, "central_asset_id", "asset_other")
         elif case.slug == "retraining":
-            object.__setattr__(runtime, "configured_model_id", "mdl_other")
+            object.__setattr__(write_runtime, "configured_model_id", "mdl_other")
         else:
-            object.__setattr__(runtime, "current_case_id", "case_other")
+            object.__setattr__(write_runtime, "current_case_id", "case_other")
         return prepared
 
     async def scenario():
-        nonlocal runtime
-        runtime = _runtime(lambda request: requests.append(request), case)
+        nonlocal write_runtime
+        write_runtime = _runtime(lambda request: requests.append(request), case)
         try:
             monkeypatch.setattr(
                 graph_module,
@@ -1006,7 +1025,7 @@ def test_same_execution_trusted_target_drift_fails_before_operation(
                 return await invoke_agent(
                     build_agent_graph(saver),
                     request=_request(),
-                    runtime=runtime,
+                    runtime=write_runtime,
                     thread_id=f"thread_target_drift_{case.slug}",
                     request_id=f"req_target_drift_{case.slug}",
                     execution_id=f"exec_target_drift_{case.slug}",
@@ -1014,7 +1033,7 @@ def test_same_execution_trusted_target_drift_fails_before_operation(
                     original_approval=case.approval,
                 )
         finally:
-            await runtime.client.aclose()
+            await write_runtime.client.aclose()
 
     state = asyncio.run(scenario())
     intent = state.intents[0]
@@ -1433,7 +1452,7 @@ def test_permission_revoked_while_waiting_does_not_prepare_or_dispatch(
     assert requests == []
 
 
-def test_retraining_confirmation_keeps_persisted_model_when_runtime_changes(
+def test_retraining_confirmation_rejects_runtime_model_drift_before_resume(
     tmp_path: Path,
 ):
     case = ACTION_CASES[2]
@@ -1458,30 +1477,28 @@ def test_retraining_confirmation_keeps_persisted_model_when_runtime_changes(
                     execution_id="exec_model_waiting",
                     proposal=case.proposal,
                 )
-                denied = await invoke_agent(
-                    graph,
-                    request=_request(),
-                    runtime=changed_runtime,
-                    thread_id="thread_model_changed",
-                    request_id="req_model_changed",
-                    execution_id="exec_model_changed",
-                    confirmation=ConfirmationReply(
-                        intent_id=waiting.intents[0].intent_id,
-                        decision="approve",
-                    ),
-                )
-                return waiting, denied
+                with pytest.raises(AgentInvocationProtocolError) as exc_info:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=changed_runtime,
+                        thread_id="thread_model_changed",
+                        request_id="req_model_changed",
+                        execution_id="exec_model_changed",
+                        confirmation=ConfirmationReply(
+                            intent_id=waiting.intents[0].intent_id,
+                            decision="approve",
+                        ),
+                    )
+                return waiting, exc_info.value
         finally:
             await initial_runtime.client.aclose()
             await changed_runtime.client.aclose()
 
-    waiting, denied = asyncio.run(scenario())
+    waiting, error = asyncio.run(scenario())
 
     assert waiting.intents[0].scope.model_id == "mdl_vib_v3"
-    assert denied.approval is not None
-    assert denied.approval.target_id == "mdl_vib_v3"
-    assert denied.intents[0].status is IntentStatus.DENIED
-    assert denied.intents[0].prepared_execution_id is None
+    assert error.code == "TRUSTED_WRITE_CONTEXT_DRIFT"
     assert requests == []
 
 

@@ -67,9 +67,11 @@ from tractian_agent.write_policy import (
     ReprocessProposal,
     RequestModelRetrainingProposal,
     RequestSpecialistAnalysisProposal,
+    TrustedWriteContext,
     WritePolicyResult,
     UpdateAssetCriticalityProposal,
     TrustedActionApproval,
+    canonical_write_payload_hash,
 )
 from tractian_agent.writer import Writer
 
@@ -780,6 +782,11 @@ def test_each_planner_proposal_runs_through_tool_node_without_effect(
     assert persisted.resume_anchor is ResumeAnchor.PLANNER_TOOL
     assert persisted.step_count == 3
     assert persisted.pending_proposal == expected
+    assert persisted.trusted_write_context == TrustedWriteContext(
+        central_asset_id="asset_G501",
+        current_case_id="case_tkt_inv_04",
+        configured_model_id="mdl_vib_v3",
+    )
     assert persisted.tool_calls[-1].name == tool_name
     assert persisted.tool_observations == trusted_observations
     checkpoint_text = repr(snapshot.values)
@@ -1791,6 +1798,10 @@ def test_writer_failure_stops_safely_without_hidden_retry(
 
 def test_write_policy_never_creates_a_second_intent_for_request_id(tmp_path):
     request = _request(message="Atualize a criticidade do ativo central.")
+    existing_proposal = ReprocessProposal(
+        analysis_id="an_historical",
+        justification="Intenção terminal já registrada para esta solicitação.",
+    )
     existing_intent = WriteIntent(
         intent_id="intent_existing_request",
         request_id="req_duplicate_intent",
@@ -1802,7 +1813,7 @@ def test_write_policy_never_creates_a_second_intent_for_request_id(tmp_path):
             analysis_id="an_historical",
             justification="Intenção terminal já registrada para esta solicitação.",
         ),
-        payload_hash="sha256:v1:" + "b" * 64,
+        payload_hash=canonical_write_payload_hash(existing_proposal),
         decision=WritePolicyResult(
             decision=PolicyDecision.DENY,
             reason=PolicyReason.MISSING_PERMISSION,
@@ -1840,10 +1851,12 @@ def test_write_policy_never_creates_a_second_intent_for_request_id(tmp_path):
                 user_id=request.identity.user_id,
             ),
             step_limit=5,
-            pending_proposal=UpdateAssetCriticalityProposal(
-                criticality="critical",
-                justification="O impacto operacional exige criticidade máxima.",
+            trusted_write_context=TrustedWriteContext(
+                central_asset_id=request.asset_id,
+                current_case_id=request.case_id,
+                configured_model_id=runtime.configured_model_id,
             ),
+            pending_proposal=existing_proposal,
             intents=(existing_intent,),
         )
         config = {"configurable": {"thread_id": state.thread_id}}
@@ -2090,6 +2103,11 @@ def test_resume_preserves_write_runtime_boundary_for_original_approval(tmp_path)
                 case_id=request.case_id,
                 company_id=write_runtime.identity.company_id,
                 user_id=write_runtime.identity.user_id,
+            ),
+            trusted_write_context=TrustedWriteContext(
+                central_asset_id=write_runtime.central_asset_id,
+                current_case_id=write_runtime.current_case_id,
+                configured_model_id=write_runtime.configured_model_id,
             ),
             step_limit=20,
             approval=approval,

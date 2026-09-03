@@ -13,8 +13,145 @@ from tractian_agent.write_policy import (
     TrustedWriteContext,
     UpdateAssetCriticalityProposal,
     WriteMaterialParameters,
+    canonical_write_payload_hash,
     evaluate_write_policy,
 )
+
+
+@pytest.mark.parametrize(
+    ("proposal", "trusted_context", "changed_proposal", "changed_context"),
+    [
+        (
+            ReprocessProposal(
+                analysis_id="an_9906",
+                justification="Há dados novos para reprocessar esta análise.",
+            ),
+            TrustedWriteContext(
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+            ),
+            ReprocessProposal(
+                analysis_id="an_9910",
+                justification="Há dados novos para reprocessar esta análise.",
+            ),
+            None,
+        ),
+        (
+            RequestSpecialistAnalysisProposal(
+                analysis_id="an_9906",
+                justification="A limitação registrada exige análise especializada.",
+            ),
+            TrustedWriteContext(
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+            ),
+            RequestSpecialistAnalysisProposal(
+                analysis_id="an_9910",
+                justification="A limitação registrada exige análise especializada.",
+            ),
+            None,
+        ),
+        (
+            UpdateAssetCriticalityProposal(
+                criticality="high",
+                justification="O impacto operacional exige criticidade mais alta.",
+            ),
+            TrustedWriteContext(
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+            ),
+            UpdateAssetCriticalityProposal(
+                criticality="critical",
+                justification="O impacto operacional exige criticidade mais alta.",
+            ),
+            TrustedWriteContext(
+                central_asset_id="asset_G502",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+            ),
+        ),
+        (
+            RequestModelRetrainingProposal(
+                justification="Erros sistemáticos sustentam solicitar novo treinamento.",
+            ),
+            TrustedWriteContext(
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+            ),
+            None,
+            TrustedWriteContext(
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v4",
+            ),
+        ),
+        (
+            EscalateCaseProposal(
+                justification="O caso ultrapassa o atendimento remoto disponível.",
+            ),
+            TrustedWriteContext(
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+            ),
+            None,
+            TrustedWriteContext(
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_05",
+                configured_model_id="mdl_vib_v3",
+            ),
+        ),
+    ],
+)
+def test_structural_hash_binds_each_action_target_and_material_body(
+    proposal,
+    trusted_context,
+    changed_proposal,
+    changed_context,
+):
+    original_hash = canonical_write_payload_hash(
+        proposal,
+        trusted_context=trusted_context,
+    )
+
+    changed_hash = canonical_write_payload_hash(
+        proposal if changed_proposal is None else changed_proposal,
+        trusted_context=(
+            trusted_context if changed_context is None else changed_context
+        ),
+    )
+
+    assert original_hash != changed_hash
+
+
+def test_structural_hash_distinguishes_action_kind_for_the_same_target():
+    context = TrustedWriteContext(
+        central_asset_id="asset_G501",
+        current_case_id="case_tkt_inv_04",
+        configured_model_id="mdl_vib_v3",
+    )
+    justification = "A mesma análise exige uma ação industrial justificada."
+
+    reprocess_hash = canonical_write_payload_hash(
+        ReprocessProposal(
+            analysis_id="an_9906",
+            justification=justification,
+        ),
+        trusted_context=context,
+    )
+    specialist_hash = canonical_write_payload_hash(
+        RequestSpecialistAnalysisProposal(
+            analysis_id="an_9906",
+            justification=justification,
+        ),
+        trusted_context=context,
+    )
+
+    assert reprocess_hash != specialist_hash
 
 
 def test_allows_criticality_update_only_for_the_exact_trusted_scope():

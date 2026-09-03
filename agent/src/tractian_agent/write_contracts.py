@@ -165,7 +165,11 @@ def proposal_matches_intent_scope(
     if (
         proposal.action != scope.action
         or proposal.justification != scope.justification
-        or canonical_write_payload_hash(proposal) != payload_hash
+        or canonical_write_payload_hash(
+            proposal,
+            trusted_context=trusted_context,
+        )
+        != payload_hash
     ):
         return False
     expected_scope_type = {

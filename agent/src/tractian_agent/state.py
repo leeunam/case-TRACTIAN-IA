@@ -1252,6 +1252,21 @@ class AgentState(FrozenStateModel):
             )
         ):
             raise ValueError("escopo confiável diverge da solicitação")
+        write_anchors = {
+            ResumeAnchor.WRITE_POLICY,
+            ResumeAnchor.CONFIRMATION_GATE,
+            ResumeAnchor.PREPARE_INTENT,
+            ResumeAnchor.EXECUTE_ACTION,
+        }
+        if self.trusted_write_context is None and (
+            self.pending_proposal is not None
+            or self.approval is not None
+            or bool(self.intents)
+            or self.resume_anchor in write_anchors
+        ):
+            raise ValueError(
+                "o ciclo de escrita exige contexto confiável persistido"
+            )
         thread_intent_scope = (
             self.thread_scope.case_id,
             self.thread_scope.company_id,
@@ -1283,6 +1298,25 @@ class AgentState(FrozenStateModel):
         ]
         if len(active_request_ids) != len(set(active_request_ids)):
             raise ValueError("cada request_id aceita no máximo uma intenção ativa")
+        current_intents = tuple(
+            intent
+            for intent in self.intents
+            if intent.request_id == self.request_id
+        )
+        if self.pending_proposal is not None and current_intents:
+            if (
+                len(current_intents) != 1
+                or not _proposal_matches_persisted_intent(
+                    self.pending_proposal,
+                    current_intents[0].scope,
+                    request=self.request,
+                    payload_hash=current_intents[0].payload_hash,
+                    trusted_context=self.trusted_write_context,
+                )
+            ):
+                raise ValueError(
+                    "ciclo de escrita diverge da assinatura canônica persistida"
+                )
         if self.step_count > self.step_limit:
             raise ValueError("contador de passos excede o orçamento")
         if self.planner_usage.request_id != self.request_id:

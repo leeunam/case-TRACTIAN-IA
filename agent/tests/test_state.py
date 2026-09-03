@@ -928,6 +928,7 @@ def test_terminal_state_rejects_incompatible_write_intent_or_execution_result():
     denied_data = _intent().model_dump(mode="python")
     denied_data.update(
         request_id="req_01",
+        payload_hash=canonical_write_payload_hash(proposal),
         status=IntentStatus.DENIED,
         decision=WritePolicyResult(
             decision=PolicyDecision.DENY,
@@ -937,6 +938,7 @@ def test_terminal_state_rejects_incompatible_write_intent_or_execution_result():
         expires_at=None,
         prepared_execution_id=None,
     )
+    denied_data["scope"]["justification"] = proposal.justification
     denied = WriteIntent.model_validate(denied_data)
     denial_state = _state(
         pending_proposal=proposal,
@@ -1014,7 +1016,14 @@ def test_terminal_execution_rejects_adulterated_effect_binding(tamper: str):
                 criticality="critical",
                 justification=proposal.justification,
             ),
-            payload_hash=canonical_write_payload_hash(proposal),
+            payload_hash=canonical_write_payload_hash(
+                proposal,
+                trusted_context=TrustedWriteContext(
+                    central_asset_id="asset_G501",
+                    current_case_id="case_tkt_inv_04",
+                    configured_model_id="mdl_vib_v3",
+                ),
+            ),
             decision=WritePolicyResult(
                 decision=PolicyDecision.ALLOW,
                 reason=PolicyReason.AUTHORIZED,
@@ -1066,8 +1075,86 @@ def test_terminal_execution_rejects_adulterated_effect_binding(tamper: str):
         else:
             wire["intents"][0]["payload_hash"] = "sha256:v1:" + "b" * 64
 
-    with pytest.raises(ValidationError, match="terminal diverge"):
+    with pytest.raises(ValidationError, match="ciclo de escrita|terminal diverge"):
         AgentState.model_validate(wire)
+
+
+def test_prepared_write_state_requires_the_persisted_trusted_context():
+    proposal = ReprocessProposal(
+        analysis_id="an_9906",
+        justification="O reprocesso autorizado deve conservar seu escopo confiável.",
+    )
+    intent_data = _intent().model_dump(mode="python")
+    intent_data.update(
+        request_id="req_01",
+        payload_hash=canonical_write_payload_hash(proposal),
+        status=IntentStatus.PREPARED,
+        prepared_execution_id="exec_01",
+    )
+    intent_data["scope"]["justification"] = proposal.justification
+    intent = WriteIntent.model_validate(intent_data)
+
+    with pytest.raises(ValidationError, match="contexto confiável"):
+        _state(
+            trusted_write_context=None,
+            pending_proposal=proposal,
+            intents=(intent,),
+            resume_anchor=ResumeAnchor.PREPARE_INTENT,
+        )
+
+
+@pytest.mark.parametrize(
+    "proposal",
+    [
+        ReprocessProposal(
+            analysis_id="an_9906",
+            justification="O reprocesso autorizado deve conservar o alvo assinado.",
+        ),
+        RequestSpecialistAnalysisProposal(
+            analysis_id="an_9906",
+            justification="A análise especializada deve conservar o alvo assinado.",
+        ),
+    ],
+)
+def test_write_lifecycle_rejects_synchronized_target_tamper_with_old_hash(
+    proposal,
+):
+    intent_data = _intent().model_dump(mode="python")
+    intent_data.update(
+        request_id="req_01",
+        payload_hash=canonical_write_payload_hash(proposal),
+        status=IntentStatus.PREPARED,
+        prepared_execution_id="exec_01",
+    )
+    intent_data["scope"].update(
+        action=proposal.action,
+        analysis_id=proposal.analysis_id,
+        justification=proposal.justification,
+    )
+    if isinstance(proposal, RequestSpecialistAnalysisProposal):
+        intent_data["scope"] = {
+            **intent_data["scope"],
+            "action": proposal.action,
+        }
+        intent_data["idempotency_key"] = None
+        intent_data["expires_at"] = None
+    state = _state(
+        pending_proposal=proposal,
+        approval=TrustedActionApproval(
+            action=proposal.action,
+            target_id=proposal.analysis_id,
+            source=ApprovalSource.ORIGINAL_REQUEST,
+        ),
+        intents=(WriteIntent.model_validate(intent_data),),
+        resume_anchor=ResumeAnchor.PREPARE_INTENT,
+    )
+    tampered = state.model_dump(mode="json")
+    tampered["pending_proposal"]["analysis_id"] = "an_9910"
+    tampered["approval"]["target_id"] = "an_9910"
+    tampered["intents"][0]["scope"]["analysis_id"] = "an_9910"
+
+    with pytest.raises(ValidationError, match="ciclo de escrita"):
+        AgentState.model_validate(tampered)
 
 
 def test_new_request_resets_request_bound_planner_progress_and_anchor():
@@ -1382,6 +1469,11 @@ def test_new_request_preserves_audit_and_intents_but_resets_transient_state():
         request_id="req_02",
         execution_id="exec_02",
         step_limit=7,
+        trusted_write_context=TrustedWriteContext(
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            configured_model_id="mdl_vib_v3",
+        ),
     )
 
     assert continued.messages == state.messages

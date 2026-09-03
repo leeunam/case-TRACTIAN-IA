@@ -58,11 +58,12 @@ def _request(
     message: str = "Consulte o estado deste ativo.",
     user_id: str = "usr_pedro",
     company_id: str = "comp_mineracao_andes",
+    asset_id: str | None = "asset_G501",
 ) -> SupportRequest:
     return SupportRequest(
         case_id="case_tkt_inv_04",
         ticket_id="TKT-INV-04",
-        asset_id="asset_G501",
+        asset_id=asset_id,
         message=message,
         identity=Identity(
             user_id=user_id,
@@ -120,7 +121,16 @@ def _initial_state(
     )
 
 
-def _denied_historical_intent(request_id: str) -> WriteIntent:
+def _denied_historical_intent(
+    request_id: str,
+    proposal: ReprocessProposal | None = None,
+) -> WriteIntent:
+    analysis_id = "an_historical" if proposal is None else proposal.analysis_id
+    justification = (
+        "Histórico terminal usado apenas para proveniência."
+        if proposal is None
+        else proposal.justification
+    )
     return WriteIntent(
         intent_id=f"intent_{request_id}",
         request_id=request_id,
@@ -129,10 +139,14 @@ def _denied_historical_intent(request_id: str) -> WriteIntent:
             case_id="case_tkt_inv_04",
             company_id="comp_mineracao_andes",
             user_id="usr_pedro",
-            analysis_id="an_historical",
-            justification="Histórico terminal usado apenas para proveniência.",
+            analysis_id=analysis_id,
+            justification=justification,
         ),
-        payload_hash="sha256:v1:" + "a" * 64,
+        payload_hash=(
+            "sha256:v1:" + "a" * 64
+            if proposal is None
+            else canonical_write_payload_hash(proposal)
+        ),
         decision=WritePolicyResult(
             decision=PolicyDecision.DENY,
             reason=PolicyReason.MISSING_PERMISSION,
@@ -192,13 +206,14 @@ def _terminal_planner_state() -> AgentState:
 
 def _terminal_denial_state() -> AgentState:
     state = _initial_state(step_limit=5)
+    proposal = ReprocessProposal(
+        analysis_id="an_historical",
+        justification="A política deve conservar a negação persistida.",
+    )
     values = state.model_dump(mode="python")
     values.update(
-        pending_proposal=ReprocessProposal(
-            analysis_id="an_historical",
-            justification="A política deve conservar a negação persistida.",
-        ),
-        intents=(_denied_historical_intent(state.request_id),),
+        pending_proposal=proposal,
+        intents=(_denied_historical_intent(state.request_id, proposal),),
         decision=AgentDecision.GUIDE,
         final_result=FinalResult(
             decision=AgentDecision.GUIDE,
@@ -515,6 +530,87 @@ def test_terminal_read_replay_revalidates_current_runtime_before_return(
     assert error.code == expected_code
     assert graph.values == persisted_values
     assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
+def test_terminal_write_replay_binds_hidden_asset_when_request_has_no_asset():
+    base = _terminal_execution_state()
+    state_data = base.model_dump(mode="python")
+    state_data["request"]["asset_id"] = None
+    state = AgentState.model_validate(state_data)
+    forged_data = state.model_dump(mode="python")
+    forged_data["trusted_write_context"]["central_asset_id"] = "asset_G502"
+    forged = AgentState.model_validate(forged_data)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            replayed = await invoke_agent(
+                _RecordingGraph(state.model_dump(mode="json")),
+                request=_request(asset_id=None),
+                runtime=runtime,
+                thread_id=state.thread_id,
+                request_id=state.request_id,
+                execution_id="exec_hidden_asset_replay",
+            )
+            forged_graph = _RecordingGraph(forged.model_dump(mode="json"))
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    forged_graph,
+                    request=_request(asset_id=None),
+                    runtime=runtime,
+                    thread_id=forged.thread_id,
+                    request_id=forged.request_id,
+                    execution_id="exec_hidden_asset_drift",
+                )
+        return replayed, forged_graph, error.value
+
+    replayed, forged_graph, error = asyncio.run(scenario())
+
+    assert replayed == state
+    assert error.code == "TRUSTED_WRITE_CONTEXT_DRIFT"
+    assert forged_graph.invoke_config is None
+
+
+def test_terminal_write_replay_rejects_persisted_model_drift_at_public_boundary():
+    state_data = _terminal_execution_state().model_dump(mode="python")
+    state_data["trusted_write_context"]["configured_model_id"] = "mdl_vib_v4"
+    synchronized = AgentState.model_validate(state_data)
+    graph = _RecordingGraph(synchronized.model_dump(mode="json"))
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=synchronized.thread_id,
+                    request_id=synchronized.request_id,
+                    execution_id="exec_terminal_model_drift",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == "TRUSTED_WRITE_CONTEXT_DRIFT"
     assert graph.invoke_config is None
 
 
@@ -1025,7 +1121,10 @@ def test_adulterated_terminal_checkpoint_fails_closed_before_return(
 
     async def scenario():
         async with IndustrialApiClient("https://industrial.test") as client:
-            with pytest.raises(ValidationError, match="terminal diverge"):
+            with pytest.raises(
+                ValidationError,
+                match="ciclo de escrita|terminal diverge",
+            ):
                 await invoke_agent(
                     graph,
                     request=_request(),
@@ -1828,6 +1927,11 @@ def test_checkpoint_preserves_intent_expiration_and_never_creates_a_key(
             case_id="case_tkt_inv_04",
             company_id="comp_mineracao_andes",
             user_id="usr_pedro",
+        ),
+        trusted_write_context=TrustedWriteContext(
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            configured_model_id="mdl_vib_v3",
         ),
         step_limit=3,
         intents=(intent,),

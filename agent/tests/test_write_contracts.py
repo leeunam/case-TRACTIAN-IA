@@ -170,7 +170,10 @@ def test_canonical_proposal_intent_matcher_binds_each_action_target(
         current_case_id="case_tkt_inv_04",
         configured_model_id="mdl_vib_v3",
     )
-    payload_hash = canonical_write_payload_hash(proposal)
+    payload_hash = canonical_write_payload_hash(
+        proposal,
+        trusted_context=trusted_context,
+    )
 
     assert proposal_matches_intent_scope(
         proposal,

@@ -210,8 +210,14 @@ def _record_ledger(state: AgentState) -> AgentState:
     return _replace_state(state, ledger=ledger)
 
 
-def _canonical_payload_hash(proposal: WriteProposal) -> str:
-    return canonical_write_payload_hash(proposal)
+def _canonical_payload_hash(
+    proposal: WriteProposal,
+    trusted_context: TrustedWriteContext,
+) -> str:
+    return canonical_write_payload_hash(
+        proposal,
+        trusted_context=trusted_context,
+    )
 
 
 def _current_write_proposal(state: AgentState) -> WriteProposal:
@@ -277,11 +283,8 @@ def _runtime_matches_state(
 ) -> bool:
     return (
         context.identity == state.identity
+        and state.trusted_write_context == _trusted_write_context(context)
         and context.current_case_id == state.request.case_id
-        and (
-            state.request.asset_id is None
-            or context.central_asset_id == state.request.asset_id
-        )
     )
 
 
@@ -684,6 +687,23 @@ async def _planner_tool(
         parsed_content = json.loads(message.content)
 
         if call.name in _PROPOSAL_ACTION_BY_TOOL:
+            if not isinstance(context, WriteToolRuntime):
+                raise ValueError(
+                    "runtime de escrita é obrigatório para aceitar proposta"
+                )
+            persisted_context = advanced.trusted_write_context
+            if (
+                persisted_context is not None
+                and not _runtime_matches_state(advanced, context)
+            ):
+                raise ValueError(
+                    "runtime diverge do contexto confiável da proposta"
+                )
+            accepted_context = (
+                persisted_context
+                if persisted_context is not None
+                else _trusted_write_context(context)
+            )
             content = validate_exact_json_model(
                 WriteProposalContent,
                 parsed_content,
@@ -700,6 +720,7 @@ async def _planner_tool(
                 raise ValueError("proposta diverge da tool selecionada")
             updated = _replace_state(
                 advanced,
+                trusted_write_context=accepted_context,
                 pending_proposal=artifact.proposal,
                 planner_terminal=None,
                 planner_failure=None,
@@ -973,6 +994,11 @@ def _write_policy(
     context = runtime.context
     if not isinstance(context, WriteToolRuntime):
         raise TypeError("runtime de escrita é obrigatório para avaliar ação")
+    if not _runtime_matches_state(state, context):
+        raise ValueError("runtime diverge do contexto confiável persistido")
+    trusted_context = state.trusted_write_context
+    if trusted_context is None:
+        raise ValueError("contexto confiável persistido é obrigatório")
     if any(intent.request_id == state.request_id for intent in state.intents):
         raise ValueError("request_id já possui intenção persistida")
     advanced = _replace_state(
@@ -980,7 +1006,6 @@ def _write_policy(
         resume_anchor=ResumeAnchor.WRITE_POLICY,
     )
     proposal = _current_write_proposal(advanced)
-    trusted_context = _trusted_write_context(context)
     policy = evaluate_write_policy(
         proposal,
         permissions=advanced.permissions,
@@ -996,7 +1021,7 @@ def _write_policy(
         intent_id=str(uuid4()),
         request_id=advanced.request_id,
         scope=_scope_from_proposal(advanced, proposal, trusted_context),
-        payload_hash=_canonical_payload_hash(proposal),
+        payload_hash=_canonical_payload_hash(proposal, trusted_context),
         decision=policy,
         status=status,
     )
@@ -1047,6 +1072,11 @@ def _confirmation_gate(
     context = runtime.context
     if not isinstance(context, WriteToolRuntime):
         raise TypeError("runtime de escrita é obrigatório para confirmar ação")
+    if not _runtime_matches_state(state, context):
+        raise ValueError("runtime diverge do contexto confiável persistido")
+    trusted_context = state.trusted_write_context
+    if trusted_context is None:
+        raise ValueError("contexto confiável persistido é obrigatório")
     proposal = _current_write_proposal(state)
     intent = _current_intent(state)
     reply: ConfirmationReply | None = None
@@ -1083,7 +1113,7 @@ def _confirmation_gate(
         proposal,
         permissions=advanced.permissions,
         approval=advanced.approval,
-        trusted_context=_trusted_write_context(context),
+        trusted_context=trusted_context,
     )
     if policy.decision is not PolicyDecision.ALLOW:
         denied = _updated_intent(
@@ -1169,7 +1199,15 @@ def _after_planner_confirmation(
     return "writer" if intent.status is IntentStatus.DENIED else "prepare"
 
 
-def _prepare_intent(state: AgentState) -> dict[str, object]:
+def _prepare_intent(
+    state: AgentState,
+    runtime: Runtime[ReadToolRuntime],
+) -> dict[str, object]:
+    context = runtime.context
+    if not isinstance(context, WriteToolRuntime):
+        raise TypeError("runtime de escrita é obrigatório para preparar ação")
+    if not _runtime_matches_state(state, context):
+        raise ValueError("runtime diverge do contexto confiável persistido")
     advanced = _replace_state(
         state.advance_step(),
         resume_anchor=ResumeAnchor.PREPARE_INTENT,
@@ -1427,14 +1465,7 @@ async def _execute_action(
     intent = _current_intent(advanced)
     if intent.status is not IntentStatus.PREPARED:
         raise ValueError("somente intenção preparada pode executar a ação")
-    is_reprocess = isinstance(intent.scope, ReprocessIntentScope)
-    if (
-        not is_reprocess
-        and intent.prepared_execution_id != advanced.execution_id
-    ):
-        return _non_idempotent_resume_unknown(advanced, intent)
-
-    if not is_reprocess and not _runtime_matches_state(advanced, context):
+    if not _runtime_matches_state(advanced, context):
         return _failed_before_dispatch(
             advanced,
             intent,
@@ -1443,7 +1474,16 @@ async def _execute_action(
                 "O runtime confiável diverge do escopo persistido.",
             ),
         )
-    trusted_context = _trusted_write_context(context)
+    trusted_context = advanced.trusted_write_context
+    if trusted_context is None:
+        raise ValueError("contexto confiável persistido é obrigatório")
+    is_reprocess = isinstance(intent.scope, ReprocessIntentScope)
+    if (
+        not is_reprocess
+        and intent.prepared_execution_id != advanced.execution_id
+    ):
+        return _non_idempotent_resume_unknown(advanced, intent)
+
     expected_scope = _scope_from_proposal(
         advanced,
         proposal,
@@ -1458,7 +1498,7 @@ async def _execute_action(
                 "O escopo persistido diverge da proposta confiável.",
             ),
         )
-    if intent.payload_hash != _canonical_payload_hash(proposal):
+    if intent.payload_hash != _canonical_payload_hash(proposal, trusted_context):
         return _failed_before_dispatch(
             advanced,
             intent,

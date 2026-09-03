@@ -400,6 +400,20 @@ def _trusted_write_context(
     )
 
 
+def _validate_persisted_trusted_write_context(
+    state: AgentState,
+    runtime: ReadToolRuntime,
+) -> None:
+    """Impede que uma retomada substitua o escopo confiável já persistido."""
+
+    expected = _trusted_write_context(state.request, runtime)
+    if state.trusted_write_context != expected:
+        raise AgentInvocationProtocolError(
+            "TRUSTED_WRITE_CONTEXT_DRIFT",
+            "o runtime atual diverge do contexto confiável persistido",
+        )
+
+
 def _validate_current_read_access(
     state: AgentState,
     runtime: ReadToolRuntime,
@@ -609,6 +623,11 @@ async def invoke_agent(
                     planner_enabled=planner_enabled,
                 )
                 _validate_legacy_intents_for_write(persisted)
+                if not new_request:
+                    _validate_persisted_trusted_write_context(
+                        persisted,
+                        runtime,
+                    )
             if new_request and _request_id_has_history(persisted, request_id):
                 raise AgentInvocationProtocolError(
                     "REQUEST_ID_ALREADY_USED",

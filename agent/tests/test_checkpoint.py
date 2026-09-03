@@ -10,7 +10,7 @@ from tractian_agent.checkpoint import create_checkpoint_serializer, open_checkpo
 from tractian_agent.contracts import Identity, SupportRequest
 from tractian_agent.state import AgentState, ThreadScope
 from tractian_agent.tools.runtime import TrustedIdentity
-from tractian_agent.write_policy import ReprocessProposal
+from tractian_agent.write_policy import ReprocessProposal, TrustedWriteContext
 
 
 class _ArbitraryModel(BaseModel):
@@ -123,6 +123,11 @@ def test_sqlite_checkpoint_reopens_the_legacy_pending_reprocess_shape(
             case_id="case_tkt_inv_04",
             company_id="comp_mineracao_andes",
             user_id="usr_pedro",
+        ),
+        trusted_write_context=TrustedWriteContext(
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            configured_model_id="mdl_vib_v3",
         ),
         step_limit=3,
         pending_proposal=ReprocessProposal(

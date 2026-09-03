@@ -145,7 +145,10 @@ def _completed_update_action() -> tuple[
             criticality="critical",
             justification=proposal.justification,
         ),
-        payload_hash=canonical_write_payload_hash(proposal),
+        payload_hash=canonical_write_payload_hash(
+            proposal,
+            trusted_context=_trusted_write_context(),
+        ),
         decision=WritePolicyResult(
             decision=PolicyDecision.ALLOW,
             reason=PolicyReason.AUTHORIZED,
@@ -1039,7 +1042,10 @@ def test_gate_reports_uncertain_action_before_considering_its_evidence_gap() -> 
             criticality="critical",
             justification=proposal.justification,
         ),
-        payload_hash=canonical_write_payload_hash(proposal),
+        payload_hash=canonical_write_payload_hash(
+            proposal,
+            trusted_context=_trusted_write_context(),
+        ),
         decision=WritePolicyResult(
             decision=PolicyDecision.ALLOW,
             reason=PolicyReason.AUTHORIZED,
@@ -1134,9 +1140,16 @@ def test_checkpoint_binds_the_released_action_target_to_the_trusted_request() ->
     state = _released_action_state()
     intent = state.intents[0]
     assert isinstance(intent.scope, UpdateAssetCriticalityIntentScope)
+    forged_trusted_context = _trusted_write_context().model_copy(
+        update={"central_asset_id": "asset_G502"}
+    )
     forged_intent = intent.model_copy(
         update={
-            "scope": intent.scope.model_copy(update={"asset_id": "asset_G502"})
+            "scope": intent.scope.model_copy(update={"asset_id": "asset_G502"}),
+            "payload_hash": canonical_write_payload_hash(
+                state.pending_proposal,
+                trusted_context=forged_trusted_context,
+            ),
         }
     )
     forged_approval = state.approval.model_copy(update={"target_id": "asset_G502"})
@@ -1145,9 +1158,6 @@ def test_checkpoint_binds_the_released_action_target_to_the_trusted_request() ->
         recorded_at=state.ledger.items[0].recorded_at,
     )
     forged_draft = _draft_for(AgentDecision.ACT, forged_ledger)
-    forged_trusted_context = _trusted_write_context().model_copy(
-        update={"central_asset_id": "asset_G502"}
-    )
     forged_context = ReleaseGateContext(
         request_id=state.request_id,
         decision=AgentDecision.ACT,
@@ -1182,7 +1192,7 @@ def test_checkpoint_cannot_delete_the_trusted_action_scope() -> None:
     tampered = state.model_dump(mode="json")
     tampered.pop("trusted_write_context")
 
-    with pytest.raises(ValidationError, match="atestado"):
+    with pytest.raises(ValidationError, match="contexto confiável|atestado"):
         AgentState.model_validate(tampered)
 
 
