@@ -825,6 +825,10 @@ def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
     assert completed.release_gate.outcome is ReleaseGateOutcome.RELEASE
     assert completed.release_gate.review_digest is not None
     assert completed.release_gate.review_audit_digest is not None
+    forged_completed = completed.model_dump(mode="json")
+    forged_completed["release_gate"] = None
+    with pytest.raises(ValidationError):
+        AgentState.model_validate(forged_completed)
     assert completed.step_count <= 24
     assert completed.approval == waiting.approval is None
     assert replayed == completed
@@ -1213,6 +1217,7 @@ def test_pending_review_rejects_new_request_stale_id_and_wrong_company_then_reje
                 "reason": ReleaseGateReason.NEXT_STEP_MISMATCH.value,
             },
         ),
+        ("release_gate", None),
     ):
         wire = json.loads(rejected.model_dump_json())
         wire[field] = value
@@ -1342,6 +1347,7 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
                 "reason": ReleaseGateReason.NEXT_STEP_MISMATCH.value,
             },
         ),
+        ("release_gate", None),
     ):
         wire = json.loads(expired.model_dump_json())
         wire[field] = value
@@ -1364,6 +1370,33 @@ def test_new_request_closes_expired_review_before_starting_fresh_work(
             checkpoint_path, requests
         )
         assert waiting.review_request is not None
+        forged_missing_gate = waiting.model_dump(mode="json")
+        forged_missing_gate["release_gate"] = None
+        with pytest.raises(ValidationError, match="gate suspenso"):
+            AgentState.model_validate(forged_missing_gate)
+        drifted = waiting.continue_with(
+            request=_request(),
+            identity=runtime.identity,
+            permissions=frozenset(),
+            request_id=waiting.request_id,
+            execution_id="exec_review_permission_drift",
+            trusted_write_context=waiting.trusted_write_context,
+        )
+        assert drifted.release_gate is None
+        assert AgentState.model_validate_json(drifted.model_dump_json()) == drifted
+        for field, value in (
+            ("permissions", ["read"]),
+            ("resume_anchor", ResumeAnchor.AWAIT_HUMAN_REVIEW.value),
+            ("resume_anchor", ResumeAnchor.WRITER.value),
+            (
+                "review",
+                {"status": "approved", "reason": "human_review:approve"},
+            ),
+        ):
+            forged_drift = drifted.model_dump(mode="json")
+            forged_drift[field] = value
+            with pytest.raises(ValidationError, match="gate suspenso"):
+                AgentState.model_validate(forged_drift)
         old_review_id = waiting.review_request.review_id
         expired_at = waiting.review_request.expires_at
         monkeypatch.setattr(graph_module, "_utc_now", lambda: expired_at)
@@ -1397,17 +1430,149 @@ def test_new_request_closes_expired_review_before_starting_fresh_work(
                     planner=Planner(fresh_planner_model),
                     writer=Writer(_HumanDispositionWriterModel()),
                 )
-                with pytest.raises(ValidationError):
+                before = await graph.aget_state(
+                    {"configurable": {"thread_id": "thread_review_boundaries"}}
+                )
+                before_json = json.dumps(
+                    before.values,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+
+                async def assert_denied_without_mutation(
+                    *,
+                    denied_request,
+                    denied_runtime,
+                    denied_request_id,
+                    denied_execution_id,
+                    expected_code,
+                ):
+                    with pytest.raises(AgentInvocationProtocolError) as denied:
+                        await invoke_agent(
+                            graph,
+                            request=denied_request,
+                            runtime=denied_runtime,
+                            thread_id="thread_review_boundaries",
+                            request_id=denied_request_id,
+                            execution_id=denied_execution_id,
+                        )
+                    assert denied.value.code == expected_code
+                    after = await graph.aget_state(
+                        {
+                            "configurable": {
+                                "thread_id": "thread_review_boundaries"
+                            }
+                        }
+                    )
+                    after_json = json.dumps(
+                        after.values,
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    assert after_json == before_json
+                    assert after.next == before.next
+                    assert after.interrupts == before.interrupts
+
+                for suffix, identity in (
+                    (
+                        "tenant",
+                        Identity(
+                            user_id="usr_attacker",
+                            company_id="comp_attacker",
+                        ),
+                    ),
+                    (
+                        "user",
+                        Identity(
+                            user_id="usr_attacker",
+                            company_id="comp_mineracao_andes",
+                        ),
+                    ),
+                ):
+                    denied_runtime = ReadToolRuntime.create(
+                        user_id=identity.user_id,
+                        company_id=identity.company_id,
+                        permissions=frozenset({"read"}),
+                        central_asset_id="asset_G501",
+                        client=client,
+                    )
+                    await assert_denied_without_mutation(
+                        denied_request=_request().model_copy(
+                            update={"identity": identity}
+                        ),
+                        denied_runtime=denied_runtime,
+                        denied_request_id=f"req_attacker_{suffix}",
+                        denied_execution_id=f"exec_attacker_{suffix}",
+                        expected_code="THREAD_SCOPE_MISMATCH",
+                    )
+                for suffix, denied_request, denied_runtime, denied_request_id, denied_execution_id, expected_code in (
+                    (
+                        "case",
+                        _request().model_copy(update={"case_id": "case_other"}),
+                        runtime,
+                        "req_other_case",
+                        "exec_other_case",
+                        "THREAD_SCOPE_MISMATCH",
+                    ),
+                    (
+                        "request",
+                        _request(message="Payload divergente na mesma request."),
+                        runtime,
+                        waiting.request_id,
+                        "exec_request_replay",
+                        "REQUEST_ID_PAYLOAD_MISMATCH",
+                    ),
+                    (
+                        "execution",
+                        _request(message="Nova request com execution repetida."),
+                        runtime,
+                        "req_execution_replay",
+                        waiting.execution_id,
+                        "EXECUTION_ID_ALREADY_USED",
+                    ),
+                    (
+                        "asset",
+                        _request().model_copy(update={"asset_id": "asset_other"}),
+                        ReadToolRuntime.create(
+                            user_id="usr_pedro",
+                            company_id="comp_mineracao_andes",
+                            permissions=frozenset({"read"}),
+                            central_asset_id="asset_other",
+                            client=client,
+                        ),
+                        "req_other_asset",
+                        "exec_other_asset",
+                        "THREAD_SCOPE_MISMATCH",
+                    ),
+                ):
+                    await assert_denied_without_mutation(
+                        denied_request=denied_request,
+                        denied_runtime=denied_runtime,
+                        denied_request_id=denied_request_id,
+                        denied_execution_id=denied_execution_id,
+                        expected_code=expected_code,
+                    )
+                no_read_runtime = ReadToolRuntime.create(
+                    user_id="usr_pedro",
+                    company_id="comp_mineracao_andes",
+                    permissions=frozenset(),
+                    central_asset_id="asset_G501",
+                    client=client,
+                )
+                with pytest.raises(AgentInvocationProtocolError) as no_read:
                     await invoke_agent(
                         graph,
-                        request=_request(
-                            message="Escopo diferente após o vencimento."
-                        ).model_copy(update={"case_id": "case_other"}),
-                        runtime=runtime,
+                        request=_request(message="Nova request sem leitura."),
+                        runtime=no_read_runtime,
                         thread_id="thread_review_boundaries",
-                        request_id="req_wrong_scope_after_expiry",
-                        execution_id="exec_wrong_scope_after_expiry",
+                        request_id="req_no_read_after_expiry",
+                        execution_id="exec_no_read_after_expiry",
                     )
+                assert no_read.value.code == "READ_PERMISSION_REQUIRED"
                 expired_snapshot = await graph.aget_state(
                     {"configurable": {"thread_id": "thread_review_boundaries"}}
                 )
@@ -1415,6 +1580,7 @@ def test_new_request_closes_expired_review_before_starting_fresh_work(
                 assert expired.review_expiry is not None
                 assert expired.review_expiry.trigger == "new_request"
                 assert expired.final_result is not None
+                assert expired.final_result.evidence_ids == ()
                 fresh = await invoke_agent(
                     graph,
                     request=_request(message="Nova solicitação após o vencimento."),
@@ -1919,6 +2085,12 @@ def test_crash_after_review_audit_with_revoked_read_regates_without_duplicate(
                     review_reply=reply,
                     reviewer=reviewer,
                 )
+                assert audited.review_audit is not None
+                assert audited.permissions == frozenset({"read"})
+                forged_audited = audited.model_dump(mode="json")
+                forged_audited["release_gate"] = None
+                with pytest.raises(ValidationError, match="gate suspenso"):
+                    AgentState.model_validate(forged_audited)
                 snapshot = await graph.aget_state(
                     {"configurable": {"thread_id": "thread_review_boundaries"}}
                 )

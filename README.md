@@ -77,7 +77,11 @@ mas bloqueia qualquer retorno público do estado técnico, inclusive em replay.
 O orçamento reserva o interrupt e o segundo gate antes de iniciar caminhos
 revisáveis; checkpoints legados sem essa reserva terminam por contrato próprio.
 No vencimento, a expiração precede a semântica da operação; uma nova solicitação
-encerra primeiro a revisão vencida, sem reexecutar trabalho antigo.
+encerra primeiro a revisão vencida, sem reexecutar trabalho antigo. Antes de
+qualquer mutação do checkpoint, a fronteira vincula novamente thread, caso,
+empresa, pessoa, alvo, request e execução ao escopo persistido. A remoção
+temporária do gate-base só representa drift real de permissão no estado exato
+de continuação anterior ao segundo gate.
 
 O **ledger de evidências** associa fatos às fontes consultadas no estado da execução. Ele recebe somente observações de leitura validadas e recibos tipados de intenções terminais; texto livre de LLM, proposals e mensagens de recibo não viram fatos. O Logfire receberá traces e métricas para consulta humana e operação; ele não será o banco principal do ledger nem uma fonte que o agente consulta durante o atendimento. Logfire ainda não está implementado.
 

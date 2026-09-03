@@ -459,7 +459,10 @@ threads. A allowlist fechada oferece edição apenas para disposição humana,
 falha do writer, seleção de evidência ou próximo passo; motivos duros aceitam
 somente rejeição. Expiração tem precedência sobre a operação e é fechada antes
 de uma nova solicitação, enquanto `ACT`/`ESCALATE` revisado preserva o recibo
-`accepted` da intenção atual.
+`accepted` da intenção atual. A autorização read-only de thread, tenant, caso,
+alvo, request e execução ocorre antes de qualquer escrita no checkpoint; o
+marcador `release_gate=None` só é válido durante drift real de permissão, nos
+dois estados fechados de continuação anteriores ao segundo gate.
 
 ## Fase 10 — Logfire
 

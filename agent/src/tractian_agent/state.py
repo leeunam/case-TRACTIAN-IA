@@ -1959,9 +1959,55 @@ class AgentState(FrozenStateModel):
         )
         if request != expected:
             raise ValueError("solicitação de revisão diverge da base canônica")
-        if (
+        second_gate_completed = (
+            self.resume_anchor is ResumeAnchor.RELEASE_GATE
+            and self.final_result is not None
+            and self.release_gate is not None
+            and self.review_audit is not None
+            and self.review_audit.operation
+            in {ReviewOperation.APPROVE, ReviewOperation.EDIT}
+        )
+        permission_drift = self.permissions != frozenset(
+            request.basis_permissions
+        )
+        pre_judgment_continuation = (
+            self.resume_anchor is ResumeAnchor.RELEASE_GATE
+            and self.final_result is None
+            and self.review_resolution is None
+            and self.reviewed_draft is None
+            and self.review_audit is None
+            and self.review_expiry is None
+            and self.review
+            == ReviewRecord(
+                status=ReviewStatus.REQUIRED,
+                reason=f"release_gate:{request.reason.value}",
+            )
+        )
+        post_judgment_continuation = (
             self.resume_anchor is ResumeAnchor.AWAIT_HUMAN_REVIEW
-            and self.release_gate not in {request.gate_basis, None}
+            and self.final_result is None
+            and self.review_resolution is not None
+            and self.reviewed_draft is not None
+            and self.review_audit is not None
+            and self.review_audit.operation
+            in {ReviewOperation.APPROVE, ReviewOperation.EDIT}
+            and self.review_expiry is None
+            and self.review
+            == ReviewRecord(
+                status=ReviewStatus.APPROVED,
+                reason=f"human_review:{self.review_audit.operation.value}",
+            )
+        )
+        cleared_gate_is_canonical = (
+            self.release_gate is None
+            and permission_drift
+            and (
+                pre_judgment_continuation or post_judgment_continuation
+            )
+        )
+        if not second_gate_completed and (
+            self.release_gate != request.gate_basis
+            and not cleared_gate_is_canonical
         ):
             raise ValueError("gate suspenso diverge da base da revisão")
         if self.review_audit is not None and self.review_expiry is not None:

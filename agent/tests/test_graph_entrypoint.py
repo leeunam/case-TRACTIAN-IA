@@ -1710,10 +1710,7 @@ def test_continuation_fails_closed_when_authenticated_identity_changes(
         async with IndustrialApiClient("https://industrial.test") as client:
             async with open_checkpointer(checkpoint_path) as saver:
                 graph = build_agent_graph(saver)
-                with pytest.raises(
-                    ValidationError,
-                    match="thread reutilizado fora do escopo confiável",
-                ):
+                with pytest.raises(AgentInvocationProtocolError) as denied:
                     await invoke_agent(
                         graph,
                         request=_request(user_id="usr_intruso"),
@@ -1722,6 +1719,7 @@ def test_continuation_fails_closed_when_authenticated_identity_changes(
                         request_id="req_02",
                         execution_id="exec_02",
                     )
+                assert denied.value.code == "THREAD_SCOPE_MISMATCH"
                 unchanged = await graph.aget_state(
                     {"configurable": {"thread_id": "thread_case_tkt_inv_04"}}
                 )
@@ -2392,11 +2390,9 @@ def test_concurrent_divergent_identity_fails_after_thread_is_bound(
                 await asyncio.sleep(0)
                 release_first.set()
                 owner = await first_task
-                with pytest.raises(
-                    ValidationError,
-                    match="thread reutilizado fora do escopo confiável",
-                ):
+                with pytest.raises(AgentInvocationProtocolError) as denied:
                     await intruder_task
+                assert denied.value.code == "THREAD_SCOPE_MISMATCH"
         return owner
 
     owner = asyncio.run(scenario())

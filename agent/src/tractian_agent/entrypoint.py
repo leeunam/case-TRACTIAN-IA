@@ -426,6 +426,56 @@ def _validate_runtime_identity_scope(
         )
 
 
+def _validate_persisted_thread_boundary(
+    *,
+    state: AgentState,
+    request: SupportRequest,
+    runtime: ReadToolRuntime,
+    thread_id: str,
+    request_id: str,
+    execution_id: str,
+) -> None:
+    """Autoriza a continuação sem alterar ou revelar o checkpoint restaurado."""
+    scope = state.thread_scope
+    if thread_id != state.thread_id or thread_id != scope.thread_id:
+        raise AgentInvocationProtocolError(
+            "THREAD_SCOPE_MISMATCH",
+            "o thread autenticado não corresponde ao checkpoint",
+        )
+    if execution_id == state.execution_id:
+        raise AgentInvocationProtocolError(
+            "EXECUTION_ID_ALREADY_USED",
+            "cada continuação exige novo execution_id",
+        )
+    if (
+        request.case_id != scope.case_id
+        or request.identity.company_id != scope.company_id
+        or request.identity.user_id != scope.user_id
+        or runtime.identity.company_id != scope.company_id
+        or runtime.identity.user_id != scope.user_id
+    ):
+        raise AgentInvocationProtocolError(
+            "THREAD_SCOPE_MISMATCH",
+            "a solicitação não pode continuar este thread",
+        )
+    if (
+        request.asset_id is not None
+        and state.trusted_write_context is not None
+        and request.asset_id != state.trusted_write_context.central_asset_id
+    ):
+        raise AgentInvocationProtocolError(
+            "THREAD_SCOPE_MISMATCH",
+            "o alvo não pode mudar dentro deste thread",
+        )
+    if request_id == state.request_id and type(state.request).model_validate(
+        request
+    ) != state.request:
+        raise AgentInvocationProtocolError(
+            "REQUEST_ID_PAYLOAD_MISMATCH",
+            "a mesma request_id exige solicitação idêntica",
+        )
+
+
 def _trusted_write_context(
     request: SupportRequest,
     runtime: ReadToolRuntime,
@@ -753,6 +803,14 @@ async def invoke_agent(
             checkpoint_anchor = _required_resume_anchor(persisted_values)
             persisted = AgentState.model_validate(persisted_values)
             new_request = request_id != persisted.request_id
+            _validate_persisted_thread_boundary(
+                state=persisted,
+                request=request,
+                runtime=runtime,
+                thread_id=thread_id,
+                request_id=request_id,
+                execution_id=execution_id,
+            )
             if (
                 not new_request
                 and persisted.final_result is None
