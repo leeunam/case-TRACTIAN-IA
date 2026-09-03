@@ -391,13 +391,21 @@ A exceção da fronteira vale somente para a aresta pendente
 execução normal, confirmação, mesma execução e replay terminal continuam
 revalidando todo o escopo.
 
+**Decisão local de segurança — round 5:** no grafo com planner, somente o
+terminal criado pelo código exato
+`NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME` preserva a resposta determinística
+de `execute_action` e segue diretamente para `END`. Esse caminho não consulta
+writer, repair ou gate e não contém afirmação técnica. Falhas, incertezas com
+qualquer outro código e resultados normais continuam obrigatoriamente em
+`writer → release_gate`.
+
 As cinco ações passaram por interrupção após o efeito, fechamento/reabertura do
 SQLite, retomada somente em writer/gate e replay sem novo HTTP ou modelo. A
 confirmação estruturada também terminou no gate sem repetir efeito. As suítes
 focadas da Fase 8 cobrem writer, gate, estado, contratos, planner e fronteira;
 as regressões dos fluxos de escrita somam 235 testes. A suíte completa do agente
-tem 1.591 testes e o `make test` confirmou 99 testes da API + 1.591 do agente =
-1.690 testes. `uv lock --check --offline` resolveu 49
+tem 1.601 testes e o `make test` confirmou 99 testes da API + 1.601 do agente =
+1.700 testes. `uv lock --check --offline` resolveu 49
 pacotes; permaneceu apenas o warning conhecido de `python_multipart`.
 
 ## Fase 9 — revisão humana

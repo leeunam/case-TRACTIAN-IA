@@ -16,6 +16,7 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool
 from pydantic import PrivateAttr
 
+import tractian_agent.graph as graph_module
 from tractian_agent.checkpoint import open_checkpointer
 from tractian_agent.client import IndustrialApiClient
 from tractian_agent.contracts import Identity, ResponseMode, SupportRequest
@@ -218,6 +219,30 @@ class _SequenceWriterGraphModel(BaseChatModel):
             return response
 
         return RunnableLambda(write)
+
+
+class _ForbiddenWriterModel(BaseChatModel):
+    _calls: int = PrivateAttr(default=0)
+
+    @property
+    def _llm_type(self) -> str:
+        return "forbidden-writer-graph-model"
+
+    def _generate(self, *args: Any, **kwargs: Any) -> ChatResult:
+        raise AssertionError("o writer não pode ser chamado nesta retomada")
+
+    def bind_tools(self, *args: Any, **kwargs: Any) -> RunnableLambda:
+        raise AssertionError("o writer não pode receber tools")
+
+    def with_structured_output(
+        self,
+        schema: object,
+        *,
+        include_raw: bool = False,
+        **kwargs: Any,
+    ) -> RunnableLambda:
+        self._calls += 1
+        raise AssertionError("o writer não pode ser chamado nesta retomada")
 
 
 def _build_planner_graph(saver: object, model: BaseChatModel):
@@ -1372,6 +1397,330 @@ def test_all_write_flows_use_public_planner_writer_gate_and_replay_once(
         assert write_request.headers["idempotency-key"] == (
             completed.intents[0].idempotency_key
         )
+
+
+@pytest.mark.parametrize(
+    ("slug", "proposal", "approval", "permission", "operation_name"),
+    [
+        (
+            "specialist",
+            RequestSpecialistAnalysisProposal(
+                analysis_id="an_9906",
+                justification="A limitação exige análise especializada.",
+            ),
+            TrustedActionApproval(
+                action="request_specialist_analysis",
+                target_id="an_9906",
+                source=ApprovalSource.ORIGINAL_REQUEST,
+            ),
+            "action_low",
+            "execute_request_specialist_analysis",
+        ),
+        (
+            "criticality",
+            UpdateAssetCriticalityProposal(
+                criticality="critical",
+                justification="O impacto operacional exige prioridade máxima.",
+            ),
+            TrustedActionApproval(
+                action="update_asset_criticality",
+                target_id="asset_G501",
+                material_parameters={"criticality": "critical"},
+                source=ApprovalSource.ORIGINAL_REQUEST,
+            ),
+            "action_high",
+            "execute_update_asset_criticality",
+        ),
+        (
+            "retraining",
+            RequestModelRetrainingProposal(
+                justification="Erros sistemáticos sustentam novo treinamento.",
+            ),
+            TrustedActionApproval(
+                action="request_model_retraining",
+                target_id="mdl_vib_v3",
+                source=ApprovalSource.ORIGINAL_REQUEST,
+            ),
+            "action_high",
+            "execute_request_model_retraining",
+        ),
+        (
+            "escalation",
+            EscalateCaseProposal(
+                justification="O caso ultrapassa o atendimento remoto.",
+            ),
+            TrustedActionApproval(
+                action="escalate_case",
+                target_id="case_tkt_inv_04",
+                source=ApprovalSource.ORIGINAL_REQUEST,
+            ),
+            "escalate",
+            "execute_escalate_case",
+        ),
+    ],
+)
+@pytest.mark.parametrize("runtime_drift", [False, True], ids=["same-scope", "drift"])
+def test_planner_resume_of_cross_execution_prepared_action_skips_writer_and_gate(
+    tmp_path,
+    monkeypatch,
+    slug,
+    proposal,
+    approval,
+    permission,
+    operation_name,
+    runtime_drift,
+):
+    operation_calls = 0
+    http_calls: list[httpx.Request] = []
+    graph_calls = 0
+    planner_model = _ScriptedPlannerModel(selector_responses=())
+    writer_model = _ForbiddenWriterModel()
+
+    async def crash_after_prepared(*args: Any, **kwargs: Any) -> None:
+        nonlocal operation_calls
+        operation_calls += 1
+        raise RuntimeError("queda depois do checkpoint prepared")
+
+    async def forbidden_graph_call(*args: Any, **kwargs: Any) -> None:
+        nonlocal graph_calls
+        graph_calls += 1
+        raise AssertionError("replay terminal não pode executar o grafo")
+
+    def forbidden_http(request: httpx.Request) -> httpx.Response:
+        http_calls.append(request)
+        raise AssertionError("retomada conservadora não pode alcançar HTTP")
+
+    async def scenario() -> tuple[AgentState, AgentState, AgentState]:
+        checkpoint_path = tmp_path / (
+            f"planner-cross-execution-{slug}-{runtime_drift}.sqlite3"
+        )
+        thread_id = f"thread_planner_cross_execution_{slug}_{runtime_drift}"
+        request_id = f"req_planner_cross_execution_{slug}_{runtime_drift}"
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(forbidden_http),
+        )
+        initial_runtime = WriteToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read", permission}),
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            configured_model_id="mdl_vib_v3",
+            client=client,
+        )
+        drift = (
+            {
+                "specialist": {"central_asset_id": "asset_other"},
+                "criticality": {"central_asset_id": "asset_other"},
+                "retraining": {"configured_model_id": "mdl_other"},
+                "escalation": {"current_case_id": "case_other"},
+            }[slug]
+            if runtime_drift
+            else {}
+        )
+        resumed_runtime = WriteToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read", permission}),
+            central_asset_id=drift.get("central_asset_id", "asset_G501"),
+            current_case_id=drift.get("current_case_id", "case_tkt_inv_04"),
+            configured_model_id=drift.get("configured_model_id", "mdl_vib_v3"),
+            client=client,
+        )
+        request = _request(message="Atualize a criticidade do ativo central.")
+        monkeypatch.setattr(
+            graph_module,
+            operation_name,
+            crash_after_prepared,
+        )
+        try:
+            async with open_checkpointer(checkpoint_path) as saver:
+                with pytest.raises(RuntimeError, match="checkpoint prepared"):
+                    await invoke_agent(
+                        build_agent_graph(
+                            saver,
+                            planner=Planner(planner_model),
+                            writer=Writer(writer_model),
+                        ),
+                        request=request,
+                        runtime=initial_runtime,
+                        thread_id=thread_id,
+                        request_id=request_id,
+                        execution_id="exec_prepare",
+                        proposal=proposal,
+                        original_approval=approval,
+                    )
+
+            async with open_checkpointer(checkpoint_path) as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=Writer(writer_model),
+                )
+                prepared = AgentState.model_validate(
+                    (
+                        await graph.aget_state(
+                            {"configurable": {"thread_id": thread_id}}
+                        )
+                    ).values
+                )
+                uncertain = await invoke_agent(
+                    graph,
+                    request=request,
+                    runtime=resumed_runtime,
+                    thread_id=thread_id,
+                    request_id=request_id,
+                    execution_id="exec_resume",
+                )
+
+            async with open_checkpointer(checkpoint_path) as saver:
+                replay_graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=Writer(writer_model),
+                )
+                terminal_snapshot = await replay_graph.aget_state(
+                    {"configurable": {"thread_id": thread_id}}
+                )
+                assert terminal_snapshot.next == ()
+                replay_graph.ainvoke = forbidden_graph_call
+                replayed = await invoke_agent(
+                    replay_graph,
+                    request=request,
+                    runtime=initial_runtime,
+                    thread_id=thread_id,
+                    request_id=request_id,
+                    execution_id="exec_replay",
+                )
+            return prepared, uncertain, replayed
+        finally:
+            await client.aclose()
+
+    prepared, uncertain, replayed = asyncio.run(scenario())
+
+    intent = uncertain.intents[0]
+    assert prepared.resume_anchor is ResumeAnchor.PREPARE_INTENT
+    assert prepared.step_count == 4
+    assert uncertain.resume_anchor is ResumeAnchor.EXECUTE_ACTION
+    assert uncertain.step_count == 5
+    assert uncertain.step_limit == 24
+    assert intent.status is IntentStatus.UNCERTAIN
+    assert intent.attempts == 0
+    assert intent.error is not None
+    assert intent.error.code == "NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME"
+    assert intent.error.message == (
+        "A execução preparadora terminou sem resultado terminal observável."
+    )
+    assert uncertain.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+    assert uncertain.release_gate is None
+    assert uncertain.writer_attempts == 0
+    assert uncertain.writer_draft is None
+    assert uncertain.writer_failure is None
+    assert uncertain.final_result is not None
+    assert uncertain.final_result.message == (
+        "O resultado remoto da ação é desconhecido e ela não será "
+        "reenviada automaticamente."
+    )
+    assert uncertain.final_result.evidence_ids == ()
+    assert uncertain.final_result.limitation_refs == ()
+    assert uncertain.final_result.next_step is None
+    assert approval.target_id not in uncertain.final_result.message
+    assert proposal.justification not in uncertain.final_result.message
+    assert approval.target_id not in intent.error.message
+    assert proposal.justification not in intent.error.message
+    assert uncertain.has_coherent_terminal_result()
+    assert replayed == uncertain
+    assert planner_model._events == []
+    assert writer_model._calls == 0
+    assert operation_calls == 1
+    assert http_calls == []
+    assert graph_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_status"),
+    [(400, IntentStatus.FAILED), (500, IntentStatus.UNCERTAIN)],
+)
+def test_other_action_failures_still_use_writer_and_release_gate(
+    tmp_path,
+    status_code,
+    expected_status,
+):
+    proposal = UpdateAssetCriticalityProposal(
+        criticality="critical",
+        justification="O impacto operacional exige prioridade máxima.",
+    )
+    approval = TrustedActionApproval(
+        action="update_asset_criticality",
+        target_id="asset_G501",
+        material_parameters={"criticality": "critical"},
+        source=ApprovalSource.ORIGINAL_REQUEST,
+    )
+    planner_model = _ScriptedPlannerModel(selector_responses=())
+    writer_model = _EchoWriterModel()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code,
+            json={
+                "code": (
+                    "VALIDATION_ERROR"
+                    if status_code == 400
+                    else "INTERNAL_ERROR"
+                ),
+                "message": "Falha remota sanitizada.",
+            },
+        )
+
+    async def scenario() -> AgentState:
+        client = IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(handler),
+        )
+        runtime = WriteToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset({"read", "action_high"}),
+            central_asset_id="asset_G501",
+            current_case_id="case_tkt_inv_04",
+            configured_model_id="mdl_vib_v3",
+            client=client,
+        )
+        try:
+            async with open_checkpointer(
+                tmp_path / f"planner-other-action-failure-{status_code}.sqlite3"
+            ) as saver:
+                return await invoke_agent(
+                    build_agent_graph(
+                        saver,
+                        planner=Planner(planner_model),
+                        writer=Writer(writer_model),
+                    ),
+                    request=_request(
+                        message="Atualize a criticidade do ativo central."
+                    ),
+                    runtime=runtime,
+                    thread_id=f"thread_planner_other_failure_{status_code}",
+                    request_id=f"req_planner_other_failure_{status_code}",
+                    execution_id=f"exec_planner_other_failure_{status_code}",
+                    proposal=proposal,
+                    original_approval=approval,
+                )
+        finally:
+            await client.aclose()
+
+    state = asyncio.run(scenario())
+
+    assert state.intents[0].status is expected_status
+    assert state.intents[0].attempts == 1
+    assert state.resume_anchor is ResumeAnchor.RELEASE_GATE
+    assert state.writer_attempts == 1
+    assert state.writer_draft is not None
+    assert state.release_gate is not None
+    assert state.final_result is not None
+    assert planner_model._events == []
+    assert writer_model._events == ["with_structured_output", "writer_request"]
 
 
 def test_writer_graph_projection_excludes_every_non_allowlisted_state_sentinel(

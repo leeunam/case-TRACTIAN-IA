@@ -123,6 +123,16 @@ _AMBIGUOUS_ERROR_CATEGORIES = frozenset(
 _UNCERTAIN_IDEMPOTENCY_CODES = frozenset(
     {"IDEMPOTENCY_IN_PROGRESS", "IDEMPOTENCY_OUTCOME_UNKNOWN"}
 )
+_NON_IDEMPOTENT_RESUME_UNKNOWN_CODE = (
+    "NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME"
+)
+_NON_IDEMPOTENT_RESUME_UNKNOWN_REASON = (
+    "A execução preparadora terminou sem resultado terminal observável."
+)
+_NON_IDEMPOTENT_RESUME_UNKNOWN_MESSAGE = (
+    "O resultado remoto da ação é desconhecido e ela não será "
+    "reenviada automaticamente."
+)
 _PROPOSAL_ACTION_BY_TOOL = {
     "propose_reprocess_analysis": "reprocess_analysis",
     "propose_request_specialist_analysis": "request_specialist_analysis",
@@ -1314,19 +1324,48 @@ def _non_idempotent_resume_unknown(
         status=IntentStatus.UNCERTAIN,
         attempts=0,
         error=_local_intent_error(
-            "NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME",
-            "A execução preparadora terminou sem resultado terminal observável.",
+            _NON_IDEMPOTENT_RESUME_UNKNOWN_CODE,
+            _NON_IDEMPOTENT_RESUME_UNKNOWN_REASON,
         ),
     )
     return _checkpoint_update(
         _terminal_result(
             _replace_intent(state, uncertain),
             decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
-            message=(
-                "O resultado remoto da ação é desconhecido e ela não será "
-                "reenviada automaticamente."
-            ),
+            message=_NON_IDEMPOTENT_RESUME_UNKNOWN_MESSAGE,
         )
+    )
+
+
+def _is_conservative_non_idempotent_terminal(state: AgentState) -> bool:
+    """Reconhece somente o terminal local criado pelo guard de retomada."""
+    current_intents = tuple(
+        intent for intent in state.intents if intent.request_id == state.request_id
+    )
+    if len(current_intents) != 1:
+        return False
+    intent = current_intents[0]
+    return (
+        state.resume_anchor is ResumeAnchor.EXECUTE_ACTION
+        and state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+        and state.final_result
+        == FinalResult(
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            message=_NON_IDEMPOTENT_RESUME_UNKNOWN_MESSAGE,
+        )
+        and state.review is None
+        and state.writer_draft is None
+        and state.writer_failure is None
+        and state.writer_attempts == 0
+        and state.release_gate is None
+        and intent.scope.action != "reprocess_analysis"
+        and intent.status is IntentStatus.UNCERTAIN
+        and intent.attempts == 0
+        and intent.prepared_execution_id is not None
+        and intent.prepared_execution_id != state.execution_id
+        and intent.error is not None
+        and intent.error.code == _NON_IDEMPOTENT_RESUME_UNKNOWN_CODE
+        and intent.error.message == _NON_IDEMPOTENT_RESUME_UNKNOWN_REASON
     )
 
 
@@ -1620,7 +1659,20 @@ async def _planner_execute_action(
     state: AgentState,
     runtime: Runtime[ReadToolRuntime],
 ) -> dict[str, object]:
-    return _planner_pending_response(await _execute_action(state, runtime))
+    update = await _execute_action(state, runtime)
+    if _is_conservative_non_idempotent_terminal(
+        AgentState.model_validate(update)
+    ):
+        return update
+    return _planner_pending_response(update)
+
+
+def _after_planner_execute_action(state: AgentState) -> Literal["end", "writer"]:
+    return (
+        "end"
+        if _is_conservative_non_idempotent_terminal(state)
+        else "writer"
+    )
 
 
 def build_agent_graph(
@@ -1712,7 +1764,11 @@ def build_agent_graph(
             {"prepare": "prepare_intent", "writer": "writer"},
         )
         builder.add_edge("prepare_intent", "execute_action")
-        builder.add_edge("execute_action", "writer")
+        builder.add_conditional_edges(
+            "execute_action",
+            _after_planner_execute_action,
+            {"end": END, "writer": "writer"},
+        )
     return CompiledAgentGraph(
         builder.compile(checkpointer=checkpointer),
         planner_enabled=planner is not None,
