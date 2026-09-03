@@ -521,7 +521,9 @@ públicas duas vezes pela fronteira real do agente antes de abrir o gabarito. A
 configuração, os hashes dos dois datasets, a revisão do Git, prompts, rubricas,
 modelos e pacotes ficaram registrados no manifesto. O relatório Pydantic Evals
 contém 34 runs e as dez dimensões por caso; o perfil determinístico sem rede
-também é executável por `make eval`.
+também é executável por `make eval`. Uma regressão TDD adicional comprovou que
+duas rodadas consecutivas no mesmo diretório usam checkpointers transitórios
+isolados e ambas produzem os 34 runs sem herdar estado anterior.
 
 ## Fase 12 — juízes offline
 
@@ -612,8 +614,10 @@ produziu os 34 runs, os dois juízes avaliaram cada run e o benchmark de
 providers comparou os dois papéis separadamente. A auditoria confirmou que
 somente o pacote `evaluation/` importa gabarito, juízes ou rubricas; o runtime
 não recebe esses objetos. `ruff check src tests`, `git diff --check`, os locks
-offline (80 pacotes no agente e 55 na API) e os 44 testes focados passaram.
-`make test` passou com 99 testes da API e 1.803 do agente, 1.902 no total,
+offline (80 pacotes no agente e 55 na API) e os 46 testes focados passaram.
+O caminho live também foi repetido localmente, com models e identidade falsos
+nas fronteiras externas, sem rede, e produziu 34 runs nas duas rodadas.
+`make test` passou com 99 testes da API e 1.805 do agente, 1.904 no total,
 mantendo apenas o warning conhecido de `python_multipart`. A calibração humana
 continua skipped e explicitamente fora deste aceite automático.
 

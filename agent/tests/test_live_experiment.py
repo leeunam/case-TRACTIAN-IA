@@ -1,10 +1,107 @@
 import asyncio
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatResult
+from langchain_core.runnables import RunnableLambda
+from langchain_core.tools import BaseTool
 
 from tractian_agent.evaluation.contracts import BenchmarkInput
-from tractian_agent.evaluation.live_experiment import _fetch_user_profile
+from tractian_agent.evaluation.live_experiment import (
+    LiveExperimentOptions,
+    UserRuntimeProfile,
+    _fetch_user_profile,
+    run_live_experiment,
+)
+from tractian_agent.planner import (
+    PlannerDecisionKind,
+    PlannerStopReason,
+    PlannerTerminalDecision,
+)
+from tractian_agent.state import AgentDecision, WriterDraft, WriterNextStep
+
+
+class _LocalPlannerModel(BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "local-live-experiment-planner"
+
+    def _generate(self, *args: Any, **kwargs: Any) -> ChatResult:
+        raise AssertionError("o planner deve usar os wrappers públicos")
+
+    def bind_tools(
+        self,
+        tools: Sequence[BaseTool],
+        *,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> RunnableLambda:
+        async def select(_: list[BaseMessage]) -> AIMessage:
+            return AIMessage(content="done")
+
+        return RunnableLambda(select)
+
+    def with_structured_output(
+        self,
+        schema: dict[str, Any] | type,
+        *,
+        include_raw: bool = False,
+        **kwargs: Any,
+    ) -> RunnableLambda:
+        assert schema is PlannerTerminalDecision
+        assert include_raw is False
+
+        async def finalize(_: list[BaseMessage]) -> PlannerTerminalDecision:
+            return PlannerTerminalDecision(
+                decision=PlannerDecisionKind.GUIDE,
+                stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+            )
+
+        return RunnableLambda(finalize)
+
+
+class _LocalWriterModel(BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "local-live-experiment-writer"
+
+    def _generate(self, *args: Any, **kwargs: Any) -> ChatResult:
+        raise AssertionError("o writer deve usar saída estruturada")
+
+    def bind_tools(self, *args: Any, **kwargs: Any) -> RunnableLambda:
+        raise AssertionError("o writer não pode receber tools")
+
+    def with_structured_output(
+        self,
+        schema: object,
+        *,
+        include_raw: bool = False,
+        **kwargs: Any,
+    ) -> RunnableLambda:
+        assert schema is WriterDraft
+        assert include_raw is False
+
+        async def write(_: list[BaseMessage]) -> WriterDraft:
+            return WriterDraft(
+                decision=AgentDecision.GUIDE,
+                next_step=WriterNextStep.MONITOR,
+            )
+
+        return RunnableLambda(write)
+
+
+class _LocalProvider:
+    def __init__(self) -> None:
+        self._calls = 0
+
+    def create_chat_model(self, config):
+        self._calls += 1
+        return _LocalPlannerModel() if self._calls == 1 else _LocalWriterModel()
 
 
 def _case() -> BenchmarkInput:
@@ -65,3 +162,60 @@ def test_live_runtime_rejects_cross_company_identity() -> None:
 
     with pytest.raises(ValueError, match="diverge"):
         asyncio.run(scenario())
+
+
+def test_live_experiment_can_repeat_the_same_destination_without_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    output_dir = tmp_path / "live-experiment"
+
+    monkeypatch.setattr(
+        "tractian_agent.evaluation.live_experiment._provider",
+        lambda name, environment: _LocalProvider(),
+    )
+
+    async def local_profile(_, benchmark: BenchmarkInput) -> UserRuntimeProfile:
+        return UserRuntimeProfile(
+            id=benchmark.user_id,
+            company_id=benchmark.company_id,
+            role="test-role",
+            permissions=frozenset({"read"}),
+        )
+
+    monkeypatch.setattr(
+        "tractian_agent.evaluation.live_experiment._fetch_user_profile",
+        local_profile,
+    )
+
+    async def run_twice():
+        options = LiveExperimentOptions(
+            provider="groq",
+            api_base_url="https://simulator.test",
+        )
+        first = await run_live_experiment(
+            root=root,
+            config_path=root / "eval/experiment-config.json",
+            output_dir=output_dir,
+            code_revision="test-revision",
+            dirty=False,
+            environment={},
+            options=options,
+        )
+        second = await run_live_experiment(
+            root=root,
+            config_path=root / "eval/experiment-config.json",
+            output_dir=output_dir,
+            code_revision="test-revision",
+            dirty=False,
+            environment={},
+            options=options,
+        )
+        return first, second
+
+    first, second = asyncio.run(run_twice())
+
+    assert first.profile == second.profile == "live-groq"
+    assert first.total_runs == second.total_runs == 34
+    assert second.programmatic_report_path.exists()

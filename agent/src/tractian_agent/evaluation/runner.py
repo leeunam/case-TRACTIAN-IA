@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 import asyncio
 import hashlib
 import inspect
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import perf_counter
 
 from pydantic_evals import Dataset
@@ -35,6 +38,14 @@ RuntimeFactory = Callable[
 def _execution_identifier(prefix: str, *parts: str) -> str:
     payload = "\0".join(parts).encode("utf-8")
     return f"{prefix}_{hashlib.sha256(payload).hexdigest()[:24]}"
+
+
+@contextmanager
+def isolated_evaluation_checkpoint(output_dir: Path) -> Iterator[Path]:
+    """Entrega um SQLite descartável para uma única rodada de avaliação."""
+
+    with TemporaryDirectory(prefix=".checkpoints-", dir=output_dir) as directory:
+        yield Path(directory) / "state.sqlite3"
 
 
 class AgentCaseExecutor:

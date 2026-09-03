@@ -38,3 +38,32 @@ def test_offline_experiment_runs_all_17_cases_twice_and_writes_artifacts(
     assert len(blind["items"]) == 24
     assert "judge" not in json.dumps(blind).casefold()
     assert "score" not in json.dumps(blind).casefold()
+
+
+def test_offline_experiment_can_be_repeated_in_the_same_output_directory(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    output_dir = tmp_path / "repeatable-experiment"
+
+    async def run_twice():
+        first = await run_offline_experiment(
+            root=root,
+            config_path=root / "eval/experiment-config.json",
+            output_dir=output_dir,
+            code_revision="test-revision",
+            dirty=False,
+        )
+        second = await run_offline_experiment(
+            root=root,
+            config_path=root / "eval/experiment-config.json",
+            output_dir=output_dir,
+            code_revision="test-revision",
+            dirty=False,
+        )
+        return first, second
+
+    first, second = asyncio.run(run_twice())
+
+    assert first.total_runs == second.total_runs == 34
+    assert second.programmatic_report_path.exists()

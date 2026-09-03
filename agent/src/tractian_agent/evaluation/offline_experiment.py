@@ -26,6 +26,7 @@ from tractian_agent.evaluation.experiment_config import (
 from tractian_agent.evaluation.runner import (
     AgentCaseExecutor,
     execute_before_loading_references,
+    isolated_evaluation_checkpoint,
 )
 from tractian_agent.graph import build_agent_graph
 from tractian_agent.tools.runtime import ReadToolRuntime
@@ -62,31 +63,32 @@ async def run_offline_experiment(
             f"o perfil deterministic-fallback não pode chamar HTTP: {request.url}"
         )
 
-    async with open_checkpointer(output_dir / "checkpoints.sqlite3") as saver:
-        graph = build_agent_graph(saver)
-        async with IndustrialApiClient(
-            "https://offline-evaluation.invalid",
-            transport=httpx.MockTransport(forbidden_http),
-        ) as client:
-            executor = AgentCaseExecutor(
-                graph=graph,
-                runtime_factory=lambda case: ReadToolRuntime.create(
-                    user_id=case.user_id,
-                    company_id=case.company_id,
-                    permissions=frozenset({"read"}),
-                    central_asset_id=case.asset_id,
-                    client=client,
-                ),
-                experiment_id=config.experiment_id,
-                step_limit=config.step_limit,
-            )
-            completed = await execute_before_loading_references(
-                public_dataset,
-                executor.execute,
-                reference_path=root / config.reference_cases_path,
-                repeat=config.repetitions,
-                max_concurrency=config.max_concurrency,
-            )
+    with isolated_evaluation_checkpoint(output_dir) as checkpoint_path:
+        async with open_checkpointer(checkpoint_path) as saver:
+            graph = build_agent_graph(saver)
+            async with IndustrialApiClient(
+                "https://offline-evaluation.invalid",
+                transport=httpx.MockTransport(forbidden_http),
+            ) as client:
+                executor = AgentCaseExecutor(
+                    graph=graph,
+                    runtime_factory=lambda case: ReadToolRuntime.create(
+                        user_id=case.user_id,
+                        company_id=case.company_id,
+                        permissions=frozenset({"read"}),
+                        central_asset_id=case.asset_id,
+                        client=client,
+                    ),
+                    experiment_id=config.experiment_id,
+                    step_limit=config.step_limit,
+                )
+                completed = await execute_before_loading_references(
+                    public_dataset,
+                    executor.execute,
+                    reference_path=root / config.reference_cases_path,
+                    repeat=config.repetitions,
+                    max_concurrency=config.max_concurrency,
+                )
 
     check_report = await run_programmatic_checks(completed)
     artifact = build_programmatic_artifact(

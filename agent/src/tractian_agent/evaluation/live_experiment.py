@@ -24,7 +24,11 @@ from tractian_agent.evaluation.experiment_config import (
     load_experiment_config,
 )
 from tractian_agent.evaluation.offline_experiment import OfflineExperimentResult
-from tractian_agent.evaluation.runner import AgentCaseExecutor, execute_before_loading_references
+from tractian_agent.evaluation.runner import (
+    AgentCaseExecutor,
+    execute_before_loading_references,
+    isolated_evaluation_checkpoint,
+)
 from tractian_agent.graph import build_agent_graph
 from tractian_agent.groq_provider import GroqModelProvider
 from tractian_agent.model_provider import ModelProvider
@@ -109,40 +113,41 @@ async def run_live_experiment(
     public_dataset = load_public_dataset(root / config.public_cases_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    async with open_checkpointer(output_dir / "checkpoints.sqlite3") as saver:
-        graph = build_agent_graph(saver, planner=planner, writer=writer)
-        async with (
-            IndustrialApiClient(options.api_base_url) as industrial_client,
-            httpx.AsyncClient(
-                base_url=options.api_base_url,
-                follow_redirects=False,
-            ) as identity_client,
-        ):
+    with isolated_evaluation_checkpoint(output_dir) as checkpoint_path:
+        async with open_checkpointer(checkpoint_path) as saver:
+            graph = build_agent_graph(saver, planner=planner, writer=writer)
+            async with (
+                IndustrialApiClient(options.api_base_url) as industrial_client,
+                httpx.AsyncClient(
+                    base_url=options.api_base_url,
+                    follow_redirects=False,
+                ) as identity_client,
+            ):
 
-            async def runtime_factory(case: BenchmarkInput) -> WriteToolRuntime:
-                profile = await _fetch_user_profile(identity_client, case)
-                return WriteToolRuntime.create(
-                    user_id=profile.id,
-                    company_id=profile.company_id,
-                    permissions=profile.permissions,
-                    central_asset_id=case.asset_id,
-                    current_case_id=case.id,
-                    client=industrial_client,
+                async def runtime_factory(case: BenchmarkInput) -> WriteToolRuntime:
+                    profile = await _fetch_user_profile(identity_client, case)
+                    return WriteToolRuntime.create(
+                        user_id=profile.id,
+                        company_id=profile.company_id,
+                        permissions=profile.permissions,
+                        central_asset_id=case.asset_id,
+                        current_case_id=case.id,
+                        client=industrial_client,
+                    )
+
+                executor = AgentCaseExecutor(
+                    graph=graph,
+                    runtime_factory=runtime_factory,
+                    experiment_id=config.experiment_id,
+                    step_limit=config.step_limit,
                 )
-
-            executor = AgentCaseExecutor(
-                graph=graph,
-                runtime_factory=runtime_factory,
-                experiment_id=config.experiment_id,
-                step_limit=config.step_limit,
-            )
-            completed = await execute_before_loading_references(
-                public_dataset,
-                executor.execute,
-                reference_path=root / config.reference_cases_path,
-                repeat=config.repetitions,
-                max_concurrency=config.max_concurrency,
-            )
+                completed = await execute_before_loading_references(
+                    public_dataset,
+                    executor.execute,
+                    reference_path=root / config.reference_cases_path,
+                    repeat=config.repetitions,
+                    max_concurrency=config.max_concurrency,
+                )
 
     check_report = await run_programmatic_checks(completed)
     artifact = build_programmatic_artifact(

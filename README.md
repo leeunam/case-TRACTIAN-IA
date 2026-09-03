@@ -232,6 +232,8 @@ flowchart LR
 O runner executa primeiro as entradas públicas e somente depois carrega
 `eval/expected-paths.json`. Os relatórios registram configuração, hashes dos
 arquivos, revisão do Git, versões de prompts/rubricas/modelos e dependências.
+Cada rodada usa um checkpointer SQLite transitório e isolado; repetir o comando
+no mesmo diretório não reutiliza estado do grafo nem altera os IDs observados.
 Os checks cobrem formato, decisão, tools, argumentos, IDs, trajetória,
 permissões, justificativa, erros e limite de passos. Os dois juízes são offline:
 o juiz cego nunca recebe chamadas; o juiz de trajetória recebe apenas chamadas
