@@ -25,7 +25,7 @@ Só marque uma tarefa após executar seu critério de aceite. Registre decisões
 
 ## Estado atual
 
-Existem o simulador FastAPI, os dados, os contratos, os cenários, o cliente HTTP, dez tools LangChain de leitura, cinco proposal tools sem efeito, estado tipado, fronteira Python, checkpointer SQLite, provider comum com adapter Groq e um grafo LangGraph com cinco fluxos de escrita, planner e writer LLM opt-in separados, ledger completo, gate determinístico de liberação, revisão humana retomável e uma fachada manual Logfire segura e opt-in. As Fases 1 a 10 estão concluídas. Runner Pydantic Evals continua ausente. Nunca descreva componente planejado como funcional.
+Existem o simulador FastAPI, os dados, os contratos, os cenários, o cliente HTTP, dez tools LangChain de leitura, cinco proposal tools sem efeito, estado tipado, fronteira Python, checkpointer SQLite, adapters Groq e NVIDIA NIM, um grafo LangGraph com cinco fluxos de escrita, planner e writer LLM opt-in separados, ledger completo, gate determinístico de liberação, revisão humana retomável, uma fachada manual Logfire segura e opt-in e um pipeline Pydantic Evals com checks, juízes offline, comparação de providers e relatórios reproduzíveis. As Fases 1–12, 14 e 15 estão implementadas. A calibração humana da Fase 13 está adiada por ausência de especialista da TRACTIAN; não existe limiar calibrado. O benchmark atual falha em qualidade e estabilidade. Nunca descreva calibração pendente ou agente de produção como funcional.
 
 ## Invariantes
 
@@ -33,7 +33,7 @@ Existem o simulador FastAPI, os dados, os contratos, os cenários, o cliente HTT
 - Há um agente lógico com planner e writer separados; LangGraph controla o fluxo e o estado.
 - Pydantic valida contratos; Pydantic Evals organiza avaliações offline; Logfire recebe observabilidade.
 - SQLite é o checkpointer de desenvolvimento; PostgreSQL é evolução futura.
-- O acesso a modelos usa adapter; Groq é inicial e NVIDIA NIM é candidato.
+- O acesso a modelos usa adapter; Groq e NVIDIA NIM possuem adapters e comparação versionada.
 - Segurança do runtime é determinística. Juízes LLM não liberam respostas, não acionam retry e não fazem parte do atendimento.
 - O runtime nunca recebe `eval/expected-paths.json`, `docs/test-scenarios.md` ou `data/cases.parquet`.
 - O golden set não é RAG e só fica disponível aos avaliadores após a execução.

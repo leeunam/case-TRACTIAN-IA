@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável, checkpointer SQLite de desenvolvimento e fachada manual Logfire opt-in. As Fases 1 a 10 estão concluídas. O runner Pydantic Evals continua planejado em [`TASKS.md`](./TASKS.md), portanto o grafo ainda não é um agente de produção.
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável, checkpointer SQLite de desenvolvimento, fachada manual Logfire opt-in e pipeline offline Pydantic Evals. As Fases 1–12, 14 e 15 estão implementadas. A calibração humana da Fase 13 está adiada até uma pessoa especialista da TRACTIAN produzir os rótulos cegos; nenhum limiar foi escolhido sem essa evidência. O benchmark atual revelou falhas de qualidade e instabilidade, portanto o agente ainda não é de produção.
 
 ## Problema
 
@@ -117,8 +117,8 @@ versão, enums/flags/contadores fechados, nomes de catálogo, `trace_id` e
 referências HMAC. IDs literais, mensagens, argumentos, retornos, evidências,
 targets, URLs, payloads, segredos e exceções não entram na telemetria. Métricas
 usam somente `stage`, `outcome`, `error_code`, `planner_enabled` e `replayed`;
-nenhum ID é label. O runtime emite zero spans de avaliação; a operação tipada
-existe apenas para o futuro runner da Fase 11.
+nenhum ID é label. O runtime emite zero spans de avaliação; o runner offline da
+Fase 11 pode usar a operação tipada somente na fronteira de avaliação.
 
 O span `action` começa somente quando um `POST` ou `PATCH` modificador é
 despachado. Leituras de preflight não criam tentativa, e uma nova tentativa só
@@ -179,8 +179,9 @@ os validators e as regras de coerência do contrato continuam falhando fechados.
 O planner e seu contrato permanecem independentes desse detalhe de transporte.
 O modelo, credenciais e respostas brutas não entram no estado. IDs persistidos
 de tool call são derivados pelo runtime de `request_id` e do ordinal, nunca do
-ID externo do provider. NVIDIA NIM continua alternativa futura; o writer pode
-usar outro modelo sem mudar as regras de negócio ou o gate determinístico.
+ID externo do provider. O adapter NVIDIA NIM usa a API OpenAI-compatible, aceita
+o endpoint hospedado oficial ou um NIM local e mantém `max_retries=0`. O writer
+pode usar outro modelo sem mudar as regras de negócio ou o gate determinístico.
 
 O smoke opt-in `make smoke-groq` compara `openai/gpt-oss-120b` e
 `openai/gpt-oss-20b` com dados sintéticos, sem retry e com o mesmo orçamento de
@@ -203,7 +204,7 @@ Pydantic válidos em duas chamadas. Como houve somente uma rodada, a estabilidad
 permanece corretamente `not_measured`; as latências observadas não constituem
 benchmark para escolher o modelo.
 
-## Avaliação offline planejada
+## Avaliação offline
 
 Avaliação não participa do atendimento ao cliente nem provoca retries automáticos no runtime.
 
@@ -226,9 +227,48 @@ flowchart LR
 - **Checks programáticos:** contratos, tools, argumentos, permissões, erros e regras críticas.
 - **Juiz do resultado:** relevância, fidelidade às evidências, honestidade, decisão, clareza e tom.
 - **Juiz da trajetória:** escolha e ordem das tools, falhas, repetições e momento de parada.
-- **Humano:** cria 20–30 rótulos de referência e analisa concordância, falsos aprovados e falsos reprovados.
+- **Humano:** uma pessoa especialista cria 20–30 rótulos cegos e permite medir concordância, falsos aprovados e falsos reprovados.
 
-Os limiares `0.7`, `0.8` e `0.9` serão comparados; `0.8` é apenas o candidato inicial. Como haverá um único avaliador humano, Cohen's kappa mede humano × juiz. Krippendorff alpha fica fora do escopo atual.
+O runner executa primeiro as entradas públicas e somente depois carrega
+`eval/expected-paths.json`. Os relatórios registram configuração, hashes dos
+arquivos, revisão do Git, versões de prompts/rubricas/modelos e dependências.
+Os checks cobrem formato, decisão, tools, argumentos, IDs, trajetória,
+permissões, justificativa, erros e limite de passos. Os dois juízes são offline:
+o juiz cego nunca recebe chamadas; o juiz de trajetória recebe apenas chamadas
+e falhas já concluídas. Suas notas nunca retornam ao grafo.
+
+O experimento real `tractian-eval-v1` executado em 03/09/2026 usou 17 casos,
+duas repetições, Groq `openai/gpt-oss-20b` no agente e limite de 24 passos. As
+34 execuções respeitaram formato, argumentos, IDs, permissões, justificativa,
+tratamento de erro e orçamento, mas nenhuma passou o conjunto completo: 33
+terminaram em revisão segura por `model_failure`, apenas uma passou a dimensão
+de decisão e nenhuma reproduziu a trajetória esperada. Isso é evidência de que
+o pipeline detecta regressões, não de qualidade do agente.
+
+Os juízes Groq `openai/gpt-oss-120b`, rubricas `v2`, JSON mode validado por
+Pydantic e pacing de dez segundos avaliaram os mesmos 34 runs. Nenhuma saída
+foi aprovada em `0.7`, `0.8` ou `0.9`; todos os 17 pares de repetição foram
+instáveis. Checks + juízes não acrescentaram rejeições porque os checks já
+haviam rejeitado os 34 runs. As 68 chamadas acumularam 468,4 s de latência do
+provider, além do pacing. O custo ficou indisponível porque não há tarifa
+versionada na configuração.
+
+Os limiares `0.7`, `0.8` e `0.9` são reaplicados aos mesmos scores. Nenhum foi
+escolhido: o autor não é especialista industrial da TRACTIAN e rotular por
+suposição contaminaria o golden set. A Fase 13 está, portanto, **skipped por
+ausência de avaliador de domínio**. Quando a equipe TRACTIAN estiver disponível:
+
+1. rode `make eval-label-template EVAL_OUTPUT_DIR=<rodada>`;
+2. leia `blind-review-packet.json` sem abrir `judge-report.json` ou
+   `judge-scores.json`;
+3. preencha os 20–30 campos `approved` e `reason` em `human-labels.json`;
+4. rode `make eval-calibrate EVAL_OUTPUT_DIR=<rodada>`;
+5. registre concordância bruta, Cohen's kappa, falsos aprovados/reprovados e o
+   limiar justificado pelos erros observados.
+
+Como haverá inicialmente uma única pessoa avaliadora, Cohen's kappa medirá
+humano × juiz e não concordância entre especialistas. Krippendorff alpha fica
+fora desta entrega.
 
 O golden set nunca entra no runtime e não é consultado por RAG. Ele é visível apenas aos avaliadores depois que a execução termina.
 
@@ -240,13 +280,26 @@ O golden set nunca entra no runtime e não é consultado por RAG. Ele é visíve
 | Orquestração | LangGraph + LangChain | Estado, ciclos, tools e retomada |
 | Contratos | Pydantic | Tipagem e validação explícitas |
 | Cliente HTTP | httpx | Chamadas assíncronas e testáveis |
-| Modelos | Groq; NVIDIA NIM candidato | Início gratuito e troca por adapter |
+| Modelos | Groq e NVIDIA NIM | Troca por adapter e benchmark comum |
 | Persistência | SQLite; PostgreSQL futuro | Simplicidade local e caminho de escala |
 | Observabilidade | Pydantic Logfire | Traces e investigação sem criar dashboard |
 | Testes | pytest | Unidade, integração e regressão |
 | Avaliação | Pydantic Evals | Casos, avaliadores e experimentos tipados |
 
-`promptfoo` poderá comparar prompts e modelos quando o pipeline estiver estável. `Ragas` só será adotado se o produto ganhar uma etapa real de RAG.
+No benchmark versionado de dois runs por papel com `openai/gpt-oss-20b`, Groq
+passou português, tool calling, saída estruturada e estabilidade no planner e
+writer. NVIDIA NIM passou o writer, mas falhou a saída estruturada/estabilidade
+do planner. A latência total observada foi 1,735 s/1,039 s para planner/writer
+na Groq e 6,361 s/21,335 s na NVIDIA. Groq é a recomendação sob essas condições;
+o custo não foi comparado por ausência de tarifa congelada.
+
+LangSmith e Phoenix não foram adicionados: Pydantic Evals já organiza o
+benchmark e Logfire já cobre observabilidade, enquanto uma terceira plataforma
+duplicaria coleta e aumentaria a superfície de exposição de traces. Phoenix
+pode ser reconsiderado se surgir necessidade de uma UI self-hosted; LangSmith,
+se o projeto adotar operacionalmente a plataforma LangChain. `promptfoo` só
+entra quando comparações recorrentes justificarem outra ferramenta. `Ragas` só
+entra se existir um pipeline RAG real.
 
 ## Executar o que já existe
 
@@ -256,6 +309,13 @@ Requisitos: Python 3.10 ou superior e [`uv`](https://docs.astral.sh/uv/).
 make setup   # instala API/agente e gera os dados
 make up      # inicia a API em http://localhost:8000
 make test    # executa as suítes da API e do agente
+make eval    # 17 casos x 2 no fallback local; sem credenciais ou rede
+make eval-live EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada EVAL_PROVIDER=groq
+make eval-providers   # benchmark real Groq x NVIDIA NIM
+make eval-judges EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
+make eval-label-template EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
+make eval-calibrate EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
+make eval-layers EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
 make logs    # acompanha o log da API
 make stop    # encerra a API iniciada pelo Makefile
 ```
@@ -308,7 +368,7 @@ Prompt curto recomendado:
 
 ## Limitações atuais
 
-- Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, revisão humana retomável, fluxos de escrita, checkpointer e telemetria manual Logfire opt-in. Ele ainda não possui runner Pydantic Evals; portanto não é um agente de produção.
+- Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, revisão humana retomável, fluxos de escrita, checkpointer, telemetria manual Logfire opt-in e avaliação Pydantic Evals. O benchmark atual falha em qualidade/estabilidade e a calibração humana está adiada; portanto não é um agente de produção.
 - As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
 - O simulador não representa todas as garantias transacionais de produção.
 - As rotas de ação do simulador devolvem recibos, mas não alteram os recursos Parquet; um novo GET não comprova a mutação solicitada.

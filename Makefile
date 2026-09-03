@@ -5,6 +5,7 @@
 #   make setup   # cria as venvs, instala API/agente e gera os dados
 #   make up      # inicia a API industrial em :8000
 #   make test    # executa a suíte atual
+#   make eval    # runner/checks locais, sem credenciais
 #   make stop    # encerra a API
 #   make smoke-groq # compara modelos Groq com dados sintéticos (opt-in)
 #
@@ -17,11 +18,15 @@ API_PY := $(API_VENV)/bin/python
 AGENT_VENV := $(ROOT)/agent/.venv
 AGENT_PY := $(AGENT_VENV)/bin/python
 PID_DIR := $(ROOT)/.run
+EVAL_PROVIDER ?= groq
+EVAL_OUTPUT_DIR ?= $(PID_DIR)/evaluation/tractian-eval-v1
+EVAL_LABELS ?= $(EVAL_OUTPUT_DIR)/human-labels.json
+EVAL_SCORES ?= $(EVAL_OUTPUT_DIR)/judge-scores.json
 MAKEFLAGS += --no-print-directory
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup deps data up up-api stop logs test smoke-groq clean clean-data
+.PHONY: help setup deps data up up-api stop logs test smoke-groq eval eval-live eval-providers eval-judges eval-label-template eval-calibrate eval-layers clean clean-data
 
 help: ## Mostra esta ajuda
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -76,8 +81,47 @@ test: ## Executa os testes da API e do agente
 smoke-groq: ## Compara modelos Groq com dados sintéticos; requer GROQ_API_KEY
 	@cd $(ROOT)/agent && $(AGENT_PY) -m tractian_agent.groq_smoke
 
+eval: ## Executa 17 casos x 2, checks e lote humano sem LLM/rede
+	@cd $(ROOT)/agent && $(AGENT_PY) -m tractian_agent.evaluation offline \
+		--root $(ROOT) --output-dir $(EVAL_OUTPUT_DIR)
+
+eval-live: up-api ## Executa o agente real; requer .env e provider configurado
+	@set -a; . $(ROOT)/.env; set +a; cd $(ROOT)/agent && \
+		$(AGENT_PY) -m tractian_agent.evaluation live --root $(ROOT) \
+		--provider $(EVAL_PROVIDER) --api-base-url http://127.0.0.1:$(API_PORT) \
+		--output-dir $(EVAL_OUTPUT_DIR)
+
+eval-providers: ## Compara Groq x NVIDIA NIM com configuração congelada
+	@set -a; . $(ROOT)/.env; set +a; cd $(ROOT)/agent && \
+		$(AGENT_PY) -m tractian_agent.evaluation providers --root $(ROOT)
+
+eval-judges: ## Avalia offline o relatório existente; não chama o agente
+	@set -a; . $(ROOT)/.env; set +a; cd $(ROOT)/agent && \
+		$(AGENT_PY) -m tractian_agent.evaluation judges --root $(ROOT) \
+		--provider $(EVAL_PROVIDER) \
+		--programmatic-report $(EVAL_OUTPUT_DIR)/programmatic-report.json \
+		--output $(EVAL_OUTPUT_DIR)/judge-report.json \
+		--scores-output $(EVAL_SCORES) \
+		--comparison-output $(EVAL_OUTPUT_DIR)/evaluation-layers.json
+
+eval-label-template: ## Gera template cego para especialista da TRACTIAN
+	@cd $(ROOT)/agent && $(AGENT_PY) -m tractian_agent.evaluation labels-template \
+		--packet $(EVAL_OUTPUT_DIR)/blind-review-packet.json \
+		--output $(EVAL_LABELS)
+
+eval-calibrate: ## Calcula calibracao com 20-30 rotulos humanos cegos
+	@cd $(ROOT)/agent && $(AGENT_PY) -m tractian_agent.evaluation calibrate \
+		--labels $(EVAL_LABELS) --scores $(EVAL_SCORES) \
+		--output $(EVAL_OUTPUT_DIR)/calibration-report.json
+
+eval-layers: ## Compara checks contra checks + juizes nos mesmos runs
+	@cd $(ROOT)/agent && $(AGENT_PY) -m tractian_agent.evaluation layers \
+		--programmatic-report $(EVAL_OUTPUT_DIR)/programmatic-report.json \
+		--judge-report $(EVAL_OUTPUT_DIR)/judge-report.json \
+		--output $(EVAL_OUTPUT_DIR)/evaluation-layers.json
+
 clean-data: ## Apaga dados gerados; regenere com make data
-	@rm -rf data agent-input eval
+	@rm -rf data agent-input eval/expected-paths.json
 	@echo "✓ dados apagados"
 
 clean: stop clean-data ## Encerra a API e apaga dados, venvs e arquivos temporários

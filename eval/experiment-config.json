@@ -1,0 +1,75 @@
+{
+  "version": "evaluation-experiment-v1",
+  "experiment_id": "tractian-eval-v1",
+  "public_cases_path": "agent-input/cases.json",
+  "reference_cases_path": "eval/expected-paths.json",
+  "repetitions": 2,
+  "max_concurrency": 1,
+  "step_limit": 24,
+  "thresholds": [0.7, 0.8, 0.9],
+  "human_sample_size": 24,
+  "versions": [
+    {"component": "dataset", "version": "synthetic-cases-v1"},
+    {"component": "planner_prompt", "version": "planner-v1"},
+    {"component": "writer_prompt", "version": "writer-v1"},
+    {"component": "blind_result_rubric", "version": "blind-result-judge-v2"},
+    {"component": "trajectory_rubric", "version": "trajectory-judge-v2"},
+    {"component": "programmatic_checks", "version": "programmatic-v1"}
+  ],
+  "judges": {
+    "provider": "groq",
+    "pacing_seconds": 10.0,
+    "blind_result": {
+      "model_id": "openai/gpt-oss-120b",
+      "temperature": 0.0,
+      "timeout_seconds": 30.0,
+      "max_output_tokens": 4096
+    },
+    "trajectory": {
+      "model_id": "openai/gpt-oss-120b",
+      "temperature": 0.0,
+      "timeout_seconds": 30.0,
+      "max_output_tokens": 4096
+    }
+  },
+  "providers": [
+    {
+      "provider": "groq",
+      "planner": {
+        "model_id": "openai/gpt-oss-20b",
+        "temperature": 0.0,
+        "timeout_seconds": 30.0,
+        "max_output_tokens": 512
+      },
+      "writer": {
+        "model_id": "openai/gpt-oss-20b",
+        "temperature": 0.0,
+        "timeout_seconds": 30.0,
+        "max_output_tokens": 512
+      },
+      "repetitions": 2,
+      "context_characters": 8000,
+      "input_cost_per_million_tokens": null,
+      "output_cost_per_million_tokens": null
+    },
+    {
+      "provider": "nvidia-nim",
+      "planner": {
+        "model_id": "openai/gpt-oss-20b",
+        "temperature": 0.0,
+        "timeout_seconds": 30.0,
+        "max_output_tokens": 512
+      },
+      "writer": {
+        "model_id": "openai/gpt-oss-20b",
+        "temperature": 0.0,
+        "timeout_seconds": 30.0,
+        "max_output_tokens": 512
+      },
+      "repetitions": 2,
+      "context_characters": 8000,
+      "input_cost_per_million_tokens": null,
+      "output_cost_per_million_tokens": null
+    }
+  ]
+}

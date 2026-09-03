@@ -509,12 +509,19 @@ continuam controles externos da conta, não propriedades do ledger ou do código
 
 **Decidir:** divisão desenvolvimento/calibração/oculto, número de repetições e versionamento de casos, prompts e modelos.
 
-- [ ] Executar casos sem disponibilizar o gabarito ao runtime.
-- [ ] Validar resposta, tools, argumentos, permissões, erros e regras críticas.
-- [ ] Comparar trajetória observada com a esperada.
-- [ ] Gerar relatório por caso, dimensão e experimento.
+- [x] Executar casos sem disponibilizar o gabarito ao runtime.
+- [x] Validar resposta, tools, argumentos, permissões, erros e regras críticas.
+- [x] Comparar trajetória observada com a esperada.
+- [x] Gerar relatório por caso, dimensão e experimento.
 
 **Aceite:** o mesmo experimento pode ser reproduzido com versões e configuração registradas.
+
+**Aceite verificado (03/09/2026):** `tractian-eval-v1` executou as 17 entradas
+públicas duas vezes pela fronteira real do agente antes de abrir o gabarito. A
+configuração, os hashes dos dois datasets, a revisão do Git, prompts, rubricas,
+modelos e pacotes ficaram registrados no manifesto. O relatório Pydantic Evals
+contém 34 runs e as dez dimensões por caso; o perfil determinístico sem rede
+também é executável por `make eval`.
 
 ## Fase 12 — juízes offline
 
@@ -522,13 +529,21 @@ continuam controles externos da conta, não propriedades do ledger ou do código
 
 **Decidir:** modelo de cada juiz, rubricas, exemplos rotulados e regras críticas de reprovação.
 
-- [ ] Implementar juiz cego do resultado sem acesso ao trace.
-- [ ] Implementar juiz de trajetória com acesso às chamadas e falhas.
-- [ ] Separar clareza/tom das dimensões industriais críticas.
-- [ ] Retornar score, aprovação e motivo estruturados.
-- [ ] Repetir casos para detectar acerto por acaso e instabilidade.
+- [x] Implementar juiz cego do resultado sem acesso ao trace.
+- [x] Implementar juiz de trajetória com acesso às chamadas e falhas.
+- [x] Separar clareza/tom das dimensões industriais críticas.
+- [x] Retornar score, aprovação e motivo estruturados.
+- [x] Repetir casos para detectar acerto por acaso e instabilidade.
 
 **Aceite:** feedback de avaliação nunca retorna ao agente durante o atendimento.
+
+**Aceite verificado (03/09/2026):** os juízes receberam somente artefatos de
+uma execução encerrada. O cego omite steps/call IDs; o de trajetória recebe
+steps e falhas sanitizados. Ambos retornam `pass`, `score` e `reason` por
+dimensão, e os cortes 0,7/0,8/0,9 são aplicados sem nova chamada. Um teste prova
+que uma resposta correta por acaso pode passar no resultado e falhar na
+trajetória. No experimento real, 68 chamadas julgaram 34 runs e os 17 casos
+foram instáveis entre repetições; nenhuma nota entrou no grafo ou acionou retry.
 
 ## Fase 13 — calibração humana
 
@@ -538,9 +553,17 @@ continuam controles externos da conta, não propriedades do ledger ou do código
 - [ ] Medir concordância bruta, kappa, falso aprovado e falso reprovado.
 - [ ] Comparar limiares `0.7`, `0.8` e `0.9` com as mesmas execuções.
 - [ ] Refinar rubricas, não o gabarito, quando a discordância revelar ambiguidade.
-- [ ] Registrar a limitação de existir um único avaliador humano.
+- [x] Registrar a limitação de existir um único avaliador humano.
 
 **Aceite:** o limiar escolhido é justificado pelos erros observados, não por preferência.
+
+**Status em 03/09/2026 — skipped:** o autor não é especialista industrial da
+TRACTIAN e não produzirá rótulos por suposição. O lote cego de 24 respostas e o
+template sem scores estão prontos, assim como cálculo de concordância bruta,
+Cohen's kappa, falsos aprovados/reprovados e taxa de revisão nos três limiares.
+As quatro tarefas de rotulagem/calibração permanecem abertas até uma pessoa da
+TRACTIAN avaliar o lote sem consultar antes as notas dos juízes. Nenhum limiar
+foi escolhido e o golden set não foi alterado.
 
 ## Fase 14 — comparação Groq × NVIDIA NIM
 
@@ -548,22 +571,51 @@ continuam controles externos da conta, não propriedades do ledger ou do código
 
 **Decidir:** modelos disponíveis no momento do experimento e orçamento de repetições.
 
-- [ ] Implementar adapter NVIDIA NIM sem alterar a lógica central.
-- [ ] Comparar português, tool calling, saída estruturada, estabilidade, contexto, latência e custo.
-- [ ] Avaliar planner e writer separadamente.
+- [x] Implementar adapter NVIDIA NIM sem alterar a lógica central.
+- [x] Comparar português, tool calling, saída estruturada, estabilidade, contexto, latência e custo.
+- [x] Avaliar planner e writer separadamente.
 
 **Aceite:** a recomendação se baseia no benchmark versionado e nas condições reais do teste.
 
+**Aceite verificado (03/09/2026):** os dois providers executaram duas vezes os
+mesmos probes, modelo `openai/gpt-oss-20b`, contexto de 8.000 caracteres e
+contratos reais. Groq passou planner e writer com estabilidade; NVIDIA NIM
+passou writer, mas falhou saída estruturada/estabilidade do planner. As
+latências totais foram 1.735/1.039 ms na Groq e 6.361/21.335 ms na NVIDIA para
+planner/writer. Groq foi recomendado nessas condições. Tokens foram registrados;
+custo ficou indisponível, sem estimativa inventada, pois a configuração não
+congela uma tarifa confiável.
+
 ## Fase 15 — experimento e entrega
 
-- [ ] Congelar versões dos dados, prompts, código, modelos e rubricas.
-- [ ] Rodar experimento final e documentar resultados e limitações.
-- [ ] Adicionar comandos reais de agente e avaliação ao `Makefile` e README.
-- [ ] Adotar `promptfoo` somente se houver comparação recorrente que ele simplifique.
-- [ ] Adotar `Ragas` somente se existir um pipeline RAG para medir.
-- [ ] Revisar segurança, reprodutibilidade e isolamento do golden set.
+- [x] Congelar versões dos dados, prompts, código, modelos e rubricas.
+- [x] Rodar experimento final e documentar resultados e limitações.
+- [x] Adicionar comandos reais de agente e avaliação ao `Makefile` e README.
+- [x] Adotar `promptfoo` somente se houver comparação recorrente que ele simplifique.
+- [x] Adotar `Ragas` somente se existir um pipeline RAG para medir.
+- [x] Revisar segurança, reprodutibilidade e isolamento do golden set.
 
 **Aceite:** outra pessoa consegue reproduzir o experimento seguindo apenas o repositório.
+
+**Decisões:** `promptfoo` não foi adotado porque a comparação atual já é
+versionada e não é uma rotina recorrente. `Ragas` não foi adotado porque não há
+RAG. LangSmith e Phoenix também não entram nesta fase: duplicariam Pydantic
+Evals + Logfire e ampliariam a superfície de traces; podem ser reconsiderados
+somente diante de uma necessidade operacional concreta. A comparação
+programático versus programático + juízes usa exatamente os mesmos runs. No
+resultado atual, ambos rejeitaram todos os 34 e o ganho incremental foi zero;
+isso não autoriza escolher um limiar sem a calibração humana adiada acima.
+
+**Aceite verificado (03/09/2026):** `make eval` executou o perfil local com 17
+casos × 2 e produziu manifesto, relatório e lote cego. O experimento real
+produziu os 34 runs, os dois juízes avaliaram cada run e o benchmark de
+providers comparou os dois papéis separadamente. A auditoria confirmou que
+somente o pacote `evaluation/` importa gabarito, juízes ou rubricas; o runtime
+não recebe esses objetos. `ruff check src tests`, `git diff --check`, os locks
+offline (80 pacotes no agente e 55 na API) e os 44 testes focados passaram.
+`make test` passou com 99 testes da API e 1.803 do agente, 1.902 no total,
+mantendo apenas o warning conhecido de `python_multipart`. A calibração humana
+continua skipped e explicitamente fora deste aceite automático.
 
 ## Registro histórico do plano SDD — Fases 5 e 4
 
