@@ -4,13 +4,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import ValidationError
 
 from tractian_agent.checkpoint import LocalCheckpointOwner, open_checkpointer
 from tractian_agent.client import IndustrialApiClient
-from tractian_agent.contracts import ActionReceipt, Identity, ResponseMode, SupportRequest
+from tractian_agent.contracts import (
+    ActionReceipt,
+    ApiError,
+    ApiErrorCategory,
+    Identity,
+    ResponseMode,
+    SupportRequest,
+)
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
 from tractian_agent.evidence import compile_action_intents
 from tractian_agent.graph import CompiledAgentGraph, build_agent_graph
@@ -39,6 +47,7 @@ from tractian_agent.tools.runtime import (
 from tractian_agent.write_contracts import (
     IntentStatus,
     ReprocessIntentScope,
+    RequestSpecialistAnalysisIntentScope,
     WriteIntent,
 )
 from tractian_agent.write_policy import (
@@ -46,6 +55,7 @@ from tractian_agent.write_policy import (
     PolicyDecision,
     PolicyReason,
     ReprocessProposal,
+    RequestSpecialistAnalysisProposal,
     TrustedActionApproval,
     TrustedWriteContext,
     WritePolicyResult,
@@ -270,6 +280,67 @@ def _terminal_execution_state() -> AgentState:
         final_result=FinalResult(
             decision=AgentDecision.ACT,
             message="Reprocesso concluído.",
+        ),
+        resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+    )
+    return AgentState.model_validate(values)
+
+
+def _terminal_conservative_non_idempotent_state() -> AgentState:
+    state = _initial_state(step_limit=24)
+    proposal = RequestSpecialistAnalysisProposal(
+        analysis_id="an_9906",
+        justification="A limitação registrada exige análise especializada.",
+    )
+    intent = WriteIntent(
+        intent_id="intent_conservative_fast_replay",
+        request_id=state.request_id,
+        scope=RequestSpecialistAnalysisIntentScope(
+            action="request_specialist_analysis",
+            case_id=state.request.case_id,
+            company_id=state.identity.company_id,
+            user_id=state.identity.user_id,
+            analysis_id=proposal.analysis_id,
+            justification=proposal.justification,
+        ),
+        payload_hash=canonical_write_payload_hash(proposal),
+        decision=WritePolicyResult(
+            decision=PolicyDecision.ALLOW,
+            reason=PolicyReason.AUTHORIZED,
+        ),
+        status=IntentStatus.UNCERTAIN,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
+        prepared_execution_id="exec_prepare",
+        attempts=0,
+        error=ApiError(
+            category=ApiErrorCategory.API,
+            code="NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME",
+            message=(
+                "A execução preparadora terminou sem resultado terminal observável."
+            ),
+        ),
+    )
+    values = state.model_dump(mode="python")
+    values.update(
+        execution_id="exec_resume",
+        pending_proposal=proposal,
+        approval=TrustedActionApproval(
+            action="request_specialist_analysis",
+            target_id=proposal.analysis_id,
+            source=ApprovalSource.ORIGINAL_REQUEST,
+        ),
+        intents=(intent,),
+        ledger=compile_action_intents(
+            (intent,),
+            recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        ),
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+        final_result=FinalResult(
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            message=(
+                "O resultado remoto da ação é desconhecido e ela não será "
+                "reenviada automaticamente."
+            ),
         ),
         resume_anchor=ResumeAnchor.EXECUTE_ACTION,
     )
@@ -584,6 +655,85 @@ def test_terminal_write_replay_binds_hidden_asset_when_request_has_no_asset():
     assert replayed == state
     assert error.code == "TRUSTED_WRITE_CONTEXT_DRIFT"
     assert forged_graph.invoke_config is None
+
+
+def test_canonical_conservative_terminal_fast_replays_without_graph_or_http():
+    state = _terminal_conservative_non_idempotent_state()
+    graph = _RecordingGraph(
+        state.model_dump(mode="json"),
+        planner_enabled=True,
+    )
+
+    async def scenario():
+        http_calls = 0
+
+        def handler(_request):
+            nonlocal http_calls
+            http_calls += 1
+            raise AssertionError("fast replay não pode chamar HTTP")
+
+        async with IndustrialApiClient(
+            "https://industrial.test",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            replayed = await invoke_agent(
+                graph,
+                request=_request(),
+                runtime=runtime,
+                thread_id=state.thread_id,
+                request_id=state.request_id,
+                execution_id="exec_fast_replay",
+            )
+        return replayed, http_calls
+
+    replayed, http_calls = asyncio.run(scenario())
+
+    assert replayed == state
+    assert graph.invoke_config is None
+    assert graph.context is None
+    assert http_calls == 0
+
+
+def test_tampered_conservative_terminal_is_rejected_before_graph_ainvoke():
+    state = _terminal_conservative_non_idempotent_state()
+    wire = state.model_dump(mode="json")
+    wire["final_result"]["message"] = "A ação pode ter sido concluída."
+    graph = _RecordingGraph(wire, planner_enabled=True)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            with pytest.raises(ValidationError, match="terminal diverge"):
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_reject_tamper",
+                )
+
+    asyncio.run(scenario())
+
+    assert graph.invoke_config is None
+    assert graph.context is None
 
 
 def test_terminal_write_replay_rejects_persisted_model_drift_at_public_boundary():

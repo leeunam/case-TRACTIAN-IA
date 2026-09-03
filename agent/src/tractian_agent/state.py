@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 import json
@@ -21,7 +22,13 @@ from pydantic import (
     model_validator,
 )
 
-from tractian_agent.contracts import ResponseMode, StrictModel, SupportRequest, ToolCall
+from tractian_agent.contracts import (
+    ApiErrorCategory,
+    ResponseMode,
+    StrictModel,
+    SupportRequest,
+    ToolCall,
+)
 from tractian_agent.tools.analyses import (
     AnalysisDetailToolArtifact,
     AnalysisListToolArtifact,
@@ -959,6 +966,84 @@ class FinalResult(FrozenStateModel):
     next_step: WriterNextStep | None = None
 
 
+@dataclass(frozen=True)
+class ConservativeNonIdempotentResumeTerminal:
+    """Contrato único do terminal local que proíbe um segundo despacho."""
+
+    error: PersistedApiError
+    final_result: FinalResult
+
+    def matches_state(self, state: AgentState) -> bool | None:
+        """Retorna ``None`` fora do caso; ``False`` denuncia shape adulterado."""
+
+        current_intents = tuple(
+            intent
+            for intent in state.intents
+            if intent.request_id == state.request_id
+        )
+        if len(current_intents) != 1:
+            return None
+        intent = current_intents[0]
+        structural_case = (
+            state.resume_anchor is ResumeAnchor.EXECUTE_ACTION
+            and intent.scope.action != "reprocess_analysis"
+            and intent.status is IntentStatus.UNCERTAIN
+            and intent.attempts == 0
+            and intent.receipt is None
+            and intent.prepared_execution_id is not None
+            and intent.prepared_execution_id != state.execution_id
+        )
+        claims_canonical_error = (
+            intent.error is not None and intent.error.code == self.error.code
+        )
+        if not structural_case and not claims_canonical_error:
+            return None
+        return (
+            structural_case
+            and intent.error == self.error
+            and state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+            and state.final_result == self.final_result
+            and state.review is None
+            and state.planner_terminal is None
+            and state.planner_failure is None
+            and state.writer_draft is None
+            and state.writer_failure is None
+            and state.writer_attempts == 0
+            and state.release_gate is None
+        )
+
+
+_CONSERVATIVE_NON_IDEMPOTENT_RESUME_TERMINAL = (
+    ConservativeNonIdempotentResumeTerminal(
+        error=PersistedApiError(
+            category=ApiErrorCategory.API,
+            code="NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME",
+            message=(
+                "A execução preparadora terminou sem resultado terminal observável."
+            ),
+            status_code=None,
+        ),
+        final_result=FinalResult(
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            message=(
+                "O resultado remoto da ação é desconhecido e ela não será "
+                "reenviada automaticamente."
+            ),
+            evidence_ids=(),
+            limitation_refs=(),
+            next_step=None,
+        ),
+    )
+)
+
+
+def canonical_non_idempotent_resume_terminal(
+) -> ConservativeNonIdempotentResumeTerminal:
+    """Fornece erro e resposta fixos, além do predicado estrutural compartilhado."""
+
+    return _CONSERVATIVE_NON_IDEMPOTENT_RESUME_TERMINAL
+
+
 class ReviewRecord(FrozenStateModel):
     status: ReviewStatus
     reason: str | None = Field(default=None, min_length=1, pattern=r"\S")
@@ -1156,6 +1241,11 @@ class AgentState(FrozenStateModel):
             )
 
         if self.resume_anchor is ResumeAnchor.EXECUTE_ACTION:
+            conservative_match = (
+                canonical_non_idempotent_resume_terminal().matches_state(self)
+            )
+            if conservative_match is not None:
+                return conservative_match
             if (
                 self.planner_terminal is not None
                 or self.pending_proposal is None

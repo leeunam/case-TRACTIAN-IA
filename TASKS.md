@@ -399,13 +399,23 @@ writer, repair ou gate e não contém afirmação técnica. Falhas, incertezas c
 qualquer outro código e resultados normais continuam obrigatoriamente em
 `writer → release_gate`.
 
+**Decisão local de segurança — escalação da Task 16:** o terminal conservador
+é reconhecido primeiro pela estrutura independente do código — ação não
+idempotente, intenção `UNCERTAIN` preparada por outra execução, zero tentativas,
+nenhum recibo e âncora `EXECUTE_ACTION`. Um único contrato puro compartilhado
+pelo estado e pela aresta do grafo exige então o erro local completo e o
+`FinalResult` sanitizado exato, sem referências, próximo passo, status HTTP ou
+afirmação técnica. O fast replay rejeita qualquer divergência antes de invocar
+o grafo. Essa validação continua sendo integridade estrutural dentro da fronteira
+confiável do checkpoint; ela não acrescenta MAC nem autenticação criptográfica.
+
 As cinco ações passaram por interrupção após o efeito, fechamento/reabertura do
 SQLite, retomada somente em writer/gate e replay sem novo HTTP ou modelo. A
 confirmação estruturada também terminou no gate sem repetir efeito. As suítes
 focadas da Fase 8 cobrem writer, gate, estado, contratos, planner e fronteira;
 as regressões dos fluxos de escrita somam 235 testes. A suíte completa do agente
-tem 1.601 testes e o `make test` confirmou 99 testes da API + 1.601 do agente =
-1.700 testes. `uv lock --check --offline` resolveu 49
+tem 1.613 testes e o `make test` confirmou 99 testes da API + 1.613 do agente =
+1.712 testes. `uv lock --check --offline` resolveu 49
 pacotes; permaneceu apenas o warning conhecido de `python_multipart`.
 
 ## Fase 9 — revisão humana

@@ -34,6 +34,8 @@ from tractian_agent.state import (
     StateEvidence,
     ThreadScope,
     ToolObservation,
+    WriterNextStep,
+    canonical_non_idempotent_resume_terminal,
 )
 from tractian_agent.tools.observations import (
     ToolArtifact,
@@ -72,6 +74,7 @@ from tractian_agent.write_contracts import (
     PersistedActionReceipt,
     PersistedApiError,
     ReprocessIntentScope,
+    RequestSpecialistAnalysisIntentScope,
     UpdateAssetCriticalityIntentScope,
     WriteIntent,
 )
@@ -191,6 +194,117 @@ def _intent() -> WriteIntent:
         prepared_execution_id="exec_01",
         attempts=0,
     )
+
+
+def _conservative_non_idempotent_terminal_state() -> AgentState:
+    proposal = RequestSpecialistAnalysisProposal(
+        analysis_id="an_9906",
+        justification="A limitação registrada exige análise especializada.",
+    )
+    intent = WriteIntent(
+        intent_id="intent_conservative_resume",
+        request_id="req_01",
+        scope=RequestSpecialistAnalysisIntentScope(
+            action="request_specialist_analysis",
+            case_id="case_tkt_inv_04",
+            company_id="comp_mineracao_andes",
+            user_id="usr_pedro",
+            analysis_id="an_9906",
+            justification=proposal.justification,
+        ),
+        payload_hash=canonical_write_payload_hash(proposal),
+        decision=WritePolicyResult(
+            decision=PolicyDecision.ALLOW,
+            reason=PolicyReason.AUTHORIZED,
+        ),
+        status=IntentStatus.UNCERTAIN,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
+        prepared_execution_id="exec_prepare",
+        attempts=0,
+        error=ApiError(
+            category=ApiErrorCategory.API,
+            code="NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME",
+            message=(
+                "A execução preparadora terminou sem resultado terminal observável."
+            ),
+        ),
+    )
+    return _state(
+        execution_id="exec_resume",
+        step_limit=24,
+        pending_proposal=proposal,
+        approval=TrustedActionApproval(
+            action="request_specialist_analysis",
+            target_id="an_9906",
+            source=ApprovalSource.ORIGINAL_REQUEST,
+        ),
+        intents=(intent,),
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+        final_result=FinalResult(
+            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+            message=(
+                "O resultado remoto da ação é desconhecido e ela não será "
+                "reenviada automaticamente."
+            ),
+        ),
+        resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+    )
+
+
+def test_conservative_non_idempotent_terminal_round_trips_exactly():
+    state = _conservative_non_idempotent_terminal_state()
+    canonical = canonical_non_idempotent_resume_terminal()
+
+    restored = AgentState.model_validate_json(state.model_dump_json())
+
+    assert restored == state
+    assert canonical.matches_state(restored) is True
+    assert restored.intents[0].error == canonical.error
+    assert restored.final_result == canonical.final_result
+    assert restored.has_coherent_terminal_result()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "final_message",
+        "evidence_ids",
+        "limitation_refs",
+        "next_step",
+        "error_code",
+        "error_message",
+        "error_category",
+        "retry_attempt",
+        "status_code",
+    ],
+)
+def test_conservative_non_idempotent_terminal_rejects_each_tampered_field(
+    tamper: str,
+):
+    wire = _conservative_non_idempotent_terminal_state().model_dump(mode="json")
+    if tamper == "final_message":
+        wire["final_result"]["message"] = "A ação pode ter sido concluída."
+    elif tamper == "evidence_ids":
+        wire["final_result"]["evidence_ids"] = ["sha256:v1:" + "a" * 64]
+    elif tamper == "limitation_refs":
+        wire["final_result"]["limitation_refs"] = [
+            "limitation:v1:" + "b" * 64
+        ]
+    elif tamper == "next_step":
+        wire["final_result"]["next_step"] = WriterNextStep.VERIFY_ACTION.value
+    elif tamper == "error_code":
+        wire["intents"][0]["error"]["code"] = "INTENT_SCOPE_MISMATCH"
+    elif tamper == "error_message":
+        wire["intents"][0]["error"]["message"] = "A ação foi concluída."
+    elif tamper == "error_category":
+        wire["intents"][0]["error"]["category"] = ApiErrorCategory.SERVER.value
+    elif tamper == "retry_attempt":
+        wire["intents"][0]["attempts"] = 1
+    else:
+        wire["intents"][0]["error"]["status_code"] = 503
+
+    with pytest.raises(ValidationError):
+        AgentState.model_validate(wire)
 
 
 def test_agent_state_requires_unique_intent_ids_and_one_active_per_request():

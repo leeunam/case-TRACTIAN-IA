@@ -58,6 +58,7 @@ from tractian_agent.state import (
     ToolObservation,
     WriterFailureCode,
     WriterFailureRecord,
+    canonical_non_idempotent_resume_terminal,
     validate_exact_json_model,
     validate_exact_read_artifact,
 )
@@ -122,16 +123,6 @@ _AMBIGUOUS_ERROR_CATEGORIES = frozenset(
 )
 _UNCERTAIN_IDEMPOTENCY_CODES = frozenset(
     {"IDEMPOTENCY_IN_PROGRESS", "IDEMPOTENCY_OUTCOME_UNKNOWN"}
-)
-_NON_IDEMPOTENT_RESUME_UNKNOWN_CODE = (
-    "NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME"
-)
-_NON_IDEMPOTENT_RESUME_UNKNOWN_REASON = (
-    "A execução preparadora terminou sem resultado terminal observável."
-)
-_NON_IDEMPOTENT_RESUME_UNKNOWN_MESSAGE = (
-    "O resultado remoto da ação é desconhecido e ela não será "
-    "reenviada automaticamente."
 )
 _PROPOSAL_ACTION_BY_TOOL = {
     "propose_reprocess_analysis": "reprocess_analysis",
@@ -1319,53 +1310,28 @@ def _non_idempotent_resume_unknown(
     state: AgentState,
     intent: WriteIntent,
 ) -> dict[str, object]:
+    canonical = canonical_non_idempotent_resume_terminal()
     uncertain = _updated_intent(
         intent,
         status=IntentStatus.UNCERTAIN,
         attempts=0,
-        error=_local_intent_error(
-            _NON_IDEMPOTENT_RESUME_UNKNOWN_CODE,
-            _NON_IDEMPOTENT_RESUME_UNKNOWN_REASON,
-        ),
+        error=canonical.error,
     )
-    return _checkpoint_update(
-        _terminal_result(
-            _replace_intent(state, uncertain),
-            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
-            message=_NON_IDEMPOTENT_RESUME_UNKNOWN_MESSAGE,
-        )
+    terminal = _replace_intent(state, uncertain).model_copy(
+        update={
+            "decision": canonical.final_result.decision,
+            "final_result": canonical.final_result,
+        }
     )
+    return _checkpoint_update(_record_ledger(terminal))
 
 
 def _is_conservative_non_idempotent_terminal(state: AgentState) -> bool:
-    """Reconhece somente o terminal local criado pelo guard de retomada."""
-    current_intents = tuple(
-        intent for intent in state.intents if intent.request_id == state.request_id
-    )
-    if len(current_intents) != 1:
-        return False
-    intent = current_intents[0]
+    """Mantém a rota dependente do mesmo contrato validado por ``AgentState``."""
+
     return (
-        state.resume_anchor is ResumeAnchor.EXECUTE_ACTION
-        and state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
-        and state.final_result
-        == FinalResult(
-            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
-            message=_NON_IDEMPOTENT_RESUME_UNKNOWN_MESSAGE,
-        )
-        and state.review is None
-        and state.writer_draft is None
-        and state.writer_failure is None
-        and state.writer_attempts == 0
-        and state.release_gate is None
-        and intent.scope.action != "reprocess_analysis"
-        and intent.status is IntentStatus.UNCERTAIN
-        and intent.attempts == 0
-        and intent.prepared_execution_id is not None
-        and intent.prepared_execution_id != state.execution_id
-        and intent.error is not None
-        and intent.error.code == _NON_IDEMPOTENT_RESUME_UNKNOWN_CODE
-        and intent.error.message == _NON_IDEMPOTENT_RESUME_UNKNOWN_REASON
+        canonical_non_idempotent_resume_terminal().matches_state(state)
+        is True
     )
 
 
