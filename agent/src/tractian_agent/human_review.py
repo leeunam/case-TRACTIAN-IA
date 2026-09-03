@@ -33,6 +33,7 @@ from tractian_agent.state import (
     ThreadScope,
     WriterDraft,
     WriterNextStep,
+    allowed_review_operations,
 )
 from tractian_agent.tools.runtime import Permission
 from tractian_agent.writer import build_writer_context
@@ -84,14 +85,9 @@ def _allowed_operations(
     reason: ReleaseGateReason,
     draft: WriterDraft | None,
 ) -> tuple[ReviewOperation, ...]:
-    approve = (
-        draft is not None
-        and reason is ReleaseGateReason.HUMAN_DISPOSITION_REQUIRED
-    )
-    return (
-        *((ReviewOperation.APPROVE,) if approve else ()),
-        ReviewOperation.EDIT,
-        ReviewOperation.REJECT,
+    return allowed_review_operations(
+        reason,
+        draft_present=draft is not None,
     )
 
 

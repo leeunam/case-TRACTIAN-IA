@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -44,6 +45,7 @@ from tractian_agent.state import (
     WriterFailureCode,
     WriterFailureRecord,
     WriterNextStep,
+    allowed_review_operations,
 )
 
 
@@ -161,6 +163,14 @@ def test_review_request_is_deterministic_strict_frozen_and_exactly_24_hours():
         type(first).model_validate(
             {**first.model_dump(), "created_at": NOW.replace(tzinfo=None)}
         )
+    for field, value in (
+        ("reason", ReleaseGateReason.NEXT_STEP_MISMATCH.value),
+        ("allowed_operations", [ReviewOperation.REJECT.value]),
+    ):
+        wire = first.model_dump(mode="json")
+        wire[field] = value
+        with pytest.raises(ValidationError):
+            ReviewRequest.model_validate_json(json.dumps(wire))
     with pytest.raises(ValidationError):
         first.review_id = "changed"  # type: ignore[misc]
 
@@ -203,6 +213,15 @@ def test_review_contracts_reject_python_coercions_but_round_trip_json():
     for model_type, value in coercions:
         with pytest.raises(ValidationError):
             model_type.model_validate(value)
+
+    expiry_wire = expiry.model_dump(mode="json")
+    expiry_wire["trigger"] = True
+    with pytest.raises(ValidationError):
+        ReviewExpiry.model_validate_json(json.dumps(expiry_wire))
+    expiry_wire = expiry.model_dump(mode="json")
+    expiry_wire["trigger"] = "new_request"
+    with pytest.raises(ValidationError):
+        ReviewExpiry.model_validate_json(json.dumps(expiry_wire))
 
     with pytest.raises(ValidationError):
         ReviewerIdentity.model_validate(
@@ -436,44 +455,46 @@ def test_hard_gate_reason_cannot_be_approved_or_overridden_by_edit():
     )
 
     assert gate.reason is ReleaseGateReason.PERMISSION_INCOMPATIBLE
-    assert ReviewOperation.APPROVE not in request.allowed_operations
+    assert request.allowed_operations == (ReviewOperation.REJECT,)
     with pytest.raises(ValueError, match="não permitida"):
         build_reviewed_draft(
             request,
             ReviewApproveReply(review_id=request.review_id, operation="approve"),
             context.ledger,
         )
-    edited = build_reviewed_draft(
-        request,
-        ReviewEditReply(
-            review_id=request.review_id,
-            operation="edit",
-            evidence_ids=request.eligible_evidence_ids,
-            next_step=WriterNextStep.MONITOR,
-        ),
-        context.ledger,
-    )
     edit_reply = ReviewEditReply(
         review_id=request.review_id,
         operation="edit",
         evidence_ids=request.eligible_evidence_ids,
         next_step=WriterNextStep.MONITOR,
     )
-    audit = build_review_audit(
-        request=request,
-        resolution=_resolution(request, edit_reply),
-        reviewed_draft=edited,
+    with pytest.raises(ValueError, match="não permitida"):
+        build_reviewed_draft(request, edit_reply, context.ledger)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        ReleaseGateReason.REQUEST_MISMATCH,
+        ReleaseGateReason.DECISION_MISMATCH,
+        ReleaseGateReason.LIMITATION_REFERENCE_MISMATCH,
+        ReleaseGateReason.INSUFFICIENT_EVIDENCE,
+        ReleaseGateReason.PERMISSION_INCOMPATIBLE,
+        ReleaseGateReason.INTENT_MISSING,
+        ReleaseGateReason.INTENT_UNCERTAIN,
+        ReleaseGateReason.INTENT_NOT_COMPLETED,
+        ReleaseGateReason.INTENT_POLICY_MISMATCH,
+        ReleaseGateReason.APPROVAL_MISMATCH,
+        ReleaseGateReason.ACTION_EVIDENCE_MISSING,
+        ReleaseGateReason.MISSING_INFORMATION_INVALID,
+        ReleaseGateReason.HUMAN_REVIEW_REQUESTED,
+        ReleaseGateReason.STEP_BUDGET_EXHAUSTED,
+    ],
+)
+def test_hard_gate_reasons_offer_only_rejection(reason: ReleaseGateReason):
+    assert allowed_review_operations(reason, draft_present=True) == (
+        ReviewOperation.REJECT,
     )
-    assert evaluate_release(
-        context.model_copy(
-            update={
-                "draft": edited,
-                "review_request": request,
-                "review_audit": audit,
-                "review_resolution": _resolution(request, edit_reply),
-            }
-        )
-    ).reason is ReleaseGateReason.PERMISSION_INCOMPATIBLE
 
 
 def test_writer_failure_can_be_structurally_edited_without_model_call():

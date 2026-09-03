@@ -417,11 +417,13 @@ def _action_is_trusted(context: ReleaseGateContext) -> ReleaseGateReason | None:
     if not _approval_matches_intent(context, intent):
         return ReleaseGateReason.APPROVAL_MISMATCH
     if not any(
-        item.intent_id == intent.intent_id
+        item.source_kind is EvidenceSourceKind.ACTION
+        and item.intent_id == intent.intent_id
         and item.action == intent.scope.action
         and item.fact_path == "accepted"
         and item.value.to_python() is True
         and item.claimable
+        and item.evidence_id in context.draft.evidence_ids
         for item in context.ledger.items
     ):
         return ReleaseGateReason.ACTION_EVIDENCE_MISSING

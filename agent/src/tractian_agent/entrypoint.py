@@ -25,9 +25,20 @@ from tractian_agent.human_review import (
     ReviewResumeEnvelope,
     ReviewerIdentity,
     build_reviewed_draft,
+    canonical_digest,
+    render_review_expired_result,
     review_resolution_subject_digest,
 )
-from tractian_agent.state import AgentState, ResumeAnchor, ReviewReply, ThreadScope
+from tractian_agent.state import (
+    AgentDecision,
+    AgentState,
+    ResumeAnchor,
+    ReviewExpiry,
+    ReviewRecord,
+    ReviewReply,
+    ReviewStatus,
+    ThreadScope,
+)
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.write_contracts import (
     ConfirmationReply,
@@ -587,19 +598,21 @@ def _review_command(
         raise AgentInvocationProtocolError(
             "REVIEW_COMPANY_MISMATCH", "o revisor pertence a outra empresa"
         )
-    if reply.operation not in {
-        operation.value for operation in request.allowed_operations
-    }:
-        raise AgentInvocationProtocolError(
-            "INVALID_REVIEW_OPERATION", "a operação não é permitida"
-        )
-    if isinstance(reply, (ReviewApproveReply, ReviewEditReply)):
-        try:
-            build_reviewed_draft(request, reply, state.ledger)
-        except ValueError as error:
+    if received_at < request.expires_at:
+        if reply.operation not in {
+            operation.value for operation in request.allowed_operations
+        }:
             raise AgentInvocationProtocolError(
-                "INVALID_REVIEW_EDIT", "a edição não passa pelo contrato estrutural"
-            ) from error
+                "INVALID_REVIEW_OPERATION", "a operação não é permitida"
+            )
+        if isinstance(reply, (ReviewApproveReply, ReviewEditReply)):
+            try:
+                build_reviewed_draft(request, reply, state.ledger)
+            except ValueError as error:
+                raise AgentInvocationProtocolError(
+                    "INVALID_REVIEW_EDIT",
+                    "a edição não passa pelo contrato estrutural",
+                ) from error
     envelope = ReviewResumeEnvelope(
         reply=reply,
         reviewer=reviewer,
@@ -623,7 +636,8 @@ def _terminal_review_replay(
     resolution_digest = review_resolution_subject_digest(reply, reviewer)
     if state.review_expiry is not None:
         return (
-            reply.review_id == state.review_expiry.review_id
+            state.review_expiry.trigger == "reply"
+            and reply.review_id == state.review_expiry.review_id
             and resolution_digest == state.review_expiry.resolution_digest
         )
     audit = state.review_audit
@@ -637,6 +651,35 @@ def _terminal_review_replay(
             state.review_resolution.reviewer,
         )
     )
+
+
+def _expire_review_for_new_request(
+    state: AgentState,
+    *,
+    expired_at: datetime,
+) -> AgentState:
+    request = state.review_request
+    if request is None or expired_at < request.expires_at:
+        raise ValueError("somente revisão vencida pode ser encerrada internamente")
+    data = state.advance_step().model_dump(mode="json")
+    data.update(
+        resume_anchor=ResumeAnchor.AWAIT_HUMAN_REVIEW.value,
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW.value,
+        final_result=render_review_expired_result().model_dump(mode="json"),
+        release_gate=request.gate_basis.model_dump(mode="json"),
+        review=ReviewRecord(
+            status=ReviewStatus.REQUIRED,
+            reason="human_review:expired",
+        ).model_dump(mode="json"),
+        review_expiry=ReviewExpiry(
+            review_id=request.review_id,
+            review_digest=canonical_digest(request),
+            trigger="new_request",
+            resolution_digest=None,
+            expired_at=expired_at,
+        ).model_dump(mode="json"),
+    )
+    return AgentState.model_validate(data)
 
 
 async def invoke_agent(
@@ -732,6 +775,21 @@ async def invoke_agent(
                 and persisted.review_audit is not None
                 and snapshot.next == ("release_gate",)
             )
+            pending_review_new_request = (
+                new_request
+                and review_reply is None
+                and persisted.review_request is not None
+                and persisted.review_audit is None
+                and persisted.review_expiry is None
+            )
+            expiry_boundary_time = (
+                _utc_now() if pending_review_new_request else None
+            )
+            close_expired_review = bool(
+                expiry_boundary_time is not None
+                and persisted.review_request is not None
+                and expiry_boundary_time >= persisted.review_request.expires_at
+            )
             if persisted.final_result is not None:
                 _validate_terminal_resume_anchor(persisted, checkpoint_anchor)
                 if snapshot.next:
@@ -769,7 +827,9 @@ async def invoke_agent(
                 planner_enabled=planner_enabled,
                 include_current_flow=not new_request,
                 allow_review_resume=(
-                    review_reply is not None or internal_review_continuation
+                    review_reply is not None
+                    or internal_review_continuation
+                    or close_expired_review
                 ),
             )
             if (
@@ -831,6 +891,24 @@ async def invoke_agent(
                     "REQUEST_ID_ALREADY_USED",
                     "request_id já pertence ao histórico do thread",
                 )
+            if close_expired_review:
+                assert expiry_boundary_time is not None
+                persisted = _expire_review_for_new_request(
+                    persisted,
+                    expired_at=expiry_boundary_time,
+                )
+                config = await graph.aupdate_state(
+                    snapshot.config,
+                    persisted.model_dump(mode="json"),
+                    as_node="await_human_review",
+                )
+                snapshot = await graph.aget_state(config)
+                persisted = AgentState.model_validate(snapshot.values)
+                if snapshot.next:
+                    raise AgentInvocationProtocolError(
+                        "EXPIRED_REVIEW_WITH_PENDING_WORK",
+                        "a revisão vencida não encerrou canonicamente",
+                    )
             state = persisted.continue_with(
                 request=request,
                 identity=runtime.identity,

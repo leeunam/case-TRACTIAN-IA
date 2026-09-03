@@ -741,6 +741,31 @@ class ReviewOperation(str, Enum):
     REJECT = "reject"
 
 
+_EDITABLE_REVIEW_REASONS = frozenset(
+    {
+        ReleaseGateReason.HUMAN_DISPOSITION_REQUIRED,
+        ReleaseGateReason.WRITER_FAILURE,
+        ReleaseGateReason.EVIDENCE_REFERENCE_MISMATCH,
+        ReleaseGateReason.NEXT_STEP_MISMATCH,
+    }
+)
+
+
+def allowed_review_operations(
+    reason: ReleaseGateReason,
+    *,
+    draft_present: bool,
+) -> tuple[ReviewOperation, ...]:
+    """Retorna a allowlist fechada das únicas disposições humanas sanáveis."""
+    operations: list[ReviewOperation] = []
+    if reason is ReleaseGateReason.HUMAN_DISPOSITION_REQUIRED and draft_present:
+        operations.append(ReviewOperation.APPROVE)
+    if reason in _EDITABLE_REVIEW_REASONS:
+        operations.append(ReviewOperation.EDIT)
+    operations.append(ReviewOperation.REJECT)
+    return tuple(operations)
+
+
 class ReviewQuestion(str, Enum):
     CONFIRM_HUMAN_DISPOSITION = "confirm_human_disposition"
     REBUILD_STRUCTURED_DRAFT = "rebuild_structured_draft"
@@ -831,15 +856,9 @@ class ReviewRequest(ReviewStateModel):
             if self.reason is ReleaseGateReason.WRITER_FAILURE
             else ReviewQuestion.ASSESS_BLOCKING_SAFETY
         )
-        expected_operations = (
-            (
-                ReviewOperation.APPROVE,
-                ReviewOperation.EDIT,
-                ReviewOperation.REJECT,
-            )
-            if self.reason is ReleaseGateReason.HUMAN_DISPOSITION_REQUIRED
-            and self.draft is not None
-            else (ReviewOperation.EDIT, ReviewOperation.REJECT)
+        expected_operations = allowed_review_operations(
+            self.reason,
+            draft_present=self.draft is not None,
         )
         if (
             self.question is not expected_question
@@ -987,7 +1006,11 @@ class ReviewAudit(ReviewStateModel):
 class ReviewExpiry(ReviewStateModel):
     review_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     review_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
-    resolution_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    trigger: Literal["reply", "new_request"] = "reply"
+    resolution_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256:v1:[0-9a-f]{64}$",
+    )
     expired_at: datetime
 
     @field_validator("expired_at")
@@ -996,6 +1019,12 @@ class ReviewExpiry(ReviewStateModel):
         if value.tzinfo is None or value.utcoffset() != timedelta(0):
             raise ValueError("expiração exige instante UTC aware")
         return value
+
+    @model_validator(mode="after")
+    def _bind_trigger_fingerprint(self) -> ReviewExpiry:
+        if (self.trigger == "reply") != (self.resolution_digest is not None):
+            raise ValueError("gatilho da expiração diverge do fingerprint")
+        return self
 
 
 class ReviewStatus(str, Enum):
@@ -1429,11 +1458,28 @@ class AgentState(FrozenStateModel):
         if self.final_result is None:
             return True
         if self.resume_anchor is ResumeAnchor.AWAIT_HUMAN_REVIEW:
+            expected_review = (
+                ReviewRecord(
+                    status=ReviewStatus.REQUIRED,
+                    reason="human_review:expired",
+                )
+                if self.review_expiry is not None
+                else ReviewRecord(
+                    status=ReviewStatus.REJECTED,
+                    reason="human_review:rejected",
+                )
+                if self.review_audit is not None
+                and self.review_audit.operation is ReviewOperation.REJECT
+                else None
+            )
             return (
-                self.final_result.decision
+                self.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+                and self.review == expected_review
+                and self.final_result.decision
                 is AgentDecision.REQUIRE_HUMAN_REVIEW
                 and self.review_request is not None
                 and self.release_gate is not None
+                and self.release_gate == self.review_request.gate_basis
                 and (
                     (
                         self.review_expiry is not None
@@ -1913,12 +1959,24 @@ class AgentState(FrozenStateModel):
         )
         if request != expected:
             raise ValueError("solicitação de revisão diverge da base canônica")
+        if (
+            self.resume_anchor is ResumeAnchor.AWAIT_HUMAN_REVIEW
+            and self.release_gate not in {request.gate_basis, None}
+        ):
+            raise ValueError("gate suspenso diverge da base da revisão")
         if self.review_audit is not None and self.review_expiry is not None:
             raise ValueError("auditoria e expiração são mutuamente exclusivas")
         resolution = self.review_resolution
         if self.review_expiry is not None:
             if (
                 resolution is not None
+                or self.decision is not AgentDecision.REQUIRE_HUMAN_REVIEW
+                or self.review
+                != ReviewRecord(
+                    status=ReviewStatus.REQUIRED,
+                    reason="human_review:expired",
+                )
+                or self.release_gate != request.gate_basis
                 or self.review_expiry.review_id != request.review_id
                 or self.review_expiry.review_digest != canonical_digest(request)
                 or self.review_expiry.expired_at < request.expires_at
@@ -1952,7 +2010,14 @@ class AgentState(FrozenStateModel):
             raise ValueError("auditoria de revisão foi adulterada")
         if audit.operation is ReviewOperation.REJECT:
             if (
-                self.reviewed_draft is not None
+                self.decision is not AgentDecision.REQUIRE_HUMAN_REVIEW
+                or self.review
+                != ReviewRecord(
+                    status=ReviewStatus.REJECTED,
+                    reason="human_review:rejected",
+                )
+                or self.release_gate != request.gate_basis
+                or self.reviewed_draft is not None
                 or self.final_result != render_review_rejected_result()
             ):
                 raise ValueError("rejeição não aceita draft revisado")

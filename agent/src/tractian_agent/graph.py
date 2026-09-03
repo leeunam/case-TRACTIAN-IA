@@ -1079,8 +1079,13 @@ def _await_human_review(state: AgentState) -> dict[str, object]:
             _replace_state(
                 advanced,
                 resume_anchor=ResumeAnchor.AWAIT_HUMAN_REVIEW,
+                decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
                 final_result=render_review_expired_result(),
                 release_gate=request.gate_basis,
+                review=ReviewRecord(
+                    status=ReviewStatus.REQUIRED,
+                    reason="human_review:expired",
+                ),
                 review_expiry=ReviewExpiry(
                     review_id=request.review_id,
                     review_digest=canonical_digest(request),
@@ -1101,6 +1106,7 @@ def _await_human_review(state: AgentState) -> dict[str, object]:
             _replace_state(
                 advanced,
                 resume_anchor=ResumeAnchor.AWAIT_HUMAN_REVIEW,
+                decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
                 final_result=render_review_rejected_result(),
                 release_gate=request.gate_basis,
                 review=ReviewRecord(

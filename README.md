@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável e checkpointer SQLite de desenvolvimento. Em 03/09/2026, `make test` passou com 99 testes da API e 1.658 do agente (1.757 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 9 estão concluídas. O grafo atual ainda não é um agente de produção: Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável e checkpointer SQLite de desenvolvimento. Em 03/09/2026, `make test` passou com 99 testes da API e 1.681 do agente (1.780 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 9 estão concluídas. O grafo atual ainda não é um agente de produção: Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -63,7 +63,11 @@ resposta. A aprovação só remove o motivo fechado `HUMAN_DISPOSITION_REQUIRED`
 de um draft `GUIDE` que já passou pelas demais verificações e pediu disposição
 humana como próximo passo; ela nunca transforma a decisão explícita
 `REQUIRE_HUMAN_REVIEW` do planner em orientação. Edição limita-se à seleção e à
-ordem das evidências atuais e ao próximo passo enumerado. Toda retomada revalida
+ordem das evidências atuais e ao próximo passo enumerado, e só é oferecida para
+`HUMAN_DISPOSITION_REQUIRED`, `WRITER_FAILURE`,
+`EVIDENCE_REFERENCE_MISMATCH` ou `NEXT_STEP_MISMATCH`; demais motivos aceitam
+somente rejeição. Para `ACT` e `ESCALATE`, a seleção revisada precisa preservar
+o fato `accepted` do recibo ligado à intenção atual. Toda retomada revalida
 ledger, permissões e intenções; bloqueios duros, rejeição, expiração ou uma
 segunda necessidade de revisão encerram de forma segura, sem executar ação.
 O ID da revisão inclui o escopo do thread; contratos rejeitam coerções Python e
@@ -72,6 +76,8 @@ o envelope confiável de autoria, empresa, permissão, horário e reply fica lig
 mas bloqueia qualquer retorno público do estado técnico, inclusive em replay.
 O orçamento reserva o interrupt e o segundo gate antes de iniciar caminhos
 revisáveis; checkpoints legados sem essa reserva terminam por contrato próprio.
+No vencimento, a expiração precede a semântica da operação; uma nova solicitação
+encerra primeiro a revisão vencida, sem reexecutar trabalho antigo.
 
 O **ledger de evidências** associa fatos às fontes consultadas no estado da execução. Ele recebe somente observações de leitura validadas e recibos tipados de intenções terminais; texto livre de LLM, proposals e mensagens de recibo não viram fatos. O Logfire receberá traces e métricas para consulta humana e operação; ele não será o banco principal do ledger nem uma fonte que o agente consulta durante o atendimento. Logfire ainda não está implementado.
 

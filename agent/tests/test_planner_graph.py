@@ -25,6 +25,7 @@ from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
 from tractian_agent.human_review import (
     ReviewApproveReply,
     ReviewEditReply,
+    ReviewOperation,
     ReviewRejectReply,
     ReviewerIdentity,
     build_review_request,
@@ -934,19 +935,24 @@ def test_legacy_review_checkpoint_exhausted_at_regate_uses_gate_terminal(
     assert len(requests) == 1
 
 
+@pytest.mark.parametrize("expired", [False, True])
 def test_concurrent_review_replies_are_literal_idempotent_or_divergent(
+    expired,
     tmp_path,
     monkeypatch,
 ):
     created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
     monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
     monkeypatch.setattr(
-        entrypoint_module, "_utc_now", lambda: created_at + timedelta(minutes=1)
+        entrypoint_module,
+        "_utc_now",
+        lambda: created_at
+        + (timedelta(hours=24) if expired else timedelta(minutes=1)),
     )
     requests: list[httpx.Request] = []
 
     async def run_pair(name, *, divergent):
-        path = tmp_path / f"review-concurrent-{name}.sqlite3"
+        path = tmp_path / f"review-concurrent-{name}-{expired}.sqlite3"
         waiting, runtime, client, planner_model, writer_model = (
             await _start_human_review(path, requests)
         )
@@ -1179,6 +1185,11 @@ def test_pending_review_rejects_new_request_stale_id_and_wrong_company_then_reje
     assert rejected.review_audit is not None
     assert rejected.review_audit.operation.value == "reject"
     assert rejected.reviewed_draft is None
+    assert rejected.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+    assert rejected.review is not None
+    assert rejected.review.status.value == "rejected"
+    assert rejected.review.reason == "human_review:rejected"
+    assert rejected.release_gate == rejected.review_request.gate_basis
     assert len(requests) == 1
     for field, value in (
         ("message", "A revisão foi aprovada."),
@@ -1187,6 +1198,24 @@ def test_pending_review_rejects_new_request_stale_id_and_wrong_company_then_reje
     ):
         wire = json.loads(rejected.model_dump_json())
         wire["final_result"][field] = value
+        with pytest.raises(ValidationError):
+            AgentState.model_validate(wire)
+    for field, value in (
+        ("decision", AgentDecision.GUIDE.value),
+        (
+            "review",
+            {"status": "approved", "reason": "human_review:forged"},
+        ),
+        (
+            "release_gate",
+            {
+                **rejected.release_gate.model_dump(mode="json"),
+                "reason": ReleaseGateReason.NEXT_STEP_MISMATCH.value,
+            },
+        ),
+    ):
+        wire = json.loads(rejected.model_dump_json())
+        wire[field] = value
         with pytest.raises(ValidationError):
             AgentState.model_validate(wire)
 
@@ -1222,9 +1251,11 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
                     thread_id="thread_review_boundaries",
                     request_id="req_review_boundaries",
                     execution_id="exec_expired_review",
-                    review_reply=ReviewApproveReply(
+                    review_reply=ReviewEditReply(
                         review_id=waiting.review_request.review_id,
-                        operation="approve",
+                        operation="edit",
+                        evidence_ids=("sha256:v1:" + "f" * 64,),
+                        next_step=WriterNextStep.MONITOR,
                     ),
                     reviewer=ReviewerIdentity(
                         reviewer_id="reviewer_not_recorded",
@@ -1239,9 +1270,11 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
                     thread_id="thread_review_boundaries",
                     request_id="req_review_boundaries",
                     execution_id="exec_expired_review_replay",
-                    review_reply=ReviewApproveReply(
+                    review_reply=ReviewEditReply(
                         review_id=waiting.review_request.review_id,
-                        operation="approve",
+                        operation="edit",
+                        evidence_ids=("sha256:v1:" + "f" * 64,),
+                        next_step=WriterNextStep.MONITOR,
                     ),
                     reviewer=ReviewerIdentity(
                         reviewer_id="reviewer_not_recorded",
@@ -1257,9 +1290,11 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
                         thread_id="thread_review_boundaries",
                         request_id="req_review_boundaries",
                         execution_id="exec_expired_review_divergent",
-                        review_reply=ReviewApproveReply(
+                        review_reply=ReviewEditReply(
                             review_id=waiting.review_request.review_id,
-                            operation="approve",
+                            operation="edit",
+                            evidence_ids=("sha256:v1:" + "f" * 64,),
+                            next_step=WriterNextStep.MONITOR,
                         ),
                         reviewer=ReviewerIdentity(
                             reviewer_id="reviewer_other",
@@ -1276,6 +1311,11 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
     assert expired.review_expiry is not None
     assert expired.review_expiry.expired_at == expired.review_request.expires_at
     assert expired.review_audit is None
+    assert expired.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+    assert expired.review is not None
+    assert expired.review.status.value == "required"
+    assert expired.review.reason == "human_review:expired"
+    assert expired.release_gate == expired.review_request.gate_basis
     assert "reviewer_not_recorded" not in expired.model_dump_json()
     assert replayed == expired
     assert divergent_code == "DIVERGENT_REVIEW"
@@ -1289,6 +1329,110 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
         wire["final_result"][field] = value
         with pytest.raises(ValidationError):
             AgentState.model_validate(wire)
+    for field, value in (
+        ("decision", AgentDecision.GUIDE.value),
+        (
+            "review",
+            {"status": "approved", "reason": "human_review:forged"},
+        ),
+        (
+            "release_gate",
+            {
+                **expired.release_gate.model_dump(mode="json"),
+                "reason": ReleaseGateReason.NEXT_STEP_MISMATCH.value,
+            },
+        ),
+    ):
+        wire = json.loads(expired.model_dump_json())
+        wire[field] = value
+        with pytest.raises(ValidationError):
+            AgentState.model_validate(wire)
+
+
+def test_new_request_closes_expired_review_before_starting_fresh_work(
+    tmp_path,
+    monkeypatch,
+):
+    created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
+    monkeypatch.setattr(entrypoint_module, "_utc_now", lambda: created_at)
+    requests: list[httpx.Request] = []
+
+    async def scenario():
+        checkpoint_path = tmp_path / "review-auto-expiry.sqlite3"
+        waiting, runtime, client, _, _ = await _start_human_review(
+            checkpoint_path, requests
+        )
+        assert waiting.review_request is not None
+        old_review_id = waiting.review_request.review_id
+        expired_at = waiting.review_request.expires_at
+        monkeypatch.setattr(graph_module, "_utc_now", lambda: expired_at)
+        monkeypatch.setattr(entrypoint_module, "_utc_now", lambda: expired_at)
+        fresh_planner_model = _ScriptedPlannerModel(
+            selector_responses=(
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "get_asset",
+                            "args": {"asset_id": "asset_G501"},
+                            "id": "fresh_review_call",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="done"),
+            ),
+            terminal_responses=(
+                PlannerTerminalDecision(
+                    decision=PlannerDecisionKind.GUIDE,
+                    stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+                ),
+            ),
+        )
+        try:
+            async with open_checkpointer(checkpoint_path) as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(fresh_planner_model),
+                    writer=Writer(_HumanDispositionWriterModel()),
+                )
+                with pytest.raises(ValidationError):
+                    await invoke_agent(
+                        graph,
+                        request=_request(
+                            message="Escopo diferente após o vencimento."
+                        ).model_copy(update={"case_id": "case_other"}),
+                        runtime=runtime,
+                        thread_id="thread_review_boundaries",
+                        request_id="req_wrong_scope_after_expiry",
+                        execution_id="exec_wrong_scope_after_expiry",
+                    )
+                expired_snapshot = await graph.aget_state(
+                    {"configurable": {"thread_id": "thread_review_boundaries"}}
+                )
+                expired = AgentState.model_validate(expired_snapshot.values)
+                assert expired.review_expiry is not None
+                assert expired.review_expiry.trigger == "new_request"
+                assert expired.final_result is not None
+                fresh = await invoke_agent(
+                    graph,
+                    request=_request(message="Nova solicitação após o vencimento."),
+                    runtime=runtime,
+                    thread_id="thread_review_boundaries",
+                    request_id="req_after_expired_review",
+                    execution_id="exec_after_expired_review",
+                )
+                return old_review_id, fresh
+        finally:
+            await client.aclose()
+
+    old_review_id, fresh = asyncio.run(scenario())
+    assert fresh.request_id == "req_after_expired_review"
+    assert fresh.final_result is None
+    assert fresh.review_request is not None
+    assert fresh.review_request.review_id != old_review_id
+    assert len(requests) == 2
 
 
 def test_human_edit_preserves_selected_order_and_releases_through_gate(
@@ -1637,14 +1781,19 @@ def test_two_writer_failures_can_be_edited_without_a_third_model_call(
     assert completed.release_gate.outcome is ReleaseGateOutcome.RELEASE
 
 
+@pytest.mark.parametrize("expired", [False, True])
 def test_planner_explicit_review_is_not_converted_to_guide_and_has_no_second_loop(
+    expired,
     tmp_path,
     monkeypatch,
 ):
     created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
     monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
     monkeypatch.setattr(
-        entrypoint_module, "_utc_now", lambda: created_at.replace(minute=1)
+        entrypoint_module,
+        "_utc_now",
+        lambda: created_at
+        + (timedelta(hours=24) if expired else timedelta(minutes=1)),
     )
     requests: list[httpx.Request] = []
     explicit_review = PlannerTerminalDecision(
@@ -1653,7 +1802,7 @@ def test_planner_explicit_review_is_not_converted_to_guide_and_has_no_second_loo
     )
 
     async def scenario():
-        path = tmp_path / "planner-explicit-review.sqlite3"
+        path = tmp_path / f"planner-explicit-review-{expired}.sqlite3"
         waiting, runtime, client, planner_model, writer_model = (
             await _start_human_review(
                 path,
@@ -1663,6 +1812,9 @@ def test_planner_explicit_review_is_not_converted_to_guide_and_has_no_second_loo
             )
         )
         assert waiting.review_request is not None
+        assert waiting.review_request.allowed_operations == (
+            ReviewOperation.REJECT,
+        )
         try:
             async with open_checkpointer(path) as saver:
                 graph = build_agent_graph(
@@ -1676,12 +1828,19 @@ def test_planner_explicit_review_is_not_converted_to_guide_and_has_no_second_loo
                     runtime=runtime,
                     thread_id="thread_review_boundaries",
                     request_id="req_review_boundaries",
-                    execution_id="exec_explicit_review_edit",
-                    review_reply=ReviewEditReply(
-                        review_id=waiting.review_request.review_id,
-                        operation="edit",
-                        evidence_ids=waiting.review_request.eligible_evidence_ids,
-                        next_step=WriterNextStep.AWAIT_HUMAN_REVIEW,
+                    execution_id=f"exec_explicit_review_{expired}",
+                    review_reply=(
+                        ReviewEditReply(
+                            review_id=waiting.review_request.review_id,
+                            operation="edit",
+                            evidence_ids=("sha256:v1:" + "f" * 64,),
+                            next_step=WriterNextStep.MONITOR,
+                        )
+                        if expired
+                        else ReviewRejectReply(
+                            review_id=waiting.review_request.review_id,
+                            operation="reject",
+                        )
                     ),
                     reviewer=ReviewerIdentity(
                         reviewer_id="reviewer_01",
@@ -1701,6 +1860,7 @@ def test_planner_explicit_review_is_not_converted_to_guide_and_has_no_second_loo
     assert completed.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
     assert completed.release_gate.reason.value == "human_review_requested"
     assert completed.final_result is not None
+    assert (completed.review_expiry is not None) is expired
     assert snapshot.next == ()
     assert snapshot.interrupts == ()
 

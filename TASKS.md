@@ -449,13 +449,17 @@ writer, mas sempre volta ao mesmo gate; se continuar bloqueada, encerra com
 aviso seguro e não abre uma segunda revisão.
 
 **Evidência de aceite (03/09/2026):** `make test` passou com 99 testes da API e
-1.658 do agente; os 235 fluxos de escrita passaram separadamente, assim como
+1.681 do agente; os 235 fluxos de escrita passaram separadamente, assim como
 Ruff e `uv lock --check --offline`. A retomada com SQLite reaberto preservou
 planner, writer, tools e ações já concluídos sem nova chamada. Testes adversariais
 adicionais cobrem perda de `read` em todas as operações e replay, terminais
 canônicos, base/auditoria adulteradas, drift de permissão, edição sem fatos para
 pedido de informação, coerções, orçamento, concorrência e isolamento entre
-threads.
+threads. A allowlist fechada oferece edição apenas para disposição humana,
+falha do writer, seleção de evidência ou próximo passo; motivos duros aceitam
+somente rejeição. Expiração tem precedência sobre a operação e é fechada antes
+de uma nova solicitação, enquanto `ACT`/`ESCALATE` revisado preserva o recibo
+`accepted` da intenção atual.
 
 ## Fase 10 — Logfire
 
