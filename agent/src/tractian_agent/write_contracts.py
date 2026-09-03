@@ -230,6 +230,13 @@ class PersistedApiError(StrictModel):
             return value.model_dump(mode="python")
         return value
 
+    @field_validator("ok", mode="before")
+    @classmethod
+    def _require_exact_false(cls, value: object) -> object:
+        if value is not False:
+            raise ValueError("ok persistido deve ser o booleano false")
+        return value
+
 
 class WriteIntent(StrictModel):
     """Registro observável de uma intenção no checkpointer do grafo."""
@@ -254,7 +261,7 @@ class WriteIntent(StrictModel):
         min_length=1,
         pattern=r"^\S+$",
     )
-    attempts: int = Field(default=0, ge=0, le=2)
+    attempts: int = Field(default=0, ge=0, le=2, strict=True)
     receipt: PersistedActionReceipt | None = None
     error: PersistedApiError | None = None
 

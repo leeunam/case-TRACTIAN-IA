@@ -264,6 +264,49 @@ def test_conservative_non_idempotent_terminal_round_trips_exactly():
     assert restored.has_coherent_terminal_result()
 
 
+def test_conservative_non_idempotent_terminal_requires_its_final_result():
+    state = _conservative_non_idempotent_terminal_state()
+    incomplete = state.model_copy(update={"final_result": None})
+    wire = state.model_dump(mode="json")
+    wire["final_result"] = None
+
+    assert not incomplete.has_coherent_terminal_result()
+    with pytest.raises(ValidationError, match="terminal diverge"):
+        AgentState.model_validate(wire)
+
+
+def test_ordinary_in_progress_state_does_not_require_a_final_result():
+    state = _state(resume_anchor=ResumeAnchor.INGEST, final_result=None)
+
+    restored = AgentState.model_validate_json(state.model_dump_json())
+
+    assert restored.final_result is None
+    assert restored.has_coherent_terminal_result()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("attempts", "0"),
+        ("attempts", False),
+        ("error.ok", 0),
+        ("error.ok", "false"),
+    ],
+)
+def test_conservative_terminal_rejects_coerced_wire_primitives(
+    field: str,
+    value: object,
+):
+    wire = _conservative_non_idempotent_terminal_state().model_dump(mode="json")
+    if field == "attempts":
+        wire["intents"][0]["attempts"] = value
+    else:
+        wire["intents"][0]["error"]["ok"] = value
+
+    with pytest.raises(ValidationError):
+        AgentState.model_validate(wire)
+
+
 @pytest.mark.parametrize(
     "tamper",
     [

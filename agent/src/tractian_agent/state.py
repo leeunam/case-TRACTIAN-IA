@@ -1140,6 +1140,11 @@ class AgentState(FrozenStateModel):
 
     def has_coherent_terminal_result(self) -> bool:
         """Confere a matriz fechada dos resultados terminais persistidos."""
+        conservative_match = (
+            canonical_non_idempotent_resume_terminal().matches_state(self)
+        )
+        if conservative_match is not None:
+            return conservative_match
         if self.final_result is None:
             return True
         if self.decision is None or self.final_result.decision is not self.decision:
@@ -1241,11 +1246,6 @@ class AgentState(FrozenStateModel):
             )
 
         if self.resume_anchor is ResumeAnchor.EXECUTE_ACTION:
-            conservative_match = (
-                canonical_non_idempotent_resume_terminal().matches_state(self)
-            )
-            if conservative_match is not None:
-                return conservative_match
             if (
                 self.planner_terminal is not None
                 or self.pending_proposal is None
@@ -1498,8 +1498,7 @@ class AgentState(FrozenStateModel):
             ResumeAnchor.RELEASE_GATE,
         }
         if (
-            self.final_result is not None
-            and self.resume_anchor in terminal_anchors
+            self.resume_anchor in terminal_anchors
             and not self.has_coherent_terminal_result()
         ):
             raise ValueError("resultado terminal diverge da âncora persistida")

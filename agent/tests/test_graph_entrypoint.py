@@ -736,6 +736,87 @@ def test_tampered_conservative_terminal_is_rejected_before_graph_ainvoke():
     assert graph.context is None
 
 
+def test_conservative_terminal_without_result_is_rejected_before_graph_ainvoke():
+    state = _terminal_conservative_non_idempotent_state()
+    wire = state.model_dump(mode="json")
+    wire["final_result"] = None
+    graph = _RecordingGraph(wire, planner_enabled=True)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            with pytest.raises(ValidationError, match="terminal diverge"):
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_reject_missing_result",
+                )
+
+    asyncio.run(scenario())
+
+    assert graph.invoke_config is None
+    assert graph.context is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("attempts", "0"),
+        ("attempts", False),
+        ("error.ok", 0),
+        ("error.ok", "false"),
+    ],
+)
+def test_coerced_conservative_terminal_is_rejected_before_graph_ainvoke(
+    field: str,
+    value: object,
+):
+    state = _terminal_conservative_non_idempotent_state()
+    wire = state.model_dump(mode="json")
+    if field == "attempts":
+        wire["intents"][0]["attempts"] = value
+    else:
+        wire["intents"][0]["error"]["ok"] = value
+    graph = _RecordingGraph(wire, planner_enabled=True)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            runtime = WriteToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read", "action_low"}),
+                central_asset_id="asset_G501",
+                current_case_id="case_tkt_inv_04",
+                configured_model_id="mdl_vib_v3",
+                client=client,
+            )
+            with pytest.raises(ValidationError):
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_reject_coerced_primitive",
+                )
+
+    asyncio.run(scenario())
+
+    assert graph.invoke_config is None
+    assert graph.context is None
+
+
 def test_terminal_write_replay_rejects_persisted_model_drift_at_public_boundary():
     state_data = _terminal_execution_state().model_dump(mode="python")
     state_data["trusted_write_context"]["configured_model_id"] = "mdl_vib_v4"
