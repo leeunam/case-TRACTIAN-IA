@@ -550,6 +550,11 @@ async def invoke_agent(
                     planner_enabled=planner_enabled,
                 )
                 _validate_legacy_intents_for_write(persisted)
+            if new_request and _request_id_has_history(persisted, request_id):
+                raise AgentInvocationProtocolError(
+                    "REQUEST_ID_ALREADY_USED",
+                    "request_id já pertence ao histórico do thread",
+                )
             state = persisted.continue_with(
                 request=request,
                 identity=runtime.identity,
@@ -579,11 +584,6 @@ async def invoke_agent(
                     raise AgentInvocationProtocolError(
                         "STALE_CONFIRMATION",
                         "confirmação não pode iniciar uma nova solicitação",
-                    )
-                if _request_id_has_history(persisted, request_id):
-                    raise AgentInvocationProtocolError(
-                        "REQUEST_ID_ALREADY_USED",
-                        "request_id já pertence ao histórico do thread",
                     )
                 if any(
                     intent.status in _ACTIVE_INTENT_STATUSES

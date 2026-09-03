@@ -171,6 +171,15 @@ def test_original_approval_completes_reprocess_in_five_steps(tmp_path: Path):
     assert intent.idempotency_key == f"tractian-agent:{intent.intent_id}"
     assert intent.attempts == 1
     assert intent.receipt is not None and intent.receipt.accepted is True
+    action_evidence = [
+        item for item in state.ledger.items if item.intent_id == intent.intent_id
+    ]
+    assert len(action_evidence) == 1
+    assert action_evidence[0].action == "reprocess_analysis"
+    assert action_evidence[0].tool is None
+    assert action_evidence[0].resource == "/actions/act_reprocess_01"
+    assert action_evidence[0].fact_path == "accepted"
+    assert action_evidence[0].value.to_python() is True
     assert [(item.method, item.url.path) for item in requests] == [
         ("GET", "/analyses/an_9901"),
         ("POST", "/analyses/an_9901/reprocess"),
@@ -1509,6 +1518,16 @@ def test_reprocess_result_matrix_uses_at_most_one_same_key_retry(
     assert len(observed_keys) == expected_attempts
     assert observed_keys == [intent.idempotency_key] * expected_attempts
     assert pending_results == []
+    if intent.status is IntentStatus.COMPLETED:
+        evidence = [item for item in state.ledger.items if item.intent_id == intent.intent_id]
+        assert len(evidence) == 1
+        assert evidence[0].value.to_python() is True
+    else:
+        gaps = [gap for gap in state.ledger.gaps if gap.intent_id == intent.intent_id]
+        assert len(gaps) == 1
+        assert gaps[0].reason.value == (
+            "unavailable" if intent.status is IntentStatus.UNCERTAIN else "error"
+        )
     if (
         results
         and isinstance(results[0], ApiError)

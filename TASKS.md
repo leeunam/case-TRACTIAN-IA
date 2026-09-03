@@ -311,12 +311,20 @@ warning conhecido de `python_multipart`.
 
 **Decidir:** schema de `EvidenceItem`, regras mínimas de suficiência e representação de conflitos.
 
-- [ ] Preencher o ledger em código com fonte, valor, instante, limitações e referência ao retorno.
-- [ ] Impedir que texto livre do LLM seja registrado como fato da API.
-- [ ] Detectar evidência ausente, parcial, vencida ou conflitante.
-- [ ] Testar fundamentação e suficiência por cenário representativo.
+- [x] Preencher o ledger em código com fonte, valor, instante, limitações e referência ao retorno.
+- [x] Impedir que texto livre do LLM seja registrado como fato da API.
+- [x] Detectar evidência ausente, parcial, vencida ou conflitante.
+- [x] Testar fundamentação e suficiência por cenário representativo.
 
-**Aceite:** toda afirmação crítica liberada pode ser ligada a evidência real.
+**Aceite verificado (02/09/2026):** o `AgentState` persiste um `ledger`
+tipado da solicitação atual e mantém `ledger_history` por `request_id`. O nó de
+tool só o atualiza após `validate_planner_read_observation`; recibos de escrita
+aceitos viram fatos vinculados exclusivamente à intenção terminal, enquanto
+falhas e resultado incerto viram lacunas sanitizadas. A validação do estado
+recusa adulteração de request, call, recurso e valor. A reabertura do SQLite
+preserva o ledger e a suíte focada passou com 598 testes; a suíte completa do
+agente passou com 1.463 testes e `uv lock --check --offline` resolveu 49
+pacotes. Writer e gate continuam pendentes na Fase 8.
 
 ## Fase 8 — writer e gate de segurança
 
@@ -908,3 +916,238 @@ documentação ao estado real, sem promover componentes das fases seguintes.
 - Executar testes focados, `uv lock --check` e `make test`; registrar totais e o resultado real do smoke.
 - Marcar a Fase 6 somente após todo o aceite. README passa a declarar provider/planner reais, mas mantém writer, resposta ao cliente, ledger completo, gate, Logfire e Pydantic Evals como ausentes.
 - Fazer self-review, commit próprio e uma revisão final independente de toda a faixa da Fase 6.
+
+## Plano de implementação SDD — Fases 7 a 10
+
+Este plano implementa, em ordem, o ledger de evidências, o writer com porta de
+segurança, a revisão humana e a observabilidade Logfire. Cada task segue uma
+fatia vertical `RED → GREEN → refactor`, termina com commit próprio e recebe
+revisão independente antes da próxima. O aceite documental ocorre somente após
+os testes integrados das quatro fases.
+
+### Restrições globais
+
+- O ledger é derivado em código de observações e recibos já validados; texto
+  livre de modelo nunca se torna fato da API.
+- Toda afirmação técnica liberada é renderizada a partir de uma evidência
+  persistida e vinculada à solicitação atual. Erros não sustentam fatos;
+  `partial`, `conflict`, `inconclusive`, `unavailable`, truncamento, limitações e
+  obsolescência permanecem explícitos.
+- Planner e writer são papéis separados. Modelo, runtime, credenciais, resposta
+  HTTP bruta, prompt completo, raciocínio e IDs externos do provider não entram
+  no checkpoint.
+- A porta de segurança é determinística. Writer, revisor e Logfire não criam
+  permissão, aprovação, tool call, retry, chave idempotente nem efeito HTTP.
+- Revisão humana não é aprovação de ação nem escalonamento humano. Qualquer
+  edição retorna à mesma porta de segurança, e uma retomada nunca repete efeito.
+- Logfire recebe somente nomes fixos e atributos de allowlist. Tokens, chaves,
+  credenciais, headers, mensagens, justificativas, valores industriais, golden
+  set, gabarito, tracebacks e identidades literais não são exportados.
+- O runtime continua sem acesso a `eval/expected-paths.json`,
+  `docs/test-scenarios.md` e `data/cases.parquet`. Logfire não é o banco do
+  ledger e avaliações não alteram o atendimento.
+- SQLite continua sendo o checkpointer de desenvolvimento; PostgreSQL permanece
+  futuro. O caminho sem planner permanece somente como fallback determinístico
+  de compatibilidade e não é descrito como o agente completo.
+
+### Task 14 — contratos e compilador determinístico do ledger
+
+**Objetivo:** substituir o placeholder de evidência por contratos completos e
+um compilador puro que transforma observações tipadas em fatos, lacunas e
+conflitos auditáveis.
+
+**Decisões:** `EvidenceItem` registra ID determinístico, `request_id`, `call_id`,
+tool, recurso, caminho canônico do fato, valor JSON observado, modo, instante da
+fonte quando existir, instante de registro, limitações e qualidade. IDs são
+derivados por SHA-256 de campos canônicos, nunca pelo LLM. Obsolescência usa
+somente sinais semânticos explícitos do domínio (`analysis.status=stale`,
+`baseline.state=invalidated`, `data_quality.staleness_flag=true` e expiração
+persistida de recibo/intenção); não inventa TTL industrial genérico. Um fato
+completo e não obsoleto pode ser `claimable`; fatos parciais ou truncados são
+preservados com limitação, mas não liberam afirmação crítica. Modos
+`conflict`, `inconclusive` e `unavailable` produzem lacunas bloqueantes; erro
+produz lacuna sanitizada e nenhum fato. Valores diferentes para a mesma chave
+canônica permanecem como itens separados e criam um conflito explícito.
+
+**Arquivos:** criar `agent/src/tractian_agent/evidence.py`; evoluir somente os
+contratos necessários em `state.py`; criar `agent/tests/test_evidence.py` e
+ajustar testes de estado pertinentes.
+
+**Contrato e testes:**
+
+- Compilar uma observação completa gera fatos com fonte, recurso, valor,
+  instante e referência exata ao `call_id` sem aceitar conteúdo livre do modelo.
+- Erro, parcial, truncamento, indisponibilidade, inconclusão, conflito e os três
+  sinais explícitos de obsolescência têm testes RED/GREEN próprios.
+- Duas fontes divergentes conservam ambos os itens e um conflito; uma repetição
+  idêntica é determinística e não duplica o ledger.
+- `EvidenceAssessment` só é `sufficient` quando existe fato `claimable` e não há
+  lacuna ou conflito bloqueante para a conclusão; a causa insuficiente é
+  enumerada e não contém texto bruto externo.
+- Contratos são estritos, congelados, JSON-safe e sobrevivem a round-trip JSON.
+- Rodar testes focados, self-review e commit próprio.
+
+### Task 15 — integrar o ledger ao estado, grafo e checkpoint
+
+**Objetivo:** preencher o ledger no caminho real imediatamente após uma read
+tool validada e após um recibo terminal de escrita, preservando histórico por
+`request_id` e coerência de retomada.
+
+**Decisões:** o nó de tool acrescenta evidência somente depois de
+`validate_planner_read_observation`. O caminho de ação registra como evidência
+apenas recibo tipado aceito ou falha/lacuna sanitizada; proposal nunca é efeito.
+O estado valida que cada evidência de tool referencia uma observação da mesma
+solicitação e que cada evidência de ação referencia uma intenção terminal da
+mesma solicitação. Histórico anterior continua auditável, mas não fundamenta a
+resposta atual.
+
+**Arquivos:** evoluir `graph.py`, `state.py`, testes de planner/grafo/checkpoint
+e os fluxos de escrita; atualizar a Fase 7 somente após o aceite.
+
+**Contrato e testes:**
+
+- O caminho público `build_agent_graph → invoke_agent` preenche evidências sem
+  permitir que planner ou writer forneçam o ledger.
+- Tool com erro preserva a lacuna e não cria fato; modos degradados e conflito
+  atravessam o checkpoint sem virar sucesso.
+- Recibo de ação concluída fica ligado à intenção; resultado incerto não afirma
+  conclusão e nunca provoca novo HTTP na retomada.
+- Fechar e reabrir SQLite preserva fatos, lacunas, conflitos e seus vínculos;
+  adulteração de `request_id`, `call_id`, recurso ou valor falha fechada.
+- Casos representativos demonstram suficiência, insuficiência, conflito e
+  obsolescência pelo caminho público.
+- Rodar testes focados, `uv lock --check --offline`, self-review e commit.
+
+### Task 16 — writer mínimo e porta determinística de segurança
+
+**Objetivo:** gerar uma resposta em português a partir da decisão e do ledger,
+sem conceder ao modelo poder para criar fatos ou mudar a decisão.
+
+**Decisões:** `Writer` usa prompt `writer-v1`, `with_structured_output` e um
+contrato sem tool calls. Recebe somente decisão, fatos canônicos utilizáveis,
+lacunas necessárias e informação ausente já decidida; não recebe mensagem
+original, identidade, permissões, artifacts, proposta, recibo bruto nem runtime.
+O draft contém a decisão imutável, IDs ordenados de evidência, IDs de limitações
+e um próximo passo enumerado. Frases técnicas finais são renderizadas em código
+a partir dos itens do ledger; o modelo não fornece valores nem afirmações
+livres. Uma falha de formato permite exatamente uma nova chamada de reparo com
+o mesmo contexto mínimo e sem reutilizar a saída inválida; nova falha encaminha
+para revisão.
+
+`ReleaseGate` valida decisão, solicitação, suficiência, referências, limitações,
+permissões e estado da intenção. Suas saídas fechadas são `release`,
+`request_information`, `request_confirmation` ou `require_human_review`.
+Somente `release` cria resposta técnica ao cliente.
+
+**Arquivos:** criar `writer.py` e `release_gate.py`; evoluir `state.py`,
+`graph.py`, `entrypoint.py` e testes públicos. O builder exige writer quando o
+planner estiver habilitado; planner/modelo e writer/modelo continuam
+dependências de construção separadas.
+
+**Contrato e testes:**
+
+- Modelo falso comprova o contexto mínimo recebido e a separação entre planner
+  e writer; `bind_tools` nunca é usado pelo writer.
+- Decisão divergente, ID inexistente, fato parcial/obsoleto/conflitante,
+  limitação omitida, permissão incompatível ou intenção incerta bloqueiam a
+  liberação antes de `FinalResult` técnico.
+- Formato inválido faz uma única tentativa de reparo; duas falhas encerram em
+  revisão sem retry oculto.
+- Respostas de orientar, agir, escalar e pedir informação são renderizadas com
+  proveniência; confirmação continua pertencendo à política já existente.
+- Novas âncoras, orçamento de passos e retomadas são validados, sem alterar as
+  garantias de checkpoint/idempotência dos cinco fluxos.
+- Rodar testes focados, suíte dos fluxos de escrita, self-review e commit.
+
+### Task 17 — revisão humana persistida e retomável
+
+**Objetivo:** suspender respostas bloqueadas, aceitar decisão humana confiável e
+retomar sem reiniciar a investigação ou repetir ação.
+
+**Decisões:** `ReviewRequest` persiste ID, solicitação, motivo enumerado, ponto de
+dúvida, IDs de evidência, draft, criação e expiração em UTC. Expira após 24
+horas. `ReviewerIdentity` é contexto confiável separado e exige permissão
+`review`; o reply não escolhe o próprio autor. Operações são `approve`, `edit`
+e `reject`. A edição altera somente seleção/ordem de evidências e próximo passo
+do contrato fechado, nunca texto técnico livre, e sempre volta ao
+`ReleaseGate`. Aprovação também passa pelo gate contra o estado atual. Rejeição
+produz somente aviso seguro de não liberação. Expiração bloqueia a retomada e
+exige nova solicitação; nenhum caminho repete efeito já terminal.
+
+**Arquivos:** criar `human_review.py`; evoluir estado, grafo, entrypoint e testes
+de checkpoint/fluxos; atualizar a Fase 9 somente após o aceite.
+
+**Contrato e testes:**
+
+- `interrupt()` expõe motivo, dúvida e referências disponíveis sem credenciais,
+  runtime ou raciocínio; `Command` retoma pelo ID persistido.
+- Aprovação, edição válida, edição inválida, rejeição, autor sem permissão,
+  reply obsoleto e expiração têm ciclos RED/GREEN separados.
+- Auditoria registra autor confiável, horário, decisão e mudança estrutural;
+  adulteração ou segundo julgamento divergente falha fechada.
+- Reinício real do SQLite retoma no nó correto, reaplica o gate e não repete
+  tool, planner, writer ou ação HTTP já concluídos.
+- Rodar testes focados, regressões dos cinco fluxos, self-review e commit.
+
+### Task 18 — observabilidade Logfire segura e opt-in
+
+**Objetivo:** reconstruir uma execução por `trace_id` usando spans e métricas de
+baixa cardinalidade, sem exportar conteúdo de atendimento ou segredo.
+
+**Decisões:** adicionar o SDK Logfire ao agente e criar uma fachada injetável
+com implementação nula por padrão. A exportação exige simultaneamente
+`TRACTIAN_LOGFIRE_ENABLED=true`, `LOGFIRE_TOKEN` explícito e
+`TRACTIAN_LOGFIRE_PSEUDONYM_KEY`; configuração ausente, vazia ou inválida não
+configura o SDK nem toca a rede. Usar apenas spans manuais; instrumentações
+automáticas de LangChain/LangGraph, HTTPX, FastAPI e Pydantic ficam desligadas.
+Um `trace_id` opaco é criado na fronteira para cada execução, correlacionado por
+atributo e retornável como único identificador técnico. IDs de request, thread,
+execução, caso, empresa, pessoa e, quando aplicável, experimento/caso de
+benchmark são HMAC-SHA256 truncados antes do export.
+
+**Allowlist:** nomes fixos para request raiz, nó, planner, writer, tool,
+política, ação, gate, revisão, resposta e avaliação; atributos limitados a
+versão, enums, flags, contadores, duração, nomes de catálogo e referências
+pseudonimizadas. Métricas não recebem IDs. Exceções são reemitidas ao chamador e
+registradas apenas por código fechado, sem mensagem ou traceback.
+
+**Arquivos:** criar `observability.py` e testes; evoluir dependências/lock,
+grafo, entrypoint e contratos mínimos de resultado. Não instrumentar o
+simulador FastAPI nem criar runner de avaliação; a fachada oferece o span de
+avaliação e correlação opcional que a Fase 11 consumirá.
+
+**Contrato e testes:**
+
+- Implementação nula prova zero configuração/rede sem o opt-in completo.
+- Recorder falso cobre request, nós, LLMs, tools, erro, política, ação, gate,
+  revisão, resposta e avaliação pelo mesmo contrato público.
+- Sentinelas em token, header, mensagem, justificativa, artifact, evidência,
+  provider e golden set nunca aparecem em nomes ou atributos exportáveis.
+- Pseudônimos são determinísticos por chave, diferentes entre chaves e não
+  revelam o ID literal; `trace_id` permite localizar todos os spans da execução.
+- Telemetria não altera decisão, retry, exceção, resultado ou checkpoint.
+- Rodar testes focados, `uv lock --check`, self-review e commit próprio.
+
+### Task 19 — aceite integrado e documentação real
+
+**Objetivo:** provar as quatro fases em conjunto e alinhar a documentação ao que
+foi realmente executado, sem antecipar Pydantic Evals ou juízes.
+
+**Arquivos:** atualizar `README.md`, `AGENTS.md`, as Fases 7–10 e este plano em
+`TASKS.md`; ajustar `Makefile` somente se existir novo comando operacional real.
+
+**Contrato e testes:**
+
+- Um cenário completo percorre consulta, ledger, writer e liberação; cenários
+  parcial, conflitante, obsoleto e falho terminam no estado seguro correto.
+- Um cenário bloqueado interrompe, fecha/reabre SQLite, recebe aprovação ou
+  edição humana, reaplica o gate e termina sem repetir tool ou efeito.
+- Uma execução instrumentada por recorder seguro compartilha `trace_id` entre
+  os estágios sem registrar valores proibidos.
+- Rodar testes focados, locks offline quando aplicável, `git diff --check` e
+  `make test`; registrar contagens e warning conhecido.
+- Marcar as Fases 7, 8, 9 e 10 somente após todos os critérios acima. README e
+  AGENTS passam a declarar ledger, writer, gate, revisão e Logfire reais, mas
+  mantêm Pydantic Evals, juízes e calibração como ausentes.
+- Fazer self-review, commit próprio e revisão final independente de toda a faixa
+  antes da integração na `main`.
