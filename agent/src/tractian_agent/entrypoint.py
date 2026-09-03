@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
+from datetime import datetime, timezone
 from typing import Any, Literal, Protocol
 
 from langgraph.graph import START
@@ -17,7 +18,27 @@ from tractian_agent.graph import (
     PLANNER_WRITE_GRAPH_STEP_COUNT,
     REPROCESS_GRAPH_STEP_COUNT,
 )
-from tractian_agent.state import AgentState, ResumeAnchor, ThreadScope
+from tractian_agent.human_review import (
+    ReviewApproveReply,
+    ReviewEditReply,
+    ReviewRejectReply,
+    ReviewResumeEnvelope,
+    ReviewerIdentity,
+    build_reviewed_draft,
+    canonical_digest,
+    render_review_expired_result,
+    review_resolution_subject_digest,
+)
+from tractian_agent.state import (
+    AgentDecision,
+    AgentState,
+    ResumeAnchor,
+    ReviewExpiry,
+    ReviewRecord,
+    ReviewReply,
+    ReviewStatus,
+    ThreadScope,
+)
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.write_contracts import (
     ConfirmationReply,
@@ -103,6 +124,8 @@ _PLANNER_RESUME_PAIRS = {
     (ResumeAnchor.PLANNER_FINALIZE, "writer"),
     (ResumeAnchor.WRITER, "writer"),
     (ResumeAnchor.WRITER, "release_gate"),
+    (ResumeAnchor.RELEASE_GATE, "await_human_review"),
+    (ResumeAnchor.AWAIT_HUMAN_REVIEW, "release_gate"),
 }
 _ALLOWED_RESUME_PAIRS = (
     _COMMON_RESUME_PAIRS | _FALLBACK_RESUME_PAIRS | _PLANNER_RESUME_PAIRS
@@ -116,6 +139,10 @@ _ACTIVE_INTENT_STATUSES = frozenset(
         IntentStatus.PREPARED,
     }
 )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _require_opaque_id(value: str, *, name: str) -> str:
@@ -399,6 +426,78 @@ def _validate_runtime_identity_scope(
         )
 
 
+def _validate_persisted_thread_boundary(
+    *,
+    state: AgentState,
+    request: SupportRequest,
+    runtime: ReadToolRuntime,
+    thread_id: str,
+    request_id: str,
+    execution_id: str,
+    allow_conservative_target_drift: bool,
+) -> None:
+    """Autoriza a continuação sem alterar ou revelar o checkpoint restaurado."""
+    scope = state.thread_scope
+    if thread_id != state.thread_id or thread_id != scope.thread_id:
+        raise AgentInvocationProtocolError(
+            "THREAD_SCOPE_MISMATCH",
+            "o thread autenticado não corresponde ao checkpoint",
+        )
+    if execution_id == state.execution_id:
+        raise AgentInvocationProtocolError(
+            "EXECUTION_ID_ALREADY_USED",
+            "cada continuação exige novo execution_id",
+        )
+    if (
+        request.case_id != scope.case_id
+        or request.identity.company_id != scope.company_id
+        or request.identity.user_id != scope.user_id
+        or runtime.identity.company_id != scope.company_id
+        or runtime.identity.user_id != scope.user_id
+    ):
+        raise AgentInvocationProtocolError(
+            "THREAD_SCOPE_MISMATCH",
+            "a solicitação não pode continuar este thread",
+        )
+    trusted_context = state.trusted_write_context
+    if trusted_context is None:
+        raise AgentInvocationProtocolError(
+            "TRUSTED_WRITE_CONTEXT_MISSING",
+            "o checkpoint não possui o alvo confiável persistido",
+        )
+    if request.asset_id is not None and (
+        request.asset_id != trusted_context.central_asset_id
+    ):
+        raise AgentInvocationProtocolError(
+            "THREAD_SCOPE_MISMATCH",
+            "o alvo não pode mudar dentro deste thread",
+        )
+    if (
+        not allow_conservative_target_drift
+        and request.asset_id is not None
+        and runtime.central_asset_id != request.asset_id
+    ):
+        raise AgentInvocationProtocolError(
+            "RUNTIME_ASSET_SCOPE_MISMATCH",
+            "o ativo central do runtime diverge da solicitação",
+        )
+    if not allow_conservative_target_drift and (
+        runtime.central_asset_id != trusted_context.central_asset_id
+        or runtime.configured_model_id != trusted_context.configured_model_id
+    ):
+        raise AgentInvocationProtocolError(
+            "TRUSTED_WRITE_CONTEXT_DRIFT",
+            "o runtime atual diverge do alvo ou modelo persistido",
+        )
+    if request_id == state.request_id and type(state.request).model_validate(
+        request
+    ) != state.request:
+        raise AgentInvocationProtocolError(
+            "REQUEST_ID_PAYLOAD_MISMATCH",
+            "a mesma request_id exige solicitação idêntica",
+        )
+
+
 def _trusted_write_context(
     request: SupportRequest,
     runtime: ReadToolRuntime,
@@ -462,8 +561,11 @@ def _validate_current_read_access(
     *,
     planner_enabled: bool,
     include_current_flow: bool,
+    allow_review_resume: bool = False,
 ) -> None:
     if "read" in runtime.permissions:
+        return
+    if allow_review_resume and state.review_request is not None:
         return
     contains_read_artifact = bool(state.tool_observations)
     current_intents = _current_request_intents(state)
@@ -539,6 +641,120 @@ def _confirmation_command(
     )
 
 
+def _review_command(
+    *,
+    snapshot: GraphStateSnapshot,
+    state: AgentState,
+    reply: ReviewReply,
+    reviewer: ReviewerIdentity,
+    received_at: datetime,
+) -> Command:
+    if snapshot.next != ("await_human_review",):
+        raise AgentInvocationProtocolError(
+            "STALE_REVIEW", "o checkpoint não aguarda esta revisão"
+        )
+    if len(snapshot.interrupts) != 1 or state.review_request is None:
+        raise AgentInvocationProtocolError(
+            "AMBIGUOUS_REVIEW", "o checkpoint deve possuir uma revisão pendente"
+        )
+    request = state.review_request
+    if received_at < request.created_at:
+        raise AgentInvocationProtocolError(
+            "INVALID_REVIEW_TIME", "o relógio confiável precede a revisão"
+        )
+    if reply.review_id != request.review_id:
+        raise AgentInvocationProtocolError(
+            "STALE_REVIEW", "o reply pertence a outra revisão"
+        )
+    if reviewer.company_id != state.identity.company_id:
+        raise AgentInvocationProtocolError(
+            "REVIEW_COMPANY_MISMATCH", "o revisor pertence a outra empresa"
+        )
+    if received_at < request.expires_at:
+        if reply.operation not in {
+            operation.value for operation in request.allowed_operations
+        }:
+            raise AgentInvocationProtocolError(
+                "INVALID_REVIEW_OPERATION", "a operação não é permitida"
+            )
+        if isinstance(reply, (ReviewApproveReply, ReviewEditReply)):
+            try:
+                build_reviewed_draft(request, reply, state.ledger)
+            except ValueError as error:
+                raise AgentInvocationProtocolError(
+                    "INVALID_REVIEW_EDIT",
+                    "a edição não passa pelo contrato estrutural",
+                ) from error
+    envelope = ReviewResumeEnvelope(
+        reply=reply,
+        reviewer=reviewer,
+        received_at=received_at,
+    )
+    return Command(
+        resume={
+            snapshot.interrupts[0].id: envelope.model_dump(mode="json")
+        },
+        update=state.model_dump(mode="json"),
+    )
+
+
+def _terminal_review_replay(
+    state: AgentState,
+    reply: ReviewReply,
+    reviewer: ReviewerIdentity,
+) -> bool:
+    if state.review_request is None:
+        return False
+    resolution_digest = review_resolution_subject_digest(reply, reviewer)
+    if state.review_expiry is not None:
+        return (
+            state.review_expiry.trigger == "reply"
+            and reply.review_id == state.review_expiry.review_id
+            and resolution_digest == state.review_expiry.resolution_digest
+        )
+    audit = state.review_audit
+    return bool(
+        audit is not None
+        and reply.review_id == audit.review_id
+        and state.review_resolution is not None
+        and resolution_digest
+        == review_resolution_subject_digest(
+            state.review_resolution.reply,
+            state.review_resolution.reviewer,
+        )
+    )
+
+
+def _expire_review_for_new_request(
+    state: AgentState,
+    *,
+    expired_at: datetime,
+) -> AgentState:
+    request = state.review_request
+    if request is None or expired_at < request.expires_at:
+        raise ValueError("somente revisão vencida pode ser encerrada internamente")
+    data = state.advance_step().model_dump(mode="json")
+    data.update(
+        resume_anchor=ResumeAnchor.AWAIT_HUMAN_REVIEW.value,
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW.value,
+        final_result=render_review_expired_result().model_dump(mode="json"),
+        release_gate=request.gate_basis.model_dump(mode="json"),
+        review=ReviewRecord(
+            status=ReviewStatus.REQUIRED,
+            reason="human_review:expired",
+        ).model_dump(mode="json"),
+        review_expiry=ReviewExpiry(
+            review_id=request.review_id,
+            review_digest=canonical_digest(request),
+            trigger="new_request",
+            resolution_digest=None,
+            expired_at=expired_at,
+        ).model_dump(mode="json"),
+        review_continuation=None,
+    )
+    return AgentState.model_validate(data)
+
+
 async def invoke_agent(
     graph: AgentGraph,
     *,
@@ -551,6 +767,8 @@ async def invoke_agent(
     proposal: WriteProposal | None = None,
     original_approval: TrustedActionApproval | None = None,
     confirmation: ConfirmationReply | None = None,
+    review_reply: ReviewReply | None = None,
+    reviewer: ReviewerIdentity | None = None,
 ) -> AgentState:
     """Cria ou continua estado confiável e executa com checkpoint síncrono."""
     if not isinstance(runtime, ReadToolRuntime):
@@ -558,6 +776,17 @@ async def invoke_agent(
     thread_id = _require_opaque_id(thread_id, name="thread_id")
     request_id = _require_opaque_id(request_id, name="request_id")
     execution_id = _require_opaque_id(execution_id, name="execution_id")
+    if (review_reply is None) != (reviewer is None):
+        raise AgentInvocationProtocolError(
+            "INVALID_REVIEW_ENVELOPE",
+            "reply e identidade confiável do revisor são obrigatórios juntos",
+        )
+    if review_reply is not None and not isinstance(
+        review_reply, (ReviewApproveReply, ReviewEditReply, ReviewRejectReply)
+    ):
+        raise TypeError("review_reply deve usar o contrato discriminado")
+    if reviewer is not None and not isinstance(reviewer, ReviewerIdentity):
+        raise TypeError("reviewer autenticado é obrigatório")
     planner_enabled = bool(getattr(graph, "planner_enabled", False))
     _validate_write_boundary(
         request=request,
@@ -597,6 +826,62 @@ async def invoke_agent(
             checkpoint_anchor = _required_resume_anchor(persisted_values)
             persisted = AgentState.model_validate(persisted_values)
             new_request = request_id != persisted.request_id
+            conservative_resume = _is_conservative_non_idempotent_resume(
+                persisted,
+                checkpoint_anchor=checkpoint_anchor,
+                pending_nodes=snapshot.next,
+                execution_id=execution_id,
+                new_request=new_request,
+                proposal=proposal,
+                original_approval=original_approval,
+                confirmation=confirmation,
+            )
+            _validate_persisted_thread_boundary(
+                state=persisted,
+                request=request,
+                runtime=runtime,
+                thread_id=thread_id,
+                request_id=request_id,
+                execution_id=execution_id,
+                allow_conservative_target_drift=conservative_resume,
+            )
+            if (
+                not new_request
+                and persisted.final_result is None
+                and persisted.review_audit is not None
+                and review_reply is not None
+                and reviewer is not None
+            ):
+                if not _terminal_review_replay(persisted, review_reply, reviewer):
+                    raise AgentInvocationProtocolError(
+                        "DIVERGENT_REVIEW",
+                        "o julgamento diverge da auditoria persistida",
+                    )
+                # Retry do mesmo envelope após o checkpoint da auditoria:
+                # continua o gate pendente sem gravar uma segunda auditoria.
+                review_reply = None
+                reviewer = None
+            internal_review_continuation = (
+                not new_request
+                and persisted.final_result is None
+                and persisted.review_audit is not None
+                and snapshot.next == ("release_gate",)
+            )
+            pending_review_new_request = (
+                new_request
+                and review_reply is None
+                and persisted.review_request is not None
+                and persisted.review_audit is None
+                and persisted.review_expiry is None
+            )
+            expiry_boundary_time = (
+                _utc_now() if pending_review_new_request else None
+            )
+            close_expired_review = bool(
+                expiry_boundary_time is not None
+                and persisted.review_request is not None
+                and expiry_boundary_time >= persisted.review_request.expires_at
+            )
             if persisted.final_result is not None:
                 _validate_terminal_resume_anchor(persisted, checkpoint_anchor)
                 if snapshot.next:
@@ -616,16 +901,6 @@ async def invoke_agent(
                     if snapshot.next
                     else None
                 )
-            conservative_resume = _is_conservative_non_idempotent_resume(
-                persisted,
-                checkpoint_anchor=checkpoint_anchor,
-                pending_nodes=snapshot.next,
-                execution_id=execution_id,
-                new_request=new_request,
-                proposal=proposal,
-                original_approval=original_approval,
-                confirmation=confirmation,
-            )
             if not conservative_resume:
                 _validate_runtime_request_scope(request, runtime)
             _validate_current_read_access(
@@ -633,6 +908,11 @@ async def invoke_agent(
                 runtime,
                 planner_enabled=planner_enabled,
                 include_current_flow=not new_request,
+                allow_review_resume=(
+                    review_reply is not None
+                    or internal_review_continuation
+                    or close_expired_review
+                ),
             )
             if (
                 planner_enabled
@@ -693,6 +973,24 @@ async def invoke_agent(
                     "REQUEST_ID_ALREADY_USED",
                     "request_id já pertence ao histórico do thread",
                 )
+            if close_expired_review:
+                assert expiry_boundary_time is not None
+                persisted = _expire_review_for_new_request(
+                    persisted,
+                    expired_at=expiry_boundary_time,
+                )
+                config = await graph.aupdate_state(
+                    snapshot.config,
+                    persisted.model_dump(mode="json"),
+                    as_node="await_human_review",
+                )
+                snapshot = await graph.aget_state(config)
+                persisted = AgentState.model_validate(snapshot.values)
+                if snapshot.next:
+                    raise AgentInvocationProtocolError(
+                        "EXPIRED_REVIEW_WITH_PENDING_WORK",
+                        "a revisão vencida não encerrou canonicamente",
+                    )
             state = persisted.continue_with(
                 request=request,
                 identity=runtime.identity,
@@ -709,6 +1007,19 @@ async def invoke_agent(
                     original_approval=original_approval,
                 )
             if not new_request and persisted.final_result is not None:
+                if review_reply is not None and reviewer is not None:
+                    if _terminal_review_replay(persisted, review_reply, reviewer):
+                        _validate_current_read_access(
+                            persisted,
+                            runtime,
+                            planner_enabled=planner_enabled,
+                            include_current_flow=True,
+                        )
+                        return persisted
+                    raise AgentInvocationProtocolError(
+                        "DIVERGENT_REVIEW",
+                        "o julgamento diverge da revisão terminal persistida",
+                    )
                 if confirmation is not None and not _terminal_confirmation_replay(
                     persisted,
                     confirmation,
@@ -719,6 +1030,19 @@ async def invoke_agent(
                     )
                 return persisted
             if new_request:
+                if persisted.review_request is not None and (
+                    persisted.review_audit is None
+                    and persisted.review_expiry is None
+                ):
+                    raise AgentInvocationProtocolError(
+                        "PENDING_REVIEW_BLOCKS_NEW_REQUEST",
+                        "uma revisão pendente bloqueia nova solicitação",
+                    )
+                if review_reply is not None:
+                    raise AgentInvocationProtocolError(
+                        "STALE_REVIEW",
+                        "um reply não pode iniciar uma nova solicitação",
+                    )
                 if confirmation is not None:
                     raise AgentInvocationProtocolError(
                         "STALE_CONFIRMATION",
@@ -770,7 +1094,16 @@ async def invoke_agent(
                         "STEP_LIMIT_EXHAUSTED",
                         "checkpoint parcial esgotou o orçamento de passos",
                     )
-                if confirmation is not None:
+                if review_reply is not None and reviewer is not None:
+                    invocation_input = _review_command(
+                        snapshot=snapshot,
+                        state=state,
+                        reply=review_reply,
+                        reviewer=reviewer,
+                        received_at=_utc_now(),
+                    )
+                    config = snapshot.config
+                elif confirmation is not None:
                     invocation_input = _confirmation_command(
                         snapshot=snapshot,
                         state=state,
@@ -780,8 +1113,12 @@ async def invoke_agent(
                 else:
                     if snapshot.interrupts:
                         raise AgentInvocationProtocolError(
-                            "CONFIRMATION_REQUIRED",
-                            "o fluxo aguarda uma confirmação estruturada",
+                            (
+                                "REVIEW_REQUIRED"
+                                if state.review_request is not None
+                                else "CONFIRMATION_REQUIRED"
+                            ),
+                            "o fluxo aguarda uma resposta estruturada",
                         )
                     predecessor = (
                         resume_predecessor
@@ -805,6 +1142,10 @@ async def invoke_agent(
                 raise AgentInvocationProtocolError(
                     "STALE_CONFIRMATION",
                     "não existe intenção persistida para confirmar",
+                )
+            if review_reply is not None:
+                raise AgentInvocationProtocolError(
+                    "STALE_REVIEW", "não existe revisão persistida para responder"
                 )
             if (
                 proposal is not None

@@ -89,12 +89,14 @@ def _runtime(
     company_id: str = "comp_mineracao_andes",
     permissions: frozenset[str] = frozenset({"read"}),
     central_asset_id: str = "asset_G501",
+    configured_model_id: str = "mdl_vib_v3",
 ) -> ReadToolRuntime:
     return ReadToolRuntime.create(
         user_id=user_id,
         company_id=company_id,
         permissions=permissions,
         central_asset_id=central_asset_id,
+        configured_model_id=configured_model_id,
         client=client,
     )
 
@@ -610,6 +612,50 @@ def test_terminal_read_replay_revalidates_current_runtime_before_return(
     assert graph.invoke_config is None
 
 
+@pytest.mark.parametrize(
+    ("runtime_overrides", "permissions"),
+    [
+        ({"central_asset_id": "asset_OTHER"}, frozenset({"read"})),
+        ({"central_asset_id": "asset_OTHER"}, frozenset()),
+        ({"configured_model_id": "mdl_other"}, frozenset({"read"})),
+        ({"configured_model_id": "mdl_other"}, frozenset()),
+    ],
+)
+def test_terminal_read_replay_binds_hidden_target_and_model_before_return(
+    runtime_overrides: dict[str, str],
+    permissions: frozenset[str],
+):
+    state_data = _terminal_read_state().model_dump(mode="python")
+    state_data["request"]["asset_id"] = None
+    state = AgentState.model_validate(state_data)
+    persisted_values = state.model_dump(mode="json")
+    graph = _RecordingGraph(persisted_values)
+
+    async def scenario():
+        async with IndustrialApiClient("https://industrial.test") as client:
+            with pytest.raises(AgentInvocationProtocolError) as error:
+                await invoke_agent(
+                    graph,
+                    request=_request(asset_id=None),
+                    runtime=_runtime(
+                        client,
+                        permissions=permissions,
+                        **runtime_overrides,
+                    ),
+                    thread_id=state.thread_id,
+                    request_id=state.request_id,
+                    execution_id="exec_hidden_read_scope_recheck",
+                )
+        return error.value
+
+    error = asyncio.run(scenario())
+
+    assert error.code == "TRUSTED_WRITE_CONTEXT_DRIFT"
+    assert graph.values == persisted_values
+    assert graph.as_node is None
+    assert graph.invoke_config is None
+
+
 def test_terminal_write_replay_binds_hidden_asset_when_request_has_no_asset():
     base = _terminal_execution_state()
     state_data = base.model_dump(mode="python")
@@ -1030,7 +1076,7 @@ def test_planner_direct_write_reserves_writer_repair_and_gate_budget():
                     thread_id="thread_planner_budget_rejected",
                     request_id="req_planner_budget_rejected",
                     execution_id="exec_planner_budget_rejected",
-                    step_limit=7,
+                    step_limit=9,
                     proposal=proposal,
                     original_approval=approval,
                 )
@@ -1042,7 +1088,7 @@ def test_planner_direct_write_reserves_writer_repair_and_gate_budget():
                 thread_id="thread_planner_budget_accepted",
                 request_id="req_planner_budget_accepted",
                 execution_id="exec_planner_budget_accepted",
-                step_limit=8,
+                step_limit=10,
                 proposal=proposal,
                 original_approval=approval,
             )
@@ -1053,7 +1099,7 @@ def test_planner_direct_write_reserves_writer_repair_and_gate_budget():
     assert error.code == "STEP_LIMIT_EXHAUSTED"
     assert rejected.state_config is not None
     assert rejected.invoke_config is None
-    assert accepted.step_limit == 8
+    assert accepted.step_limit == 10
 
 
 @pytest.mark.parametrize(
@@ -1710,10 +1756,7 @@ def test_continuation_fails_closed_when_authenticated_identity_changes(
         async with IndustrialApiClient("https://industrial.test") as client:
             async with open_checkpointer(checkpoint_path) as saver:
                 graph = build_agent_graph(saver)
-                with pytest.raises(
-                    ValidationError,
-                    match="thread reutilizado fora do escopo confiável",
-                ):
+                with pytest.raises(AgentInvocationProtocolError) as denied:
                     await invoke_agent(
                         graph,
                         request=_request(user_id="usr_intruso"),
@@ -1722,6 +1765,7 @@ def test_continuation_fails_closed_when_authenticated_identity_changes(
                         request_id="req_02",
                         execution_id="exec_02",
                     )
+                assert denied.value.code == "THREAD_SCOPE_MISMATCH"
                 unchanged = await graph.aget_state(
                     {"configurable": {"thread_id": "thread_case_tkt_inv_04"}}
                 )
@@ -2392,11 +2436,9 @@ def test_concurrent_divergent_identity_fails_after_thread_is_bound(
                 await asyncio.sleep(0)
                 release_first.set()
                 owner = await first_task
-                with pytest.raises(
-                    ValidationError,
-                    match="thread reutilizado fora do escopo confiável",
-                ):
+                with pytest.raises(AgentInvocationProtocolError) as denied:
                     await intruder_task
+                assert denied.value.code == "THREAD_SCOPE_MISMATCH"
         return owner
 
     owner = asyncio.run(scenario())

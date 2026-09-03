@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -12,6 +12,14 @@ from tractian_agent.contracts import (
     SupportRequest,
 )
 from tractian_agent.evidence import canonical_evidence_id, compile_action_intents
+from tractian_agent.human_review import (
+    ReviewEditReply,
+    ReviewerIdentity,
+    build_review_audit,
+    build_review_resolution,
+    build_reviewed_draft,
+    build_review_request,
+)
 from tractian_agent.release_gate import (
     ReleaseGateContext,
     evaluate_release,
@@ -36,6 +44,8 @@ from tractian_agent.state import (
     ResumeAnchor,
     ThreadScope,
     WriterDraft,
+    WriterFailureCode,
+    WriterFailureRecord,
     WriterNextStep,
 )
 from tractian_agent.tools.runtime import TrustedIdentity
@@ -519,6 +529,216 @@ def test_receipt_only_action_does_not_require_read_permission() -> None:
     result = evaluate_release(context)
 
     assert result.outcome is ReleaseGateOutcome.RELEASE
+
+
+def test_reviewed_action_cannot_omit_the_current_accepted_receipt() -> None:
+    proposal, approval, intent, action_ledger = _completed_update_action()
+    technical = _claimable_ledger().items[0].model_copy(
+        update={"request_id": "req_gate_action"}
+    )
+    technical = technical.model_copy(
+        update={"evidence_id": canonical_evidence_id(technical)}
+    )
+    ledger = EvidenceLedger(
+        request_id="req_gate_action",
+        items=tuple(
+            sorted((*action_ledger.items, technical), key=lambda item: item.evidence_id)
+        ),
+    )
+    failure = WriterFailureRecord(
+        code=WriterFailureCode.INVALID_STRUCTURED_OUTPUT,
+        attempts=2,
+        repairable=True,
+    )
+    permissions = frozenset({"action_high", "read"})
+    basis = ReleaseGateContext(
+        request_id="req_gate_action",
+        decision=AgentDecision.ACT,
+        ledger=ledger,
+        draft=None,
+        permissions=permissions,
+        trusted_write_context=_trusted_write_context(),
+        intents=(intent,),
+        proposal=proposal,
+        approval=approval,
+        writer_failure=failure,
+    )
+    gate = evaluate_release(basis)
+    request = build_review_request(
+        request_id="req_gate_action",
+        request={"safe": True},
+        thread_scope=ThreadScope(
+            thread_id="thread_gate_action_review",
+            case_id="case_tkt_inv_04",
+            company_id="comp_mineracao_andes",
+            user_id="usr_pedro",
+        ),
+        permissions=permissions,
+        gate=gate,
+        ledger=ledger,
+        draft=None,
+        created_at=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+    )
+    reply = ReviewEditReply(
+        review_id=request.review_id,
+        operation="edit",
+        evidence_ids=(technical.evidence_id,),
+        next_step=WriterNextStep.VERIFY_ACTION,
+    )
+    reviewed = build_reviewed_draft(request, reply, ledger)
+    resolution = build_review_resolution(
+        request=request,
+        reply=reply,
+        reviewer=ReviewerIdentity(
+            reviewer_id="reviewer_gate_action",
+            company_id="comp_mineracao_andes",
+            permission="review",
+        ),
+        received_at=request.created_at + timedelta(minutes=1),
+    )
+    audit = build_review_audit(
+        request=request,
+        resolution=resolution,
+        reviewed_draft=reviewed,
+    )
+    result = evaluate_release(
+        basis.model_copy(
+            update={
+                "draft": reviewed,
+                "review_request": request,
+                "review_resolution": resolution,
+                "review_audit": audit,
+            }
+        )
+    )
+
+    assert result.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+    assert result.reason is ReleaseGateReason.ACTION_EVIDENCE_MISSING
+
+
+def _reviewed_action_after_writer_failure(
+    action: str,
+    *,
+    include_receipt: bool,
+):
+    proposal, approval, intent, action_ledger, permission, decision = (
+        _completed_gate_action(action)
+    )
+    ledger = action_ledger
+    selected_id = action_ledger.items[0].evidence_id
+    permissions = frozenset({permission})
+    if not include_receipt:
+        technical = _claimable_ledger().items[0].model_copy(
+            update={"request_id": "req_gate_matrix"}
+        )
+        technical = technical.model_copy(
+            update={"evidence_id": canonical_evidence_id(technical)}
+        )
+        ledger = EvidenceLedger(
+            request_id="req_gate_matrix",
+            items=tuple(
+                sorted(
+                    (*action_ledger.items, technical),
+                    key=lambda item: item.evidence_id,
+                )
+            ),
+        )
+        selected_id = technical.evidence_id
+        permissions = frozenset({permission, "read"})
+    failure = WriterFailureRecord(
+        code=WriterFailureCode.INVALID_STRUCTURED_OUTPUT,
+        attempts=2,
+        repairable=True,
+    )
+    basis = ReleaseGateContext(
+        request_id="req_gate_matrix",
+        decision=decision,
+        ledger=ledger,
+        draft=None,
+        permissions=permissions,
+        trusted_write_context=_trusted_write_context(),
+        intents=(intent,),
+        proposal=proposal,
+        approval=approval,
+        writer_failure=failure,
+    )
+    gate = evaluate_release(basis)
+    request = build_review_request(
+        request_id="req_gate_matrix",
+        request={"safe": True},
+        thread_scope=ThreadScope(
+            thread_id=f"thread_reviewed_{action}",
+            case_id="case_tkt_inv_04",
+            company_id="comp_mineracao_andes",
+            user_id="usr_pedro",
+        ),
+        permissions=permissions,
+        gate=gate,
+        ledger=ledger,
+        draft=None,
+        created_at=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+    )
+    reply = ReviewEditReply(
+        review_id=request.review_id,
+        operation="edit",
+        evidence_ids=(selected_id,),
+        next_step=(
+            WriterNextStep.VERIFY_ACTION
+            if decision is AgentDecision.ACT
+            else WriterNextStep.AWAIT_ESCALATION
+        ),
+    )
+    reviewed = build_reviewed_draft(request, reply, ledger)
+    resolution = build_review_resolution(
+        request=request,
+        reply=reply,
+        reviewer=ReviewerIdentity(
+            reviewer_id="reviewer_gate_matrix",
+            company_id="comp_mineracao_andes",
+            permission="review",
+        ),
+        received_at=request.created_at + timedelta(minutes=1),
+    )
+    audit = build_review_audit(
+        request=request,
+        resolution=resolution,
+        reviewed_draft=reviewed,
+    )
+    return evaluate_release(
+        basis.model_copy(
+            update={
+                "draft": reviewed,
+                "review_request": request,
+                "review_resolution": resolution,
+                "review_audit": audit,
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "reprocess_analysis",
+        "request_specialist_analysis",
+        "update_asset_criticality",
+        "request_model_retraining",
+        "escalate_case",
+    ],
+)
+def test_reviewed_actions_require_and_release_with_the_current_receipt(action: str):
+    omitted = _reviewed_action_after_writer_failure(
+        action,
+        include_receipt=False,
+    )
+    included = _reviewed_action_after_writer_failure(
+        action,
+        include_receipt=True,
+    )
+
+    assert omitted.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+    assert omitted.reason is ReleaseGateReason.ACTION_EVIDENCE_MISSING
+    assert included.outcome is ReleaseGateOutcome.RELEASE
 
 
 def test_read_permission_revoked_after_draft_blocks_cited_tool_evidence() -> None:

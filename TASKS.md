@@ -427,12 +427,44 @@ pacotes; permaneceu apenas o warning conhecido de `python_multipart`.
 
 **Decidir:** autenticação provisória, operações de aprovar/editar/rejeitar e expiração.
 
-- [ ] Interromper o grafo com motivo, ponto de dúvida e evidências disponíveis.
-- [ ] Permitir retomada após decisão do revisor.
-- [ ] Registrar autor, horário e alteração do humano.
-- [ ] Testar aprovação, edição, rejeição e retomada.
+- [x] Interromper o grafo com motivo, ponto de dúvida e evidências disponíveis.
+- [x] Permitir retomada após decisão do revisor.
+- [x] Registrar autor, horário e alteração do humano.
+- [x] Testar aprovação, edição, rejeição e retomada.
 
 **Aceite:** caso ambíguo não chega ao cliente como certeza e pode ser retomado sem recomeçar.
+
+**Decisão local de segurança — Ruling 10:** a única razão que uma aprovação
+humana pode limpar é `human_disposition_required`: uma decisão `guide` cujo
+draft, proveniência, suficiência, permissões e estado de ação já passaram por
+todas as regras determinísticas, mas cujo próximo passo fechado pede disposição
+humana. A aprovação cria um `ReviewedDraft` separado e troca somente esse
+próximo passo por `monitor`; ela não altera a decisão do planner. Pedido
+explícito `require_human_review`, falha de integridade, lacuna, conflito,
+obsolescência, overflow, permissão incompatível, informação ausente inválida,
+aprovação de ação divergente e intenção ausente, incerta ou não concluída são
+bloqueios duros. Uma edição pode selecionar/reordenar IDs elegíveis e escolher
+um próximo passo enumerado, inclusive reconstruir o draft após duas falhas do
+writer, mas sempre volta ao mesmo gate; se continuar bloqueada, encerra com
+aviso seguro e não abre uma segunda revisão.
+
+**Evidência de aceite (03/09/2026):** `make test` passou com 99 testes da API e
+1.689 do agente; os 235 fluxos de escrita passaram separadamente, assim como
+Ruff e `uv lock --check --offline`. A retomada com SQLite reaberto preservou
+planner, writer, tools e ações já concluídos sem nova chamada. Testes adversariais
+adicionais cobrem perda de `read` em todas as operações e replay, terminais
+canônicos, base/auditoria adulteradas, drift de permissão, edição sem fatos para
+pedido de informação, coerções, orçamento, concorrência e isolamento entre
+threads. A allowlist fechada oferece edição apenas para disposição humana,
+falha do writer, seleção de evidência ou próximo passo; motivos duros aceitam
+somente rejeição. Expiração tem precedência sobre a operação e é fechada antes
+de uma nova solicitação, enquanto `ACT`/`ESCALATE` revisado preserva o recibo
+`accepted` da intenção atual. A autorização read-only de thread, tenant, caso,
+alvo central, modelo configurado, request e execução ocorre antes de qualquer
+escrita no checkpoint, inclusive quando a request omite o ativo. O gate-base
+original nunca é removido durante drift de permissão: um marcador estrito e
+derivado vincula permissões de base/atuais, decisão e a fase exata anterior ao
+julgamento ou posterior à auditoria, até o segundo gate.
 
 ## Fase 10 — Logfire
 
