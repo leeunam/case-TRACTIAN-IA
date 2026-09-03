@@ -27,6 +27,17 @@ from tractian_agent.evidence import (
     compile_observations,
     merge_ledgers,
 )
+from tractian_agent.human_review import (
+    ReviewApproveReply,
+    ReviewEditReply,
+    ReviewResumeEnvelope,
+    build_review_audit,
+    build_review_request,
+    build_reviewed_draft,
+    canonical_digest,
+    review_interrupt_payload,
+    review_is_valid,
+)
 from tractian_agent.planner import (
     Planner,
     PlannerDecisionTurn,
@@ -53,11 +64,13 @@ from tractian_agent.state import (
     PlannerTerminalRecord,
     ResumeAnchor,
     ReviewRecord,
+    ReviewExpiry,
     ReviewStatus,
     ReleaseGateOutcome,
     ToolObservation,
     WriterFailureCode,
     WriterFailureRecord,
+    WriterNextStep,
     canonical_non_idempotent_resume_terminal,
     validate_exact_json_model,
     validate_exact_read_artifact,
@@ -936,7 +949,11 @@ def _release_gate_context(state: AgentState) -> ReleaseGateContext:
             else AgentDecision.REQUIRE_HUMAN_REVIEW
         ),
         ledger=state.ledger,
-        draft=state.writer_draft,
+        draft=(
+            state.reviewed_draft
+            if state.reviewed_draft is not None
+            else state.writer_draft
+        ),
         permissions=state.permissions,
         intents=current_intents,
         proposal=state.pending_proposal,
@@ -949,6 +966,8 @@ def _release_gate_context(state: AgentState) -> ReleaseGateContext:
             else None
         ),
         writer_failure=state.writer_failure,
+        review_request=state.review_request,
+        review_audit=state.review_audit,
     )
 
 
@@ -967,26 +986,141 @@ def _release_gate(state: AgentState) -> dict[str, object]:
     if attestation.outcome is ReleaseGateOutcome.RELEASE:
         final_result = render_released_result(context, attestation)
         review = None
+        review_request = advanced.review_request
     else:
-        final_result = render_non_release_result(context, attestation)
+        requires_review = (
+            attestation.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+        )
+        if requires_review and advanced.review_audit is None:
+            final_result = None
+            review_request = build_review_request(
+                request_id=advanced.request_id,
+                request=advanced.request,
+                gate=attestation,
+                ledger=advanced.ledger,
+                draft=advanced.writer_draft,
+                created_at=_utc_now(),
+            )
+        else:
+            final_result = render_non_release_result(context, attestation)
+            review_request = advanced.review_request
         review = (
             ReviewRecord(
                 status=ReviewStatus.REQUIRED,
                 reason=f"release_gate:{attestation.reason.value}",
             )
-            if attestation.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+            if requires_review
             else None
         )
     return _checkpoint_update(
         _replace_state(
             advanced,
             resume_anchor=ResumeAnchor.RELEASE_GATE,
-            decision=final_result.decision,
+            decision=(
+                final_result.decision
+                if final_result is not None
+                else advanced.decision
+            ),
             final_result=final_result,
             review=review,
             release_gate=attestation,
+            review_request=review_request,
         )
     )
+
+
+def _after_release_gate(state: AgentState) -> Literal["end", "review"]:
+    return "review" if state.final_result is None else "end"
+
+
+def _await_human_review(state: AgentState) -> dict[str, object]:
+    request = state.review_request
+    if request is None or state.review_audit is not None or state.review_expiry is not None:
+        raise ValueError("estado não possui uma única revisão pendente")
+    envelope = ReviewResumeEnvelope.model_validate_json(
+        json.dumps(
+            interrupt(review_interrupt_payload(request).model_dump(mode="json")),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    if envelope.reply.review_id != request.review_id:
+        raise ValueError("reply pertence a outra revisão")
+    if envelope.reviewer.company_id != state.identity.company_id:
+        raise ValueError("revisor pertence a outra empresa")
+    advanced = state.advance_step()
+    if not review_is_valid(request, envelope.received_at):
+        return _checkpoint_update(
+            _replace_state(
+                advanced,
+                resume_anchor=ResumeAnchor.AWAIT_HUMAN_REVIEW,
+                final_result=FinalResult(
+                    decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+                    message=(
+                        "A revisão expirou; uma nova solicitação é necessária."
+                    ),
+                    next_step=WriterNextStep.AWAIT_HUMAN_REVIEW,
+                ),
+                review_expiry=ReviewExpiry(
+                    review_id=request.review_id,
+                    review_digest=canonical_digest(request),
+                    expired_at=envelope.received_at,
+                ),
+            )
+        )
+    if envelope.reply.operation == "reject":
+        audit = build_review_audit(
+            request=request,
+            reply=envelope.reply,
+            reviewer=envelope.reviewer,
+            received_at=envelope.received_at,
+            reviewed_draft=None,
+        )
+        return _checkpoint_update(
+            _replace_state(
+                advanced,
+                resume_anchor=ResumeAnchor.AWAIT_HUMAN_REVIEW,
+                final_result=FinalResult(
+                    decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+                    message="A revisão humana rejeitou a liberação da resposta.",
+                    next_step=WriterNextStep.AWAIT_HUMAN_REVIEW,
+                ),
+                review=ReviewRecord(
+                    status=ReviewStatus.REJECTED,
+                    reason="human_review:rejected",
+                ),
+                review_audit=audit,
+            )
+        )
+    if not isinstance(envelope.reply, (ReviewApproveReply, ReviewEditReply)):
+        raise ValueError("operação de revisão desconhecida")
+    reviewed_draft = build_reviewed_draft(request, envelope.reply, advanced.ledger)
+    audit = build_review_audit(
+        request=request,
+        reply=envelope.reply,
+        reviewer=envelope.reviewer,
+        received_at=envelope.received_at,
+        reviewed_draft=reviewed_draft,
+    )
+    return _checkpoint_update(
+        _replace_state(
+            advanced,
+            resume_anchor=ResumeAnchor.AWAIT_HUMAN_REVIEW,
+            final_result=None,
+            reviewed_draft=reviewed_draft,
+            review_audit=audit,
+            review=ReviewRecord(
+                status=ReviewStatus.APPROVED,
+                reason=f"human_review:{envelope.reply.operation}",
+            ),
+        )
+    )
+
+
+def _after_human_review(state: AgentState) -> Literal["end", "gate"]:
+    return "end" if state.final_result is not None else "gate"
 
 
 def _write_policy(
@@ -1683,6 +1817,7 @@ def build_agent_graph(
         builder.add_node("planner_finalize", _planner_finalize)
         builder.add_node("writer", _writer_node(writer))
         builder.add_node("release_gate", _release_gate)
+        builder.add_node("await_human_review", _await_human_review)
         builder.add_conditional_edges(
             "ingest",
             _after_ingest_with_planner,
@@ -1704,7 +1839,16 @@ def build_agent_graph(
             _after_writer,
             {"repair": "writer", "gate": "release_gate"},
         )
-        builder.add_edge("release_gate", END)
+        builder.add_conditional_edges(
+            "release_gate",
+            _after_release_gate,
+            {"end": END, "review": "await_human_review"},
+        )
+        builder.add_conditional_edges(
+            "await_human_review",
+            _after_human_review,
+            {"end": END, "gate": "release_gate"},
+        )
     if planner is None:
         builder.add_conditional_edges(
             "write_policy",

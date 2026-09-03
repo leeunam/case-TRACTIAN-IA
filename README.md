@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação e checkpointer SQLite de desenvolvimento. Em 02/09/2026, `make test` passou com 99 testes da API e 1.624 do agente (1.723 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 8 estão concluídas. O grafo atual ainda não é um agente de produção: revisão humana retomável, Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável e checkpointer SQLite de desenvolvimento. Em 02/09/2026, `make test` passou com 99 testes da API e 1.646 do agente (1.745 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 9 estão concluídas. O grafo atual ainda não é um agente de produção: Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
 
 ## Problema
 
@@ -30,7 +30,8 @@ flowchart TD
     D --> H[Writer: redige com base no ledger]
     H --> I[Gate determinístico de segurança]
     I --> J[Resposta ou pedido seguro]
-    I -. futura fila retomável .-> L[Revisão humana]
+    I --> L[Revisão humana retomável]
+    L --> I
     C -. traces e métricas .-> K[Logfire]
 ```
 
@@ -54,7 +55,17 @@ permite ao renderer buscar os valores no ledger; a mensagem técnica não vem do
 modelo e é revalidada ao restaurar o checkpoint. Uma saída de formato inválido
 admite somente um repair; contador, âncora e próximo nó impedem uma terceira
 chamada. Duas falhas, erro de provider ou qualquer incerteza terminam em aviso
-sanitizado e seguro para futura revisão.
+sanitizado ou, quando aplicável, revisão humana.
+
+A revisão humana é uma fronteira persistente e retomável: o pedido sanitizado é
+gravado antes da interrupção e a identidade da pessoa revisora chega separada da
+resposta. A aprovação só remove o motivo fechado `HUMAN_DISPOSITION_REQUIRED`
+de um draft `GUIDE` que já passou pelas demais verificações e pediu disposição
+humana como próximo passo; ela nunca transforma a decisão explícita
+`REQUIRE_HUMAN_REVIEW` do planner em orientação. Edição limita-se à seleção e à
+ordem das evidências atuais e ao próximo passo enumerado. Toda retomada revalida
+ledger, permissões e intenções; bloqueios duros, rejeição, expiração ou uma
+segunda necessidade de revisão encerram de forma segura, sem executar ação.
 
 O **ledger de evidências** associa fatos às fontes consultadas no estado da execução. Ele recebe somente observações de leitura validadas e recibos tipados de intenções terminais; texto livre de LLM, proposals e mensagens de recibo não viram fatos. O Logfire receberá traces e métricas para consulta humana e operação; ele não será o banco principal do ledger nem uma fonte que o agente consulta durante o atendimento. Logfire ainda não está implementado.
 
@@ -224,7 +235,7 @@ Prompt curto recomendado:
 
 ## Limitações atuais
 
-- Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, fluxos de escrita e checkpointer. Ele ainda não possui revisão humana retomável, Logfire nem runner Pydantic Evals; portanto não é um agente de produção.
+- Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, revisão humana retomável, fluxos de escrita e checkpointer. Ele ainda não possui Logfire nem runner Pydantic Evals; portanto não é um agente de produção.
 - As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
 - O simulador não representa todas as garantias transacionais de produção.
 - As rotas de ação do simulador devolvem recibos, mas não alteram os recursos Parquet; um novo GET não comprova a mutação solicitada.
