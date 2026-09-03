@@ -173,6 +173,7 @@ def test_original_approval_completes_reprocess_in_five_steps(tmp_path: Path):
     intent = state.intents[0]
     assert intent.request_id == "req_reprocess_direct"
     assert intent.status is IntentStatus.COMPLETED
+    assert intent.approval_source is ApprovalSource.ORIGINAL_REQUEST
     assert intent.payload_hash == _expected_payload_hash()
     assert intent.idempotency_key == f"tractian-agent:{intent.intent_id}"
     assert intent.attempts == 1
@@ -331,6 +332,9 @@ def test_confirmation_resume_approves_with_trusted_scope_and_completes(
     assert completed.approval.source is ApprovalSource.CONFIRMATION
     assert completed.approval.target_id == "an_9901"
     assert completed.intents[0].status is IntentStatus.COMPLETED
+    assert (
+        completed.intents[0].approval_source is ApprovalSource.CONFIRMATION
+    )
     assert len(requests) == 2
 
 

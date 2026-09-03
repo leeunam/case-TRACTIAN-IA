@@ -34,8 +34,7 @@ from tractian_agent.tools.runtime import Permission
 from tractian_agent.write_contracts import (
     IntentStatus,
     WriteIntent,
-    intent_scope_material_parameters,
-    intent_scope_target_id,
+    approval_matches_write_intent,
     proposal_matches_intent_scope,
 )
 from tractian_agent.write_policy import (
@@ -44,6 +43,7 @@ from tractian_agent.write_policy import (
     TrustedActionApproval,
     TrustedWriteContext,
     WriteProposal,
+    evaluate_write_policy,
 )
 from tractian_agent.writer import (
     WriterContext,
@@ -192,15 +192,14 @@ def _approval_matches_intent(
     context: ReleaseGateContext,
     intent: WriteIntent,
 ) -> bool:
-    if context.approval is None:
+    if context.proposal is None:
         return False
-    expected = TrustedActionApproval(
-        action=intent.scope.action,
-        target_id=intent_scope_target_id(intent.scope),
-        material_parameters=intent_scope_material_parameters(intent.scope),
-        source=context.approval.source,
+    return approval_matches_write_intent(
+        context.proposal,
+        intent,
+        approval=context.approval,
+        trusted_context=context.trusted_write_context,
     )
-    return context.approval == expected
 
 
 def _action_decision_is_canonical(
@@ -239,16 +238,13 @@ def _action_decision_is_canonical(
             return ReleaseGateReason.DECISION_MISMATCH
         if _ACTION_PERMISSION[intent.scope.action] not in context.permissions:
             return ReleaseGateReason.PERMISSION_INCOMPATIBLE
-        if (
-            intent.decision.reason is PolicyReason.EXPLICIT_APPROVAL_REQUIRED
-            and context.approval is not None
-        ) or (
-            intent.decision.reason is PolicyReason.APPROVAL_SCOPE_MISMATCH
-            and (
-                context.approval is None
-                or _approval_matches_intent(context, intent)
-            )
-        ):
+        current_policy = evaluate_write_policy(
+            context.proposal,
+            permissions=context.permissions,
+            approval=context.approval,
+            trusted_context=context.trusted_write_context,
+        )
+        if current_policy != intent.decision:
             return ReleaseGateReason.INTENT_POLICY_MISMATCH
         return None
     if context.proposal is None or not proposal_matches_intent_scope(

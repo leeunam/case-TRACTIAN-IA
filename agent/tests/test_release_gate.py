@@ -40,16 +40,22 @@ from tractian_agent.state import (
 )
 from tractian_agent.tools.runtime import TrustedIdentity
 from tractian_agent.write_contracts import (
+    EscalateCaseIntentScope,
     IntentStatus,
     ReprocessIntentScope,
+    RequestModelRetrainingIntentScope,
+    RequestSpecialistAnalysisIntentScope,
     UpdateAssetCriticalityIntentScope,
     WriteIntent,
 )
 from tractian_agent.write_policy import (
     ApprovalSource,
+    EscalateCaseProposal,
     PolicyDecision,
     PolicyReason,
     ReprocessProposal,
+    RequestModelRetrainingProposal,
+    RequestSpecialistAnalysisProposal,
     TrustedActionApproval,
     TrustedWriteContext,
     UpdateAssetCriticalityProposal,
@@ -154,6 +160,7 @@ def _completed_update_action() -> tuple[
             reason=PolicyReason.AUTHORIZED,
         ),
         status=IntentStatus.COMPLETED,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
         prepared_execution_id="exec_gate_action",
         attempts=1,
         receipt=ActionReceipt(
@@ -167,6 +174,194 @@ def _completed_update_action() -> tuple[
         recorded_at=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
     )
     return proposal, approval, intent, ledger
+
+
+def _completed_gate_action(action: str):
+    justification = "A ação atual foi explicitamente autorizada para este escopo."
+    common = {
+        "case_id": "case_tkt_inv_04",
+        "company_id": "comp_mineracao_andes",
+        "user_id": "usr_pedro",
+        "justification": justification,
+    }
+    if action == "reprocess_analysis":
+        proposal = ReprocessProposal(
+            analysis_id="an_9906",
+            justification=justification,
+        )
+        scope = ReprocessIntentScope(
+            action=action,
+            analysis_id="an_9906",
+            **common,
+        )
+        target_id = "an_9906"
+        permission = "action_low"
+        decision = AgentDecision.ACT
+    elif action == "request_specialist_analysis":
+        proposal = RequestSpecialistAnalysisProposal(
+            analysis_id="an_9906",
+            justification=justification,
+        )
+        scope = RequestSpecialistAnalysisIntentScope(
+            action=action,
+            analysis_id="an_9906",
+            **common,
+        )
+        target_id = "an_9906"
+        permission = "action_low"
+        decision = AgentDecision.ACT
+    elif action == "update_asset_criticality":
+        proposal = UpdateAssetCriticalityProposal(
+            criticality="critical",
+            justification=justification,
+        )
+        scope = UpdateAssetCriticalityIntentScope(
+            action=action,
+            asset_id="asset_G501",
+            criticality="critical",
+            **common,
+        )
+        target_id = "asset_G501"
+        permission = "action_high"
+        decision = AgentDecision.ACT
+    elif action == "request_model_retraining":
+        proposal = RequestModelRetrainingProposal(justification=justification)
+        scope = RequestModelRetrainingIntentScope(
+            action=action,
+            model_id="mdl_vib_v3",
+            **common,
+        )
+        target_id = "mdl_vib_v3"
+        permission = "action_high"
+        decision = AgentDecision.ACT
+    else:
+        proposal = EscalateCaseProposal(justification=justification)
+        scope = EscalateCaseIntentScope(action="escalate_case", **common)
+        target_id = "case_tkt_inv_04"
+        permission = "escalate"
+        decision = AgentDecision.ESCALATE
+    material = (
+        {"criticality": "critical"}
+        if action == "update_asset_criticality"
+        else {}
+    )
+    approval = TrustedActionApproval(
+        action=action,
+        target_id=target_id,
+        material_parameters=material,
+        source=ApprovalSource.ORIGINAL_REQUEST,
+    )
+    intent_kwargs = {}
+    if action == "reprocess_analysis":
+        intent_kwargs = {
+            "idempotency_key": "tractian-agent:intent_gate_matrix",
+            "expires_at": datetime(2026, 9, 3, 12, tzinfo=timezone.utc),
+        }
+    intent = WriteIntent(
+        intent_id="intent_gate_matrix",
+        request_id="req_gate_matrix",
+        scope=scope,
+        payload_hash=canonical_write_payload_hash(
+            proposal,
+            trusted_context=_trusted_write_context(),
+        ),
+        decision=WritePolicyResult(
+            decision=PolicyDecision.ALLOW,
+            reason=PolicyReason.AUTHORIZED,
+        ),
+        status=IntentStatus.COMPLETED,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
+        prepared_execution_id="exec_gate_matrix",
+        attempts=1,
+        receipt=ActionReceipt(
+            accepted=True,
+            action_id="act_gate_matrix",
+            message="Mensagem externa não claimable.",
+        ),
+        **intent_kwargs,
+    )
+    ledger = compile_action_intents(
+        (intent,),
+        recorded_at=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+    )
+    return proposal, approval, intent, ledger, permission, decision
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "reprocess_analysis",
+        "request_specialist_analysis",
+        "update_asset_criticality",
+        "request_model_retraining",
+        "escalate_case",
+    ],
+)
+def test_gate_releases_each_action_only_with_its_canonical_approval(
+    action: str,
+) -> None:
+    proposal, approval, intent, ledger, permission, decision = (
+        _completed_gate_action(action)
+    )
+    context = ReleaseGateContext(
+        request_id="req_gate_matrix",
+        decision=decision,
+        ledger=ledger,
+        draft=_draft_for(decision, ledger),
+        permissions=frozenset({permission}),
+        trusted_write_context=_trusted_write_context(),
+        intents=(intent,),
+        proposal=proposal,
+        approval=approval,
+    )
+
+    assert evaluate_release(context).outcome is ReleaseGateOutcome.RELEASE
+
+
+@pytest.mark.parametrize("tamper", ["missing", "action", "target", "material"])
+def test_gate_blocks_noncanonical_approval_fields(tamper: str) -> None:
+    proposal, approval, intent, ledger = _completed_update_action()
+    intent = intent.model_copy(
+        update={"approval_source": ApprovalSource.ORIGINAL_REQUEST}
+    )
+    ledger = compile_action_intents(
+        (intent,),
+        recorded_at=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+    )
+    divergent: TrustedActionApproval | None
+    if tamper == "missing":
+        divergent = None
+    elif tamper == "action":
+        divergent = TrustedActionApproval(
+            action="request_specialist_analysis",
+            target_id="an_9906",
+            source=ApprovalSource.ORIGINAL_REQUEST,
+        )
+    elif tamper == "target":
+        divergent = approval.model_copy(update={"target_id": "asset_G502"})
+    else:
+        divergent = TrustedActionApproval(
+            action="update_asset_criticality",
+            target_id="asset_G501",
+            material_parameters={"criticality": "low"},
+            source=ApprovalSource.ORIGINAL_REQUEST,
+        )
+    context = ReleaseGateContext(
+        request_id="req_gate_action",
+        decision=AgentDecision.ACT,
+        ledger=ledger,
+        draft=_draft_for(AgentDecision.ACT, ledger),
+        permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
+        intents=(intent,),
+        proposal=proposal,
+        approval=divergent,
+    )
+
+    result = evaluate_release(context)
+
+    assert result.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+    assert result.reason is ReleaseGateReason.APPROVAL_MISMATCH
 
 
 def _released_action_state() -> AgentState:
@@ -222,6 +417,34 @@ def _released_action_state() -> AgentState:
         release_gate=attestation,
         resume_anchor=ResumeAnchor.RELEASE_GATE,
     )
+
+
+def test_gate_rejects_an_approval_source_that_diverges_from_the_intent() -> None:
+    proposal, approval, intent, ledger = _completed_update_action()
+    intent = intent.model_copy(
+        update={"approval_source": ApprovalSource.ORIGINAL_REQUEST}
+    )
+    ledger = compile_action_intents(
+        (intent,),
+        recorded_at=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+    )
+    divergent = approval.model_copy(update={"source": ApprovalSource.CONFIRMATION})
+    context = ReleaseGateContext(
+        request_id="req_gate_action",
+        decision=AgentDecision.ACT,
+        ledger=ledger,
+        draft=_draft_for(AgentDecision.ACT, ledger),
+        permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
+        intents=(intent,),
+        proposal=proposal,
+        approval=divergent,
+    )
+
+    result = evaluate_release(context)
+
+    assert result.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+    assert result.reason is ReleaseGateReason.APPROVAL_MISMATCH
 
 
 def test_gate_derives_act_from_the_completed_canonical_action() -> None:
@@ -482,6 +705,38 @@ def test_request_confirmation_rejects_an_approval_incompatible_with_policy() -> 
         decision=WritePolicyResult(
             decision=PolicyDecision.REQUIRE_CONFIRMATION,
             reason=PolicyReason.EXPLICIT_APPROVAL_REQUIRED,
+        ),
+        status=IntentStatus.AWAITING_CONFIRMATION,
+    )
+    ledger = EvidenceLedger()
+    context = ReleaseGateContext(
+        request_id="req_gate_confirmation",
+        decision=AgentDecision.REQUEST_CONFIRMATION,
+        ledger=ledger,
+        draft=_draft_for(AgentDecision.REQUEST_CONFIRMATION, ledger),
+        permissions=frozenset({"action_high"}),
+        trusted_write_context=_trusted_write_context(),
+        intents=(awaiting,),
+        proposal=proposal,
+        approval=approval,
+    )
+
+    result = evaluate_release(context)
+
+    assert result.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+    assert result.reason is ReleaseGateReason.INTENT_POLICY_MISMATCH
+
+
+def test_scope_mismatch_confirmation_recomputes_the_current_policy() -> None:
+    proposal, approval, completed, _ = _completed_update_action()
+    awaiting = WriteIntent(
+        intent_id="intent_gate_scope_confirmation",
+        request_id="req_gate_confirmation",
+        scope=completed.scope,
+        payload_hash=completed.payload_hash,
+        decision=WritePolicyResult(
+            decision=PolicyDecision.REQUIRE_CONFIRMATION,
+            reason=PolicyReason.APPROVAL_SCOPE_MISMATCH,
         ),
         status=IntentStatus.AWAITING_CONFIRMATION,
     )

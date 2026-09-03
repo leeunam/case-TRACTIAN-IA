@@ -16,15 +16,20 @@ from tractian_agent.write_contracts import (
     RequestSpecialistAnalysisIntentScope,
     UpdateAssetCriticalityIntentScope,
     WriteIntent,
+    approval_matches_write_intent,
+    intent_scope_material_parameters,
+    intent_scope_target_id,
     proposal_matches_intent_scope,
 )
 from tractian_agent.write_policy import (
+    ApprovalSource,
     EscalateCaseProposal,
     PolicyDecision,
     PolicyReason,
     ReprocessProposal,
     RequestModelRetrainingProposal,
     RequestSpecialistAnalysisProposal,
+    TrustedActionApproval,
     TrustedWriteContext,
     UpdateAssetCriticalityProposal,
     WritePolicyResult,
@@ -191,6 +196,33 @@ def test_canonical_proposal_intent_matcher_binds_each_action_target(
         proposal,
         scope.model_copy(update={"case_id": "case_tkt_inv_05"}),
         payload_hash=payload_hash,
+        trusted_context=trusted_context,
+    )
+    intent = WriteIntent(
+        intent_id=f"intent_{proposal.action}",
+        request_id="req_action_binding",
+        scope=scope,
+        payload_hash=payload_hash,
+        decision=_policy_result(),
+        status=IntentStatus.PROPOSED,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
+    )
+    approval = TrustedActionApproval(
+        action=scope.action,
+        target_id=intent_scope_target_id(scope),
+        material_parameters=intent_scope_material_parameters(scope),
+        source=ApprovalSource.ORIGINAL_REQUEST,
+    )
+    assert approval_matches_write_intent(
+        proposal,
+        intent,
+        approval=approval,
+        trusted_context=trusted_context,
+    )
+    assert not approval_matches_write_intent(
+        proposal,
+        intent,
+        approval=approval.model_copy(update={"source": ApprovalSource.CONFIRMATION}),
         trusted_context=trusted_context,
     )
 

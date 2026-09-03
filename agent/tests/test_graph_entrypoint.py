@@ -239,6 +239,7 @@ def _terminal_execution_state() -> AgentState:
             reason=PolicyReason.AUTHORIZED,
         ),
         status=IntentStatus.COMPLETED,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
         payload_hash=canonical_write_payload_hash(proposal),
         idempotency_key="tractian-agent:intent_req_01",
         expires_at=datetime.now(timezone.utc) + timedelta(days=1),
@@ -255,6 +256,11 @@ def _terminal_execution_state() -> AgentState:
     values = state.model_dump(mode="python")
     values.update(
         pending_proposal=proposal,
+        approval=TrustedActionApproval(
+            action="reprocess_analysis",
+            target_id="an_historical",
+            source=ApprovalSource.ORIGINAL_REQUEST,
+        ),
         intents=(completed,),
         ledger=compile_action_intents(
             (completed,),
@@ -1082,6 +1088,7 @@ def test_terminal_anchor_table_rejects_known_but_impossible_state(
         "execution_as_guide",
         "execution_with_other_target",
         "execution_with_other_payload_hash",
+        "execution_with_wrong_approval",
     ],
 )
 def test_adulterated_terminal_checkpoint_fails_closed_before_return(
@@ -1113,6 +1120,8 @@ def test_adulterated_terminal_checkpoint_fails_closed_before_return(
             persisted_values["final_result"]["decision"] = AgentDecision.GUIDE.value
         elif tamper == "execution_with_other_target":
             persisted_values["pending_proposal"]["analysis_id"] = "an_other"
+        elif tamper == "execution_with_wrong_approval":
+            persisted_values["approval"]["target_id"] = "an_other"
         else:
             persisted_values["intents"][0]["payload_hash"] = (
                 "sha256:v1:" + "b" * 64

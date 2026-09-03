@@ -965,6 +965,7 @@ def test_terminal_state_rejects_incompatible_write_intent_or_execution_result():
         request_id="req_01",
         payload_hash=canonical_write_payload_hash(proposal),
         status=IntentStatus.COMPLETED,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
         attempts=1,
         receipt=ActionReceipt(
             accepted=True,
@@ -976,6 +977,11 @@ def test_terminal_state_rejects_incompatible_write_intent_or_execution_result():
     completed = WriteIntent.model_validate(completed_data)
     execution_state = _state(
         pending_proposal=proposal,
+        approval=TrustedActionApproval(
+            action="reprocess_analysis",
+            target_id="an_9906",
+            source=ApprovalSource.ORIGINAL_REQUEST,
+        ),
         intents=(completed,),
         decision=AgentDecision.ACT,
         final_result=FinalResult(
@@ -1029,12 +1035,19 @@ def test_terminal_execution_rejects_adulterated_effect_binding(tamper: str):
                 reason=PolicyReason.AUTHORIZED,
             ),
             status=IntentStatus.COMPLETED,
+            approval_source=ApprovalSource.ORIGINAL_REQUEST,
             prepared_execution_id="exec_01",
             attempts=1,
             receipt=receipt,
         )
         state = _state(
             pending_proposal=proposal,
+            approval=TrustedActionApproval(
+                action="update_asset_criticality",
+                target_id="asset_G501",
+                material_parameters={"criticality": "critical"},
+                source=ApprovalSource.ORIGINAL_REQUEST,
+            ),
             intents=(intent,),
             decision=AgentDecision.ACT,
             final_result=FinalResult(
@@ -1055,12 +1068,18 @@ def test_terminal_execution_rejects_adulterated_effect_binding(tamper: str):
             request_id="req_01",
             payload_hash=canonical_write_payload_hash(proposal),
             status=IntentStatus.COMPLETED,
+            approval_source=ApprovalSource.ORIGINAL_REQUEST,
             attempts=1,
             receipt=receipt,
         )
         intent_data["scope"]["justification"] = proposal.justification
         state = _state(
             pending_proposal=proposal,
+            approval=TrustedActionApproval(
+                action="reprocess_analysis",
+                target_id="an_9906",
+                source=ApprovalSource.ORIGINAL_REQUEST,
+            ),
             intents=(WriteIntent.model_validate(intent_data),),
             decision=AgentDecision.ACT,
             final_result=FinalResult(
@@ -1076,6 +1095,157 @@ def test_terminal_execution_rejects_adulterated_effect_binding(tamper: str):
             wire["intents"][0]["payload_hash"] = "sha256:v1:" + "b" * 64
 
     with pytest.raises(ValidationError, match="ciclo de escrita|terminal diverge"):
+        AgentState.model_validate(wire)
+
+
+def test_completed_terminal_requires_a_canonical_approval():
+    proposal = ReprocessProposal(
+        analysis_id="an_9906",
+        justification="O reprocesso autorizado foi concluído pela plataforma.",
+    )
+    intent_data = _intent().model_dump(mode="python")
+    intent_data.update(
+        request_id="req_01",
+        payload_hash=canonical_write_payload_hash(proposal),
+        status=IntentStatus.COMPLETED,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
+        attempts=1,
+        receipt=ActionReceipt(
+            accepted=True,
+            action_id="act_missing_approval",
+            message="Reprocesso concluído.",
+        ),
+    )
+    intent_data["scope"]["justification"] = proposal.justification
+
+    with pytest.raises(ValidationError, match="terminal diverge"):
+        _state(
+            pending_proposal=proposal,
+            intents=(WriteIntent.model_validate(intent_data),),
+            decision=AgentDecision.ACT,
+            final_result=FinalResult(
+                decision=AgentDecision.ACT,
+                message="Reprocesso concluído.",
+            ),
+            resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+        )
+
+
+@pytest.mark.parametrize("tamper", ["action", "target", "source"])
+def test_completed_terminal_rejects_a_noncanonical_approval(tamper: str):
+    proposal = ReprocessProposal(
+        analysis_id="an_9906",
+        justification="O reprocesso autorizado foi concluído pela plataforma.",
+    )
+    intent_data = _intent().model_dump(mode="python")
+    intent_data.update(
+        request_id="req_01",
+        payload_hash=canonical_write_payload_hash(proposal),
+        status=IntentStatus.COMPLETED,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
+        attempts=1,
+        receipt=ActionReceipt(
+            accepted=True,
+            action_id="act_noncanonical_approval",
+            message="Reprocesso concluído.",
+        ),
+    )
+    intent_data["scope"]["justification"] = proposal.justification
+    canonical = _state(
+        pending_proposal=proposal,
+        approval=TrustedActionApproval(
+            action="reprocess_analysis",
+            target_id="an_9906",
+            source=ApprovalSource.ORIGINAL_REQUEST,
+        ),
+        intents=(WriteIntent.model_validate(intent_data),),
+        decision=AgentDecision.ACT,
+        final_result=FinalResult(
+            decision=AgentDecision.ACT,
+            message="Reprocesso concluído.",
+        ),
+        resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+    )
+    wire = canonical.model_dump(mode="json")
+    if tamper == "action":
+        wire["approval"]["action"] = "request_specialist_analysis"
+    elif tamper == "target":
+        wire["approval"]["target_id"] = "an_9910"
+    else:
+        wire["approval"]["source"] = ApprovalSource.CONFIRMATION.value
+
+    tampered = canonical.model_copy(
+        update={"approval": TrustedActionApproval.model_validate(wire["approval"])}
+    )
+    assert not tampered.has_coherent_terminal_result()
+    with pytest.raises(ValidationError, match="terminal diverge"):
+        AgentState.model_validate(wire)
+
+
+def test_completed_terminal_rejects_approval_material_drift():
+    proposal = UpdateAssetCriticalityProposal(
+        criticality="critical",
+        justification="A criticidade máxima foi autorizada para o ativo central.",
+    )
+    trusted_context = TrustedWriteContext(
+        central_asset_id="asset_G501",
+        current_case_id="case_tkt_inv_04",
+        configured_model_id="mdl_vib_v3",
+    )
+    intent = WriteIntent(
+        intent_id="intent_material_approval",
+        request_id="req_01",
+        scope=UpdateAssetCriticalityIntentScope(
+            action="update_asset_criticality",
+            case_id="case_tkt_inv_04",
+            company_id="comp_mineracao_andes",
+            user_id="usr_pedro",
+            asset_id="asset_G501",
+            criticality="critical",
+            justification=proposal.justification,
+        ),
+        payload_hash=canonical_write_payload_hash(
+            proposal,
+            trusted_context=trusted_context,
+        ),
+        decision=WritePolicyResult(
+            decision=PolicyDecision.ALLOW,
+            reason=PolicyReason.AUTHORIZED,
+        ),
+        status=IntentStatus.COMPLETED,
+        approval_source=ApprovalSource.ORIGINAL_REQUEST,
+        prepared_execution_id="exec_01",
+        attempts=1,
+        receipt=ActionReceipt(
+            accepted=True,
+            action_id="act_material_approval",
+            message="Criticidade atualizada.",
+        ),
+    )
+    canonical = _state(
+        pending_proposal=proposal,
+        approval=TrustedActionApproval(
+            action="update_asset_criticality",
+            target_id="asset_G501",
+            material_parameters={"criticality": "critical"},
+            source=ApprovalSource.ORIGINAL_REQUEST,
+        ),
+        intents=(intent,),
+        decision=AgentDecision.ACT,
+        final_result=FinalResult(
+            decision=AgentDecision.ACT,
+            message="Criticidade atualizada.",
+        ),
+        resume_anchor=ResumeAnchor.EXECUTE_ACTION,
+    )
+    wire = canonical.model_dump(mode="json")
+    wire["approval"]["material_parameters"]["criticality"] = "low"
+
+    tampered = canonical.model_copy(
+        update={"approval": TrustedActionApproval.model_validate(wire["approval"])}
+    )
+    assert not tampered.has_coherent_terminal_result()
+    with pytest.raises(ValidationError, match="terminal diverge"):
         AgentState.model_validate(wire)
 
 

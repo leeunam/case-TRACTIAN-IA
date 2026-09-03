@@ -379,13 +379,25 @@ capaz de reescrever coordenadamente o banco e recalcular todos os hashes. Não f
 inventada chave criptográfica: o armazenamento do checkpoint continua sendo uma
 fronteira confiável que precisa de controle de acesso operacional.
 
+**Decisão local de segurança — round 4:** qualquer resultado técnico de ação
+concluída, tanto no terminal legado `EXECUTE_ACTION` quanto em `RELEASE_GATE`,
+exige uma aprovação cuja ação, alvo, parâmetros materiais e origem coincidam
+com proposal, intenção e contexto confiável. A origem autorizadora é persistida
+na intenção para não ser autoatestada pela própria aprovação. Nas quatro ações
+não idempotentes, uma intenção `PREPARED` por outro `execution_id` termina
+primeiro em `uncertain/0`, inclusive se ativo, caso ou modelo atuais divergirem.
+A exceção da fronteira vale somente para a aresta pendente
+`prepare_intent → execute_action`, sem nova proposal, aprovação ou confirmação;
+execução normal, confirmação, mesma execução e replay terminal continuam
+revalidando todo o escopo.
+
 As cinco ações passaram por interrupção após o efeito, fechamento/reabertura do
 SQLite, retomada somente em writer/gate e replay sem novo HTTP ou modelo. A
 confirmação estruturada também terminou no gate sem repetir efeito. As suítes
 focadas da Fase 8 cobrem writer, gate, estado, contratos, planner e fronteira;
-as regressões dos fluxos de escrita somam 227 testes. A suíte completa do agente
-tem 1.566 testes e o `make test` confirmou 99 testes da API + 1.566 do agente =
-1.665 testes. `uv lock --check --offline` resolveu 49
+as regressões dos fluxos de escrita somam 235 testes. A suíte completa do agente
+tem 1.591 testes e o `make test` confirmou 99 testes da API + 1.591 do agente =
+1.690 testes. `uv lock --check --offline` resolveu 49
 pacotes; permaneceu apenas o warning conhecido de `python_multipart`.
 
 ## Fase 9 — revisão humana

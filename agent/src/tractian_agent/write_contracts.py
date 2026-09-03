@@ -17,9 +17,11 @@ from tractian_agent.contracts import (
 )
 from tractian_agent.tools.identifiers import AnalysisId, AssetId, ModelId
 from tractian_agent.write_policy import (
+    ApprovalSource,
     AssetCriticality,
     PolicyDecision,
     PolicyReason,
+    TrustedActionApproval,
     TrustedWriteContext,
     WriteMaterialParameters,
     WritePolicyResult,
@@ -244,6 +246,7 @@ class WriteIntent(StrictModel):
     payload_hash: CanonicalHash
     decision: WritePolicyResult
     status: IntentStatus
+    approval_source: ApprovalSource | None = None
     idempotency_key: IdempotencyKey | None = None
     expires_at: datetime | None = None
     prepared_execution_id: str | None = Field(
@@ -389,3 +392,37 @@ class WriteIntent(StrictModel):
                     "zero tentativa só aceita falha local pré-despacho"
                 )
         return self
+
+
+def approval_matches_write_intent(
+    proposal: WriteProposal,
+    intent: WriteIntent,
+    *,
+    approval: TrustedActionApproval | None,
+    trusted_context: TrustedWriteContext | None,
+) -> bool:
+    """Compara aprovação, proposal e intenção sem confiar em um só registro."""
+
+    if (
+        approval is None
+        or intent.approval_source is None
+        or trusted_context is None
+        or not proposal_matches_intent_scope(
+            proposal,
+            intent.scope,
+            payload_hash=intent.payload_hash,
+            trusted_context=trusted_context,
+        )
+    ):
+        return False
+    canonical = resolve_action_scope(
+        proposal,
+        trusted_context=trusted_context,
+    )
+    expected = TrustedActionApproval(
+        action=canonical.action,
+        target_id=canonical.target_id,
+        material_parameters=canonical.material_parameters,
+        source=intent.approval_source,
+    )
+    return approval == expected

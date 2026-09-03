@@ -45,6 +45,7 @@ from tractian_agent.write_contracts import (
     PersistedApiError,
     WriteIntent,
     WriteIntentScope,
+    approval_matches_write_intent,
     proposal_matches_intent_scope,
 )
 from tractian_agent.write_policy import (
@@ -1104,11 +1105,26 @@ class AgentState(FrozenStateModel):
             if gate is None:
                 return False
             if gate.outcome is ReleaseGateOutcome.RELEASE:
-                return (
+                coherent_release = (
                     self.writer_draft is not None
                     and self.writer_failure is None
                     and self.decision is self.writer_draft.decision
                     and self.review is None
+                )
+                if not coherent_release:
+                    return False
+                if self.decision not in {AgentDecision.ACT, AgentDecision.ESCALATE}:
+                    return True
+                return (
+                    self.pending_proposal is not None
+                    and len(current_intents) == 1
+                    and current_intents[0].status is IntentStatus.COMPLETED
+                    and approval_matches_write_intent(
+                        self.pending_proposal,
+                        current_intents[0],
+                        approval=self.approval,
+                        trusted_context=self.trusted_write_context,
+                    )
                 )
             if gate.outcome is ReleaseGateOutcome.REQUEST_INFORMATION:
                 return (
@@ -1155,6 +1171,13 @@ class AgentState(FrozenStateModel):
                     intent.scope,
                     request=self.request,
                     payload_hash=intent.payload_hash,
+                    trusted_context=self.trusted_write_context,
+                ):
+                    return False
+                if not approval_matches_write_intent(
+                    self.pending_proposal,
+                    intent,
+                    approval=self.approval,
                     trusted_context=self.trusted_write_context,
                 ):
                     return False

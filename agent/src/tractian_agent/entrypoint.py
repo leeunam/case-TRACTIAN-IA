@@ -23,6 +23,7 @@ from tractian_agent.write_contracts import (
     ConfirmationReply,
     IntentStatus,
     WriteIntent,
+    approval_matches_write_intent,
     intent_scope_material_parameters,
     intent_scope_target_id,
 )
@@ -279,13 +280,16 @@ def _terminal_confirmation_replay(
         return False
     intent = matches[0]
     if confirmation.decision == "approve":
-        expected_approval = TrustedActionApproval(
-            action=intent.scope.action,
-            target_id=intent_scope_target_id(intent.scope),
-            material_parameters=intent_scope_material_parameters(intent.scope),
-            source=ApprovalSource.CONFIRMATION,
+        return (
+            intent.approval_source is ApprovalSource.CONFIRMATION
+            and state.pending_proposal is not None
+            and approval_matches_write_intent(
+                state.pending_proposal,
+                intent,
+                approval=state.approval,
+                trusted_context=state.trusted_write_context,
+            )
         )
-        return state.approval == expected_approval
     return (
         intent.status is IntentStatus.DENIED
         and intent.decision.reason is PolicyReason.CONFIRMATION_REJECTED
@@ -373,11 +377,7 @@ def _validate_runtime_request_scope(
     request: SupportRequest,
     runtime: ReadToolRuntime,
 ) -> None:
-    if runtime.identity.model_dump() != request.identity.model_dump():
-        raise AgentInvocationProtocolError(
-            "RUNTIME_IDENTITY_SCOPE_MISMATCH",
-            "a identidade confiável diverge da solicitação",
-        )
+    _validate_runtime_identity_scope(request, runtime)
     if (
         request.asset_id is not None
         and runtime.central_asset_id != request.asset_id
@@ -385,6 +385,17 @@ def _validate_runtime_request_scope(
         raise AgentInvocationProtocolError(
             "RUNTIME_ASSET_SCOPE_MISMATCH",
             "o ativo central do runtime diverge da solicitação",
+        )
+
+
+def _validate_runtime_identity_scope(
+    request: SupportRequest,
+    runtime: ReadToolRuntime,
+) -> None:
+    if runtime.identity.model_dump() != request.identity.model_dump():
+        raise AgentInvocationProtocolError(
+            "RUNTIME_IDENTITY_SCOPE_MISMATCH",
+            "a identidade confiável diverge da solicitação",
         )
 
 
@@ -412,6 +423,37 @@ def _validate_persisted_trusted_write_context(
             "TRUSTED_WRITE_CONTEXT_DRIFT",
             "o runtime atual diverge do contexto confiável persistido",
         )
+
+
+def _is_conservative_non_idempotent_resume(
+    state: AgentState,
+    *,
+    checkpoint_anchor: ResumeAnchor,
+    pending_nodes: tuple[str, ...],
+    execution_id: str,
+    new_request: bool,
+    proposal: WriteProposal | None,
+    original_approval: TrustedActionApproval | None,
+    confirmation: ConfirmationReply | None,
+) -> bool:
+    """Reconhece somente o salto PREPARED que deve terminar como incerto."""
+
+    intents = _current_request_intents(state)
+    return (
+        not new_request
+        and state.final_result is None
+        and checkpoint_anchor is ResumeAnchor.PREPARE_INTENT
+        and pending_nodes == ("execute_action",)
+        and proposal is None
+        and original_approval is None
+        and confirmation is None
+        and state.pending_proposal is not None
+        and len(intents) == 1
+        and intents[0].status is IntentStatus.PREPARED
+        and intents[0].scope.action != "reprocess_analysis"
+        and intents[0].prepared_execution_id is not None
+        and intents[0].prepared_execution_id != execution_id
+    )
 
 
 def _validate_current_read_access(
@@ -525,7 +567,7 @@ async def invoke_agent(
         original_approval=original_approval,
         planner_enabled=planner_enabled,
     )
-    _validate_runtime_request_scope(request, runtime)
+    _validate_runtime_identity_scope(request, runtime)
     trusted_write_context = _trusted_write_context(request, runtime)
     resolved_step_limit = step_limit
     if resolved_step_limit is None:
@@ -574,6 +616,18 @@ async def invoke_agent(
                     if snapshot.next
                     else None
                 )
+            conservative_resume = _is_conservative_non_idempotent_resume(
+                persisted,
+                checkpoint_anchor=checkpoint_anchor,
+                pending_nodes=snapshot.next,
+                execution_id=execution_id,
+                new_request=new_request,
+                proposal=proposal,
+                original_approval=original_approval,
+                confirmation=confirmation,
+            )
+            if not conservative_resume:
+                _validate_runtime_request_scope(request, runtime)
             _validate_current_read_access(
                 persisted,
                 runtime,
@@ -610,20 +664,26 @@ async def invoke_agent(
                 )
             )
             if write_flow:
-                _validate_write_boundary(
-                    request=request,
-                    runtime=runtime,
-                    proposal=(
-                        proposal
-                        if proposal is not None
-                        else persisted.pending_proposal
-                    ),
-                    confirmation=confirmation,
-                    original_approval=persisted_original_approval,
-                    planner_enabled=planner_enabled,
-                )
+                if not isinstance(runtime, WriteToolRuntime):
+                    raise AgentInvocationProtocolError(
+                        "WRITE_RUNTIME_REQUIRED",
+                        "o fluxo de escrita exige contexto confiável de escrita",
+                    )
+                if not conservative_resume:
+                    _validate_write_boundary(
+                        request=request,
+                        runtime=runtime,
+                        proposal=(
+                            proposal
+                            if proposal is not None
+                            else persisted.pending_proposal
+                        ),
+                        confirmation=confirmation,
+                        original_approval=persisted_original_approval,
+                        planner_enabled=planner_enabled,
+                    )
                 _validate_legacy_intents_for_write(persisted)
-                if not new_request:
+                if not new_request and not conservative_resume:
                     _validate_persisted_trusted_write_context(
                         persisted,
                         runtime,
@@ -740,6 +800,7 @@ async def invoke_agent(
                     )
                     invocation_input = None
         else:
+            _validate_runtime_request_scope(request, runtime)
             if confirmation is not None:
                 raise AgentInvocationProtocolError(
                     "STALE_CONFIRMATION",

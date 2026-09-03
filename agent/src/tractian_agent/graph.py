@@ -76,6 +76,7 @@ from tractian_agent.write_contracts import (
     UpdateAssetCriticalityIntentScope,
     WriteIntent,
     WriteIntentScope,
+    approval_matches_write_intent,
     intent_scope_target_id,
 )
 from tractian_agent.write_operations import (
@@ -1024,6 +1025,11 @@ def _write_policy(
         payload_hash=_canonical_payload_hash(proposal, trusted_context),
         decision=policy,
         status=status,
+        approval_source=(
+            advanced.approval.source
+            if status is IntentStatus.PROPOSED and advanced.approval is not None
+            else None
+        ),
     )
     updated = _replace_state(advanced, intents=(*advanced.intents, intent))
     if status is IntentStatus.DENIED:
@@ -1140,6 +1146,9 @@ def _confirmation_gate(
         intent,
         decision=policy,
         status=IntentStatus.PROPOSED,
+        approval_source=(
+            advanced.approval.source if advanced.approval is not None else None
+        ),
     )
     return _checkpoint_update(
         _replace_state(
@@ -1465,6 +1474,12 @@ async def _execute_action(
     intent = _current_intent(advanced)
     if intent.status is not IntentStatus.PREPARED:
         raise ValueError("somente intenção preparada pode executar a ação")
+    is_reprocess = isinstance(intent.scope, ReprocessIntentScope)
+    if (
+        not is_reprocess
+        and intent.prepared_execution_id != advanced.execution_id
+    ):
+        return _non_idempotent_resume_unknown(advanced, intent)
     if not _runtime_matches_state(advanced, context):
         return _failed_before_dispatch(
             advanced,
@@ -1477,12 +1492,6 @@ async def _execute_action(
     trusted_context = advanced.trusted_write_context
     if trusted_context is None:
         raise ValueError("contexto confiável persistido é obrigatório")
-    is_reprocess = isinstance(intent.scope, ReprocessIntentScope)
-    if (
-        not is_reprocess
-        and intent.prepared_execution_id != advanced.execution_id
-    ):
-        return _non_idempotent_resume_unknown(advanced, intent)
 
     expected_scope = _scope_from_proposal(
         advanced,
@@ -1547,6 +1556,14 @@ async def _execute_action(
                     message="A chave idempotente preparada expirou sem novo envio.",
                 )
             )
+
+    if not approval_matches_write_intent(
+        proposal,
+        intent,
+        approval=advanced.approval,
+        trusted_context=trusted_context,
+    ):
+        return _authorization_changed_before_dispatch(advanced, intent)
 
     current_policy = evaluate_write_policy(
         proposal,
