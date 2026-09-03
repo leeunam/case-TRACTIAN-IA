@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
 from typing import Any, Literal, Protocol
+
+from pydantic import BaseModel, ConfigDict
 
 from langgraph.graph import START
 from langgraph.types import Command
@@ -28,6 +31,16 @@ from tractian_agent.human_review import (
     canonical_digest,
     render_review_expired_result,
     review_resolution_subject_digest,
+)
+from tractian_agent.observability import (
+    AgentTelemetry,
+    ErrorCode,
+    ExecutionCorrelations,
+    NullTelemetry,
+    Outcome,
+    ResponseSpanAttributes,
+    SpanName,
+    TraceId,
 )
 from tractian_agent.state import (
     AgentDecision,
@@ -63,6 +76,15 @@ class AgentInvocationProtocolError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class AgentInvocationResult(BaseModel):
+    """Envelope não persistível que expõe somente estado e correlação técnica."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    state: AgentState
+    trace_id: TraceId
 
 
 class GraphStateSnapshot(Protocol):
@@ -146,8 +168,10 @@ def _utc_now() -> datetime:
 
 
 def _require_opaque_id(value: str, *, name: str) -> str:
-    if not isinstance(value, str) or not value or any(
-        character.isspace() for character in value
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(character.isspace() for character in value)
     ):
         raise ValueError(f"{name} é obrigatório e não aceita espaços")
     return value
@@ -176,9 +200,10 @@ def _pending_node(next_nodes: tuple[str, ...]) -> str:
 def _required_resume_anchor(
     persisted_values: Mapping[str, object],
 ) -> ResumeAnchor:
-    if "resume_anchor" not in persisted_values or persisted_values.get(
-        "resume_anchor"
-    ) is None:
+    if (
+        "resume_anchor" not in persisted_values
+        or persisted_values.get("resume_anchor") is None
+    ):
         raise AgentInvocationProtocolError(
             "MISSING_RESUME_ANCHOR",
             "checkpoint não registra o último nó concluído",
@@ -363,11 +388,7 @@ def _validate_write_boundary(
             "WRITE_RUNTIME_REQUIRED",
             "o fluxo de escrita exige contexto confiável de escrita",
         )
-    if (
-        original_approval is not None
-        and proposal is None
-        and not planner_enabled
-    ):
+    if original_approval is not None and proposal is None and not planner_enabled:
         raise AgentInvocationProtocolError(
             "ORIGINAL_APPROVAL_WITHOUT_PROPOSAL",
             "aprovação original exige proposta na mesma entrada",
@@ -390,10 +411,7 @@ def _validate_write_boundary(
             "WRITE_IDENTITY_SCOPE_MISMATCH",
             "a identidade confiável diverge da solicitação",
         )
-    if (
-        request.asset_id is not None
-        and runtime.central_asset_id != request.asset_id
-    ):
+    if request.asset_id is not None and runtime.central_asset_id != request.asset_id:
         raise AgentInvocationProtocolError(
             "WRITE_ASSET_SCOPE_MISMATCH",
             "o ativo central do runtime diverge da solicitação",
@@ -405,10 +423,7 @@ def _validate_runtime_request_scope(
     runtime: ReadToolRuntime,
 ) -> None:
     _validate_runtime_identity_scope(request, runtime)
-    if (
-        request.asset_id is not None
-        and runtime.central_asset_id != request.asset_id
-    ):
+    if request.asset_id is not None and runtime.central_asset_id != request.asset_id:
         raise AgentInvocationProtocolError(
             "RUNTIME_ASSET_SCOPE_MISMATCH",
             "o ativo central do runtime diverge da solicitação",
@@ -489,9 +504,10 @@ def _validate_persisted_thread_boundary(
             "TRUSTED_WRITE_CONTEXT_DRIFT",
             "o runtime atual diverge do alvo ou modelo persistido",
         )
-    if request_id == state.request_id and type(state.request).model_validate(
-        request
-    ) != state.request:
+    if (
+        request_id == state.request_id
+        and type(state.request).model_validate(request) != state.request
+    ):
         raise AgentInvocationProtocolError(
             "REQUEST_ID_PAYLOAD_MISMATCH",
             "a mesma request_id exige solicitação idêntica",
@@ -691,9 +707,7 @@ def _review_command(
         received_at=received_at,
     )
     return Command(
-        resume={
-            snapshot.interrupts[0].id: envelope.model_dump(mode="json")
-        },
+        resume={snapshot.interrupts[0].id: envelope.model_dump(mode="json")},
         update=state.model_dump(mode="json"),
     )
 
@@ -755,7 +769,7 @@ def _expire_review_for_new_request(
     return AgentState.model_validate(data)
 
 
-async def invoke_agent(
+async def _invoke_agent_unobserved(
     graph: AgentGraph,
     *,
     request: SupportRequest,
@@ -874,9 +888,7 @@ async def invoke_agent(
                 and persisted.review_audit is None
                 and persisted.review_expiry is None
             )
-            expiry_boundary_time = (
-                _utc_now() if pending_review_new_request else None
-            )
+            expiry_boundary_time = _utc_now() if pending_review_new_request else None
             close_expired_review = bool(
                 expiry_boundary_time is not None
                 and persisted.review_request is not None
@@ -928,8 +940,7 @@ async def invoke_agent(
                 if (
                     not new_request
                     and persisted.approval is not None
-                    and persisted.approval.source
-                    is ApprovalSource.ORIGINAL_REQUEST
+                    and persisted.approval.source is ApprovalSource.ORIGINAL_REQUEST
                 )
                 else None
             )
@@ -938,10 +949,7 @@ async def invoke_agent(
                 or confirmation is not None
                 or original_approval is not None
                 or persisted_original_approval is not None
-                or (
-                    not new_request
-                    and persisted.pending_proposal is not None
-                )
+                or (not new_request and persisted.pending_proposal is not None)
             )
             if write_flow:
                 if not isinstance(runtime, WriteToolRuntime):
@@ -1031,8 +1039,7 @@ async def invoke_agent(
                 return persisted
             if new_request:
                 if persisted.review_request is not None and (
-                    persisted.review_audit is None
-                    and persisted.review_expiry is None
+                    persisted.review_audit is None and persisted.review_expiry is None
                 ):
                     raise AgentInvocationProtocolError(
                         "PENDING_REVIEW_BLOCKS_NEW_REQUEST",
@@ -1147,14 +1154,10 @@ async def invoke_agent(
                 raise AgentInvocationProtocolError(
                     "STALE_REVIEW", "não existe revisão persistida para responder"
                 )
-            if (
-                proposal is not None
-                and resolved_step_limit
-                < (
-                    PLANNER_WRITE_GRAPH_STEP_COUNT
-                    if planner_enabled
-                    else REPROCESS_GRAPH_STEP_COUNT
-                )
+            if proposal is not None and resolved_step_limit < (
+                PLANNER_WRITE_GRAPH_STEP_COUNT
+                if planner_enabled
+                else REPROCESS_GRAPH_STEP_COUNT
             ):
                 raise AgentInvocationProtocolError(
                     "STEP_LIMIT_EXHAUSTED",
@@ -1205,3 +1208,167 @@ async def invoke_agent(
             include_current_flow=True,
         )
     return final_state
+
+
+def _safe_execution_trace(
+    graph: AgentGraph,
+    *,
+    request: SupportRequest,
+    runtime: ReadToolRuntime,
+    thread_id: str,
+    request_id: str,
+    execution_id: str,
+    review_resumed: bool,
+):
+    telemetry = getattr(graph, "telemetry", None)
+    if not isinstance(telemetry, AgentTelemetry):
+        telemetry = NullTelemetry()
+    try:
+        correlations = ExecutionCorrelations(
+            request_id=request_id,
+            thread_id=thread_id,
+            execution_id=execution_id,
+            case_id=request.case_id,
+            company_id=runtime.identity.company_id,
+            user_id=runtime.identity.user_id,
+            planner_enabled=bool(getattr(graph, "planner_enabled", False)),
+            review_resumed=review_resumed,
+        )
+        return telemetry.start_execution(correlations)
+    except Exception:
+        # Telemetria nunca amplia a validação da fronteira de negócio.
+        return NullTelemetry().start_execution(
+            ExecutionCorrelations(
+                request_id="unavailable",
+                thread_id="unavailable",
+                execution_id="unavailable",
+                case_id="unavailable",
+                company_id="unavailable",
+                user_id="unavailable",
+                planner_enabled=bool(getattr(graph, "planner_enabled", False)),
+                review_resumed=review_resumed,
+            )
+        )
+
+
+async def invoke_agent_observed(
+    graph: AgentGraph,
+    *,
+    request: SupportRequest,
+    runtime: ReadToolRuntime,
+    thread_id: str,
+    request_id: str,
+    execution_id: str,
+    step_limit: int | None = None,
+    proposal: WriteProposal | None = None,
+    original_approval: TrustedActionApproval | None = None,
+    confirmation: ConfirmationReply | None = None,
+    review_reply: ReviewReply | None = None,
+    reviewer: ReviewerIdentity | None = None,
+) -> AgentInvocationResult:
+    """Executa uma invocação técnica e devolve correlação fora do checkpoint."""
+
+    trace = _safe_execution_trace(
+        graph,
+        request=request,
+        runtime=runtime,
+        thread_id=thread_id,
+        request_id=request_id,
+        execution_id=execution_id,
+        review_resumed=review_reply is not None,
+    )
+    planner_enabled = bool(getattr(graph, "planner_enabled", False))
+    with trace.activate():
+        with trace.span(SpanName.REQUEST, trace.request_attributes) as request_span:
+            try:
+                state = await _invoke_agent_unobserved(
+                    graph,
+                    request=request,
+                    runtime=runtime,
+                    thread_id=thread_id,
+                    request_id=request_id,
+                    execution_id=execution_id,
+                    step_limit=step_limit,
+                    proposal=proposal,
+                    original_approval=original_approval,
+                    confirmation=confirmation,
+                    review_reply=review_reply,
+                    reviewer=reviewer,
+                )
+                replayed = state.execution_id != execution_id
+                outcome = (
+                    Outcome.REPLAYED
+                    if replayed
+                    else Outcome.SUSPENDED
+                    if state.final_result is None
+                    else Outcome.OK
+                )
+                with trace.span(
+                    SpanName.RESPONSE,
+                    ResponseSpanAttributes(
+                        planner_enabled=planner_enabled,
+                        replayed=replayed,
+                    ),
+                ) as response_span:
+                    response_span.finish(outcome)
+                request_span.finish(outcome)
+                return AgentInvocationResult(state=state, trace_id=trace.trace_id)
+            except BaseException as error:
+                cancelled = isinstance(error, asyncio.CancelledError)
+                error_code = (
+                    ErrorCode.CANCELLED
+                    if cancelled
+                    else ErrorCode.PROTOCOL
+                    if isinstance(error, AgentInvocationProtocolError)
+                    else ErrorCode.RUNTIME
+                )
+                with trace.span(
+                    SpanName.RESPONSE,
+                    ResponseSpanAttributes(
+                        planner_enabled=planner_enabled,
+                        replayed=False,
+                    ),
+                ) as response_span:
+                    response_span.finish(
+                        Outcome.CANCELLED if cancelled else Outcome.ERROR,
+                        error_code,
+                    )
+                request_span.finish(
+                    Outcome.CANCELLED if cancelled else Outcome.ERROR,
+                    error_code,
+                )
+                raise
+
+
+async def invoke_agent(
+    graph: AgentGraph,
+    *,
+    request: SupportRequest,
+    runtime: ReadToolRuntime,
+    thread_id: str,
+    request_id: str,
+    execution_id: str,
+    step_limit: int | None = None,
+    proposal: WriteProposal | None = None,
+    original_approval: TrustedActionApproval | None = None,
+    confirmation: ConfirmationReply | None = None,
+    review_reply: ReviewReply | None = None,
+    reviewer: ReviewerIdentity | None = None,
+) -> AgentState:
+    """API compatível: mantém o retorno histórico e ativa telemetria injetada."""
+
+    result = await invoke_agent_observed(
+        graph,
+        request=request,
+        runtime=runtime,
+        thread_id=thread_id,
+        request_id=request_id,
+        execution_id=execution_id,
+        step_limit=step_limit,
+        proposal=proposal,
+        original_approval=original_approval,
+        confirmation=confirmation,
+        review_reply=review_reply,
+        reviewer=reviewer,
+    )
+    return result.state

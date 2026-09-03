@@ -1208,6 +1208,14 @@ de checkpoint/fluxos; atualizar a Fase 9 somente após o aceite.
 **Objetivo:** reconstruir uma execução por `trace_id` usando spans e métricas de
 baixa cardinalidade, sem exportar conteúdo de atendimento ou segredo.
 
+**Estado implementado, pendente do aceite integrado da Task 19:** fachada nula,
+recorder seguro e adapter Logfire manual; opt-in triplo validado antes do import;
+correlações HMAC por domínio; envelope público sem persistência do `trace_id`;
+spans de request, nós, planner, writer, tool, política, tentativas de ação, gate,
+revisão e resposta; métricas sem IDs. O runtime não emite avaliação. Retenção
+inicial de 30 dias e limites de volume/cardinalidade pertencem à operação externa
+da conta Logfire, não ao ledger nem ao código do atendimento.
+
 **Decisões:** adicionar o SDK Logfire ao agente e criar uma fachada injetável
 com implementação nula por padrão. A exportação exige simultaneamente
 `TRACTIAN_LOGFIRE_ENABLED=true`, `LOGFIRE_TOKEN` explícito e

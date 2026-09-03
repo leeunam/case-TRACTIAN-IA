@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from contextlib import AbstractAsyncContextManager
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager, nullcontext
 from datetime import datetime, timedelta, timezone
+from functools import wraps
+import inspect
 import json
 from typing import Any, Literal
 from uuid import uuid4
@@ -41,6 +44,28 @@ from tractian_agent.human_review import (
     review_resolution_subject_digest,
     render_review_expired_result,
     render_review_rejected_result,
+)
+from tractian_agent.observability import (
+    ActionName,
+    ActionSpanAttributes,
+    AgentTelemetry,
+    ErrorCode,
+    GateSpanAttributes,
+    GraphNodeName,
+    NodeSpanAttributes,
+    NullTelemetry,
+    Outcome,
+    PlannerOperation,
+    PlannerSpanAttributes,
+    PolicyOperation,
+    PolicySpanAttributes,
+    ReviewOperation as TelemetryReviewOperation,
+    ReviewSpanAttributes,
+    SpanName,
+    ToolName,
+    ToolSpanAttributes,
+    WriterSpanAttributes,
+    current_execution_trace,
 )
 from tractian_agent.planner import (
     Planner,
@@ -160,14 +185,20 @@ class CompiledAgentGraph:
         graph: CompiledStateGraph,
         *,
         planner_enabled: bool = False,
+        telemetry: AgentTelemetry | None = None,
     ) -> None:
         self._graph = graph
         self._checkpoint_owner = get_checkpoint_owner(graph.checkpointer)
         self._planner_enabled = planner_enabled
+        self._telemetry = telemetry if telemetry is not None else NullTelemetry()
 
     @property
     def planner_enabled(self) -> bool:
         return self._planner_enabled
+
+    @property
+    def telemetry(self) -> AgentTelemetry:
+        return self._telemetry
 
     def thread_lock(self, thread_id: str) -> AbstractAsyncContextManager[None]:
         return self._checkpoint_owner.thread_lock(thread_id)
@@ -202,6 +233,135 @@ def _replace_state(state: AgentState, **changes: object) -> AgentState:
     }
     data.update(changes)
     return AgentState.model_validate(data)
+
+
+def _observed_node(name: GraphNodeName, node: Any) -> Any:
+    """Envolve nós sync/async sem alterar sua assinatura observada pelo grafo."""
+
+    if inspect.iscoroutinefunction(node):
+
+        @wraps(node)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            trace = current_execution_trace()
+            if trace is None:
+                return await node(*args, **kwargs)
+            with trace.span(SpanName.NODE, NodeSpanAttributes(node=name)) as node_span:
+                with _stage_scope(trace, name, args) as stage_span:
+                    result = await node(*args, **kwargs)
+                    _finish_failed_stage(name, result, node_span, stage_span)
+                    return result
+
+        return async_wrapper
+
+    @wraps(node)
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        trace = current_execution_trace()
+        if trace is None:
+            return node(*args, **kwargs)
+        with trace.span(SpanName.NODE, NodeSpanAttributes(node=name)) as node_span:
+            with _stage_scope(trace, name, args) as stage_span:
+                result = node(*args, **kwargs)
+                _finish_failed_stage(name, result, node_span, stage_span)
+                return result
+
+    return sync_wrapper
+
+
+def _finish_failed_stage(
+    name: GraphNodeName,
+    result: object,
+    node_span: Any,
+    stage_span: Any,
+) -> None:
+    """Classifica falhas já convertidas no estado sem ler conteúdo livre."""
+
+    if not isinstance(result, Mapping):
+        return
+    error_code = None
+    if name in {GraphNodeName.PLANNER_SELECT, GraphNodeName.PLANNER_FINALIZE}:
+        if result.get("planner_failure") is not None:
+            error_code = ErrorCode.MODEL
+    elif name is GraphNodeName.WRITER and result.get("writer_failure") is not None:
+        error_code = ErrorCode.MODEL
+    elif (
+        name is GraphNodeName.PLANNER_TOOL and result.get("planner_failure") is not None
+    ):
+        error_code = ErrorCode.TOOL
+    if error_code is None:
+        return
+    node_span.finish(Outcome.ERROR, error_code)
+    if stage_span is not None:
+        stage_span.finish(Outcome.ERROR, error_code)
+
+
+def _stage_scope(trace: Any, name: GraphNodeName, args: tuple[Any, ...]) -> Any:
+    state = args[0] if args and isinstance(args[0], AgentState) else None
+    if name is GraphNodeName.PLANNER_SELECT:
+        return trace.span(
+            SpanName.PLANNER,
+            PlannerSpanAttributes(operation=PlannerOperation.SELECT),
+        )
+    if name is GraphNodeName.PLANNER_FINALIZE:
+        return trace.span(
+            SpanName.PLANNER,
+            PlannerSpanAttributes(operation=PlannerOperation.FINALIZE),
+        )
+    if name is GraphNodeName.WRITER:
+        attempt = 1 if state is None else min(state.writer_attempts + 1, 2)
+        return trace.span(
+            SpanName.WRITER,
+            WriterSpanAttributes(attempt=attempt),
+        )
+    if name in {GraphNodeName.WRITE_POLICY, GraphNodeName.CONFIRMATION_GATE}:
+        operation = (
+            PolicyOperation.EVALUATE
+            if name is GraphNodeName.WRITE_POLICY
+            else PolicyOperation.CONFIRM
+        )
+        return trace.span(
+            SpanName.POLICY,
+            PolicySpanAttributes(operation=operation),
+        )
+    if name is GraphNodeName.RELEASE_GATE:
+        return trace.span(SpanName.GATE, GateSpanAttributes())
+    if name is GraphNodeName.AWAIT_HUMAN_REVIEW:
+        operation = (
+            TelemetryReviewOperation.RESUME
+            if trace.review_resumed
+            else TelemetryReviewOperation.WAIT
+        )
+        return trace.span(
+            SpanName.REVIEW,
+            ReviewSpanAttributes(operation=operation),
+        )
+    return nullcontext()
+
+
+async def _observed_action_dispatch(
+    action: ActionName,
+    attempt: int,
+    operation: Callable[[], Awaitable[ActionReceipt | ApiError]],
+) -> ActionReceipt | ApiError:
+    trace = current_execution_trace()
+    if trace is None:
+        return await operation()
+    with trace.span(
+        SpanName.ACTION,
+        ActionSpanAttributes(action=action, attempt=attempt),
+    ) as action_span:
+        try:
+            result = await operation()
+        except BaseException as error:
+            if isinstance(error, asyncio.CancelledError):
+                action_span.finish(Outcome.CANCELLED, ErrorCode.CANCELLED)
+            else:
+                action_span.finish(Outcome.ERROR, ErrorCode.ACTION)
+            raise
+        if isinstance(result, ApiError):
+            action_span.finish(Outcome.ERROR, ErrorCode.ACTION)
+        elif not result.accepted:
+            action_span.finish(Outcome.DENIED, ErrorCode.ACTION)
+        return result
 
 
 def _checkpoint_update(state: AgentState) -> dict[str, object]:
@@ -325,9 +485,7 @@ def _updated_intent(intent: WriteIntent, **changes: object) -> WriteIntent:
 
 
 def _replace_intent(state: AgentState, replacement: WriteIntent) -> AgentState:
-    found = any(
-        intent.intent_id == replacement.intent_id for intent in state.intents
-    )
+    found = any(intent.intent_id == replacement.intent_id for intent in state.intents)
     replacements = tuple(
         replacement if intent.intent_id == replacement.intent_id else intent
         for intent in state.intents
@@ -403,11 +561,7 @@ def _planner_failure_update(
 
 
 def _successful_action_decision(action: str) -> AgentDecision:
-    return (
-        AgentDecision.ESCALATE
-        if action == "escalate_case"
-        else AgentDecision.ACT
-    )
+    return AgentDecision.ESCALATE if action == "escalate_case" else AgentDecision.ACT
 
 
 def _ingest(
@@ -537,9 +691,7 @@ def _planner_select_node(planner: Planner):
         remaining_steps = updated.step_limit - updated.step_count
         if isinstance(turn, PlannerToolTurn):
             is_proposal = turn.tool_call.name in _PROPOSAL_ACTION_BY_TOOL
-            required_steps = 1 + (
-                _PLANNER_FIXED_WRITE_STEPS if is_proposal else 0
-            )
+            required_steps = 1 + (_PLANNER_FIXED_WRITE_STEPS if is_proposal else 0)
             if remaining_steps < required_steps:
                 return _planner_failure_update(
                     updated,
@@ -571,9 +723,7 @@ def _planner_select_node(planner: Planner):
         terminal = PlannerTerminalRecord.model_validate(
             turn.decision.model_dump(mode="json")
         )
-        return _checkpoint_update(
-            _replace_state(updated, planner_terminal=terminal)
-        )
+        return _checkpoint_update(_replace_state(updated, planner_terminal=terminal))
 
     return planner_select
 
@@ -612,9 +762,7 @@ def _pending_planner_tool(
         raise ValueError("estado não possui uma única tool pendente")
     pending = calls[-1]
     prior = _replace_state(state, tool_calls=state.tool_calls[:-1])
-    offered_by_name = {
-        tool.name: tool for tool in select_planner_tools(prior, runtime)
-    }
+    offered_by_name = {tool.name: tool for tool in select_planner_tools(prior, runtime)}
     selected_tool = offered_by_name.get(pending.name)
     if selected_tool is None:
         raise ValueError("tool pendente não pertence ao catálogo autorizado")
@@ -667,27 +815,41 @@ async def _planner_tool(
         )
     try:
         call, selected_tool = _pending_planner_tool(advanced, context)
-        raw_output = await ToolNode(
-            (selected_tool,),
-            handle_tool_errors=False,
-        ).ainvoke(
-            {
-                "messages": [
-                    AIMessage(
-                        content="",
-                        tool_calls=[
-                            {
-                                "name": call.name,
-                                "args": call.arguments.to_python(),
-                                "id": call.call_id,
-                                "type": "tool_call",
-                            }
-                        ],
+        tool_node = ToolNode((selected_tool,), handle_tool_errors=False)
+        tool_input = {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": call.name,
+                            "args": call.arguments.to_python(),
+                            "id": call.call_id,
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        }
+        trace = current_execution_trace()
+        if trace is None:
+            raw_output = await tool_node.ainvoke(tool_input, runtime=runtime)
+        else:
+            with trace.span(
+                SpanName.TOOL,
+                ToolSpanAttributes(tool=ToolName(call.name)),
+            ) as tool_span:
+                try:
+                    raw_output = await tool_node.ainvoke(
+                        tool_input,
+                        runtime=runtime,
                     )
-                ]
-            },
-            runtime=runtime,
-        )
+                except BaseException as error:
+                    if isinstance(error, asyncio.CancelledError):
+                        tool_span.finish(Outcome.CANCELLED, ErrorCode.CANCELLED)
+                    else:
+                        tool_span.finish(Outcome.ERROR, ErrorCode.TOOL)
+                    raise
         if not isinstance(raw_output, Mapping):
             raise ValueError("ToolNode devolveu envelope inválido")
         messages = raw_output.get("messages")
@@ -713,13 +875,10 @@ async def _planner_tool(
                     "runtime de escrita é obrigatório para aceitar proposta"
                 )
             persisted_context = advanced.trusted_write_context
-            if (
-                persisted_context is not None
-                and not _runtime_matches_state(advanced, context)
+            if persisted_context is not None and not _runtime_matches_state(
+                advanced, context
             ):
-                raise ValueError(
-                    "runtime diverge do contexto confiável da proposta"
-                )
+                raise ValueError("runtime diverge do contexto confiável da proposta")
             accepted_context = (
                 persisted_context
                 if persisted_context is not None
@@ -897,8 +1056,7 @@ def _writer_node(writer: Writer):
                     code=failure_code,
                     attempts=attempt,
                     repairable=(
-                        failure_code
-                        is WriterFailureCode.INVALID_STRUCTURED_OUTPUT
+                        failure_code is WriterFailureCode.INVALID_STRUCTURED_OUTPUT
                     ),
                 ),
                 release_gate=None,
@@ -1005,9 +1163,7 @@ def _release_gate(state: AgentState) -> dict[str, object]:
         review = None
         review_request = advanced.review_request
     else:
-        requires_review = (
-            attestation.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
-        )
+        requires_review = attestation.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
         if requires_review and advanced.review_audit is None:
             final_result = None
             review_request = build_review_request(
@@ -1036,9 +1192,7 @@ def _release_gate(state: AgentState) -> dict[str, object]:
             advanced,
             resume_anchor=ResumeAnchor.RELEASE_GATE,
             decision=(
-                final_result.decision
-                if final_result is not None
-                else advanced.decision
+                final_result.decision if final_result is not None else advanced.decision
             ),
             final_result=final_result,
             review=review,
@@ -1055,7 +1209,11 @@ def _after_release_gate(state: AgentState) -> Literal["end", "review"]:
 
 def _await_human_review(state: AgentState) -> dict[str, object]:
     request = state.review_request
-    if request is None or state.review_audit is not None or state.review_expiry is not None:
+    if (
+        request is None
+        or state.review_audit is not None
+        or state.review_expiry is not None
+    ):
         raise ValueError("estado não possui uma única revisão pendente")
     envelope = ReviewResumeEnvelope.model_validate_json(
         json.dumps(
@@ -1451,11 +1609,7 @@ def _authorization_changed_before_dispatch(
     same_execution = intent.prepared_execution_id == state.execution_id
     terminal = _updated_intent(
         intent,
-        status=(
-            IntentStatus.FAILED
-            if same_execution
-            else IntentStatus.UNCERTAIN
-        ),
+        status=(IntentStatus.FAILED if same_execution else IntentStatus.UNCERTAIN),
         attempts=0,
         error=_local_intent_error(
             (
@@ -1498,10 +1652,7 @@ def _non_idempotent_resume_unknown(
 def _is_conservative_non_idempotent_terminal(state: AgentState) -> bool:
     """Mantém a rota dependente do mesmo contrato validado por ``AgentState``."""
 
-    return (
-        canonical_non_idempotent_resume_terminal().matches_state(state)
-        is True
-    )
+    return canonical_non_idempotent_resume_terminal().matches_state(state) is True
 
 
 def _status_for_first_error(error: ApiError) -> IntentStatus:
@@ -1525,9 +1676,7 @@ def _terminal_from_operation(
     first_was_ambiguous: bool,
 ) -> AgentState:
     if isinstance(result, ActionReceipt):
-        status = (
-            IntentStatus.COMPLETED if result.accepted else IntentStatus.FAILED
-        )
+        status = IntentStatus.COMPLETED if result.accepted else IntentStatus.FAILED
         terminal_intent = _updated_intent(
             intent,
             status=status,
@@ -1546,12 +1695,8 @@ def _terminal_from_operation(
             attempts=attempts,
             error=result,
         )
-    requires_review = (
-        status is IntentStatus.UNCERTAIN
-        or (
-            isinstance(result, ApiError)
-            and result.code == "IDEMPOTENCY_PAYLOAD_CONFLICT"
-        )
+    requires_review = status is IntentStatus.UNCERTAIN or (
+        isinstance(result, ApiError) and result.code == "IDEMPOTENCY_PAYLOAD_CONFLICT"
     )
     decision = (
         AgentDecision.ACT
@@ -1577,9 +1722,7 @@ def _terminal_from_non_idempotent_operation(
     result: ActionReceipt | ApiError,
 ) -> AgentState:
     if isinstance(result, ActionReceipt):
-        status = (
-            IntentStatus.COMPLETED if result.accepted else IntentStatus.FAILED
-        )
+        status = IntentStatus.COMPLETED if result.accepted else IntentStatus.FAILED
         terminal_intent = _updated_intent(
             intent,
             status=status,
@@ -1611,8 +1754,7 @@ def _terminal_from_non_idempotent_operation(
             IntentStatus.COMPLETED: "A ação foi concluída pela plataforma.",
             IntentStatus.FAILED: "A ação não foi concluída.",
             IntentStatus.UNCERTAIN: (
-                "O resultado remoto da ação é incerto e não haverá reenvio "
-                "automático."
+                "O resultado remoto da ação é incerto e não haverá reenvio automático."
             ),
         }[status],
     )
@@ -1649,10 +1791,7 @@ async def _execute_action(
     if intent.status is not IntentStatus.PREPARED:
         raise ValueError("somente intenção preparada pode executar a ação")
     is_reprocess = isinstance(intent.scope, ReprocessIntentScope)
-    if (
-        not is_reprocess
-        and intent.prepared_execution_id != advanced.execution_id
-    ):
+    if not is_reprocess and intent.prepared_execution_id != advanced.execution_id:
         return _non_idempotent_resume_unknown(advanced, intent)
     if not _runtime_matches_state(advanced, context):
         return _failed_before_dispatch(
@@ -1708,9 +1847,7 @@ async def _execute_action(
             expired = _updated_intent(
                 intent,
                 status=(
-                    IntentStatus.FAILED
-                    if same_execution
-                    else IntentStatus.UNCERTAIN
+                    IntentStatus.FAILED if same_execution else IntentStatus.UNCERTAIN
                 ),
                 attempts=0,
                 error=_expiration_error(
@@ -1749,21 +1886,28 @@ async def _execute_action(
         return _authorization_changed_before_dispatch(advanced, intent)
 
     if not is_reprocess:
-        result = await _dispatch_non_idempotent_action(proposal, context)
+        result = await _observed_action_dispatch(
+            ActionName(proposal.action),
+            1,
+            lambda: _dispatch_non_idempotent_action(proposal, context),
+        )
         return _checkpoint_update(
             _terminal_from_non_idempotent_operation(advanced, intent, result)
         )
 
     if not isinstance(proposal, ReprocessProposal) or intent.idempotency_key is None:
         raise TypeError("intenção de reprocesso diverge da proposta persistida")
-    first = await execute_reprocess_analysis(
-        proposal,
-        context,
-        idempotency_key=intent.idempotency_key,
+    first = await _observed_action_dispatch(
+        ActionName.REPROCESS_ANALYSIS,
+        1,
+        lambda: execute_reprocess_analysis(
+            proposal,
+            context,
+            idempotency_key=intent.idempotency_key,
+        ),
     )
-    first_was_ambiguous = (
-        isinstance(first, ApiError)
-        and _is_ambiguous_operation_error(first)
+    first_was_ambiguous = isinstance(first, ApiError) and _is_ambiguous_operation_error(
+        first
     )
     if not first_was_ambiguous:
         terminal = _terminal_from_operation(
@@ -1775,10 +1919,14 @@ async def _execute_action(
         )
         return _checkpoint_update(terminal)
 
-    second = await execute_reprocess_analysis(
-        proposal,
-        context,
-        idempotency_key=intent.idempotency_key,
+    second = await _observed_action_dispatch(
+        ActionName.REPROCESS_ANALYSIS,
+        2,
+        lambda: execute_reprocess_analysis(
+            proposal,
+            context,
+            idempotency_key=intent.idempotency_key,
+        ),
     )
     terminal = _terminal_from_operation(
         advanced,
@@ -1795,19 +1943,13 @@ async def _planner_execute_action(
     runtime: Runtime[ReadToolRuntime],
 ) -> dict[str, object]:
     update = await _execute_action(state, runtime)
-    if _is_conservative_non_idempotent_terminal(
-        AgentState.model_validate(update)
-    ):
+    if _is_conservative_non_idempotent_terminal(AgentState.model_validate(update)):
         return update
     return _planner_pending_response(update)
 
 
 def _after_planner_execute_action(state: AgentState) -> Literal["end", "writer"]:
-    return (
-        "end"
-        if _is_conservative_non_idempotent_terminal(state)
-        else "writer"
-    )
+    return "end" if _is_conservative_non_idempotent_terminal(state) else "writer"
 
 
 def build_agent_graph(
@@ -1815,29 +1957,44 @@ def build_agent_graph(
     *,
     planner: Planner | None = None,
     writer: Writer | None = None,
+    telemetry: AgentTelemetry | None = None,
 ) -> CompiledAgentGraph:
     """Compila o fallback determinístico ou o ciclo opt-in do planner."""
     if (planner is None) != (writer is None):
-        raise ValueError("planner e writer devem ser fornecidos separadamente em conjunto")
+        raise ValueError(
+            "planner e writer devem ser fornecidos separadamente em conjunto"
+        )
     builder = StateGraph(AgentState, context_schema=ReadToolRuntime)
-    builder.add_node("ingest", _ingest)
+    builder.add_node("ingest", _observed_node(GraphNodeName.INGEST, _ingest))
     builder.add_node(
         "write_policy",
-        _write_policy if planner is None else _planner_write_policy,
+        _observed_node(
+            GraphNodeName.WRITE_POLICY,
+            _write_policy if planner is None else _planner_write_policy,
+        ),
     )
     builder.add_node(
         "confirmation_gate",
-        _confirmation_gate if planner is None else _planner_confirmation_gate,
+        _observed_node(
+            GraphNodeName.CONFIRMATION_GATE,
+            _confirmation_gate if planner is None else _planner_confirmation_gate,
+        ),
     )
-    builder.add_node("prepare_intent", _prepare_intent)
+    builder.add_node(
+        "prepare_intent",
+        _observed_node(GraphNodeName.PREPARE_INTENT, _prepare_intent),
+    )
     builder.add_node(
         "execute_action",
-        _execute_action if planner is None else _planner_execute_action,
+        _observed_node(
+            GraphNodeName.EXECUTE_ACTION,
+            _execute_action if planner is None else _planner_execute_action,
+        ),
     )
     builder.add_edge(START, "ingest")
     if planner is None:
-        builder.add_node("route", _route)
-        builder.add_node("finish", _finish)
+        builder.add_node("route", _observed_node(GraphNodeName.ROUTE, _route))
+        builder.add_node("finish", _observed_node(GraphNodeName.FINISH, _finish))
         builder.add_conditional_edges(
             "ingest",
             _after_ingest,
@@ -1847,12 +2004,30 @@ def build_agent_graph(
         builder.add_edge("finish", END)
     else:
         assert writer is not None
-        builder.add_node("planner_select", _planner_select_node(planner))
-        builder.add_node("planner_tool", _planner_tool)
-        builder.add_node("planner_finalize", _planner_finalize)
-        builder.add_node("writer", _writer_node(writer))
-        builder.add_node("release_gate", _release_gate)
-        builder.add_node("await_human_review", _await_human_review)
+        builder.add_node(
+            "planner_select",
+            _observed_node(GraphNodeName.PLANNER_SELECT, _planner_select_node(planner)),
+        )
+        builder.add_node(
+            "planner_tool",
+            _observed_node(GraphNodeName.PLANNER_TOOL, _planner_tool),
+        )
+        builder.add_node(
+            "planner_finalize",
+            _observed_node(GraphNodeName.PLANNER_FINALIZE, _planner_finalize),
+        )
+        builder.add_node(
+            "writer",
+            _observed_node(GraphNodeName.WRITER, _writer_node(writer)),
+        )
+        builder.add_node(
+            "release_gate",
+            _observed_node(GraphNodeName.RELEASE_GATE, _release_gate),
+        )
+        builder.add_node(
+            "await_human_review",
+            _observed_node(GraphNodeName.AWAIT_HUMAN_REVIEW, _await_human_review),
+        )
         builder.add_conditional_edges(
             "ingest",
             _after_ingest_with_planner,
@@ -1917,4 +2092,5 @@ def build_agent_graph(
     return CompiledAgentGraph(
         builder.compile(checkpointer=checkpointer),
         planner_enabled=planner is not None,
+        telemetry=telemetry,
     )

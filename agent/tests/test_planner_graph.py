@@ -32,6 +32,7 @@ from tractian_agent.human_review import (
 )
 from tractian_agent.evidence import compile_observations
 from tractian_agent.graph import build_agent_graph
+from tractian_agent.observability import RecordingTelemetry, SpanName
 from tractian_agent.planner import (
     Planner,
     PlannerDecisionKind,
@@ -289,11 +290,17 @@ class _ForbiddenWriterModel(BaseChatModel):
         raise AssertionError("o writer não pode ser chamado nesta retomada")
 
 
-def _build_planner_graph(saver: object, model: BaseChatModel):
+def _build_planner_graph(
+    saver: object,
+    model: BaseChatModel,
+    *,
+    telemetry: RecordingTelemetry | None = None,
+):
     return build_agent_graph(
         saver,
         planner=Planner(model),
         writer=Writer(_EchoWriterModel()),
+        telemetry=telemetry,
     )
 
 
@@ -557,6 +564,7 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
     )
     writer_model = _EchoWriterModel()
     writer = Writer(writer_model)
+    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
 
     async def scenario():
         checkpoint_path = tmp_path / "planner.sqlite3"
@@ -577,6 +585,7 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
                     saver,
                     planner=Planner(model),
                     writer=writer,
+                    telemetry=telemetry,
                 )
                 state = await invoke_agent(
                     graph,
@@ -601,11 +610,11 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
                         )
                     ).values
                 )
-            return state, snapshot, reopened
+            return state, snapshot, reopened, telemetry
         finally:
             await client.aclose()
 
-    state, snapshot, reopened = asyncio.run(scenario())
+    state, snapshot, reopened, telemetry = asyncio.run(scenario())
 
     assert len(requests) == 1
     assert requests[0].url.path == "/assets/asset_G501"
@@ -653,6 +662,16 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
         "terminal_request",
     ]
     assert writer_model._events == ["with_structured_output", "writer_request"]
+    specialized = {span.name for span in telemetry.spans}
+    assert {
+        SpanName.REQUEST,
+        SpanName.PLANNER,
+        SpanName.TOOL,
+        SpanName.WRITER,
+        SpanName.GATE,
+        SpanName.RESPONSE,
+    } <= specialized
+    assert SpanName.EVALUATION not in specialized
 
 
 def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
@@ -691,6 +710,7 @@ def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
         ),
     )
     writer_model = _HumanDispositionWriterModel()
+    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
     created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
     monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
     monkeypatch.setattr(
@@ -718,6 +738,7 @@ def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
                     saver,
                     planner=Planner(planner_model),
                     writer=Writer(writer_model),
+                    telemetry=telemetry,
                 )
                 waiting = await invoke_agent(
                     graph,
@@ -757,6 +778,7 @@ def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
                     reopened_saver,
                     planner=Planner(planner_model),
                     writer=Writer(writer_model),
+                    telemetry=telemetry,
                 )
                 completed = await invoke_agent(
                     reopened_graph,
@@ -813,11 +835,20 @@ def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
                             permission="review",
                         ),
                     )
-            return waiting, snapshot, completed, replayed, divergent.value.code
+            return (
+                waiting,
+                snapshot,
+                completed,
+                replayed,
+                divergent.value.code,
+                telemetry,
+            )
         finally:
             await client.aclose()
 
-    waiting, snapshot, completed, replayed, divergent_code = asyncio.run(scenario())
+    waiting, snapshot, completed, replayed, divergent_code, telemetry = asyncio.run(
+        scenario()
+    )
 
     assert waiting.final_result is None
     assert waiting.review_request is not None
@@ -843,6 +874,40 @@ def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
     assert completed.approval == waiting.approval is None
     assert replayed == completed
     assert divergent_code == "DIVERGENT_REVIEW"
+    roots = [
+        dict(span.attributes)
+        for span in telemetry.spans
+        if span.name is SpanName.REQUEST
+    ]
+    assert len(roots) == 4
+    assert len({root["trace_id"] for root in roots}) == 4
+    assert len({root["request_ref"] for root in roots}) == 1
+    assert len({root["thread_ref"] for root in roots}) == 1
+    assert len({root["execution_ref"] for root in roots}) == 4
+    reviews = [
+        dict(span.attributes)
+        for span in telemetry.spans
+        if span.name is SpanName.REVIEW
+    ]
+    assert reviews[0]["outcome"] == "suspended"
+    assert [review["operation"] for review in reviews] == ["wait", "resume"]
+    responses = [
+        dict(span.attributes)
+        for span in telemetry.spans
+        if span.name is SpanName.RESPONSE
+    ]
+    assert [response["outcome"] for response in responses] == [
+        "suspended",
+        "ok",
+        "replayed",
+        "error",
+    ]
+    replay_trace_id = responses[2]["trace_id"]
+    assert [
+        span.name
+        for span in telemetry.spans
+        if dict(span.attributes)["trace_id"] == replay_trace_id
+    ] == [SpanName.RESPONSE, SpanName.REQUEST]
 
 
 def test_eight_step_read_path_fails_closed_before_unfinishable_review(
@@ -854,12 +919,10 @@ def test_eight_step_read_path_fails_closed_before_unfinishable_review(
     requests: list[httpx.Request] = []
 
     async def scenario():
-        state, runtime, client, planner_model, writer_model = (
-            await _start_human_review(
-                tmp_path / "review-budget-eight.sqlite3",
-                requests,
-                step_limit=8,
-            )
+        state, runtime, client, planner_model, writer_model = await _start_human_review(
+            tmp_path / "review-budget-eight.sqlite3",
+            requests,
+            step_limit=8,
         )
         await client.aclose()
         return state, planner_model, writer_model
@@ -889,9 +952,13 @@ def test_legacy_review_checkpoint_exhausted_at_regate_uses_gate_terminal(
 
     async def scenario():
         path = tmp_path / "review-regate-exhausted.sqlite3"
-        waiting, runtime, client, planner_model, writer_model = (
-            await _start_human_review(path, requests)
-        )
+        (
+            waiting,
+            runtime,
+            client,
+            planner_model,
+            writer_model,
+        ) = await _start_human_review(path, requests)
         assert waiting.review_request is not None
         try:
             async with open_checkpointer(path) as saver:
@@ -960,16 +1027,19 @@ def test_concurrent_review_replies_are_literal_idempotent_or_divergent(
     monkeypatch.setattr(
         entrypoint_module,
         "_utc_now",
-        lambda: created_at
-        + (timedelta(hours=24) if expired else timedelta(minutes=1)),
+        lambda: created_at + (timedelta(hours=24) if expired else timedelta(minutes=1)),
     )
     requests: list[httpx.Request] = []
 
     async def run_pair(name, *, divergent):
         path = tmp_path / f"review-concurrent-{name}-{expired}.sqlite3"
-        waiting, runtime, client, planner_model, writer_model = (
-            await _start_human_review(path, requests)
-        )
+        (
+            waiting,
+            runtime,
+            client,
+            planner_model,
+            writer_model,
+        ) = await _start_human_review(path, requests)
         assert waiting.review_request is not None
         approve = ReviewApproveReply(
             review_id=waiting.review_request.review_id,
@@ -1053,10 +1123,8 @@ def test_review_reply_cannot_cross_threads_with_same_request_and_clock(
         first, runtime_a, client_a, _, _ = await _start_human_review(
             first_path, requests
         )
-        second, runtime_b, client_b, planner_b, writer_b = (
-            await _start_human_review(
-                second_path, requests, thread_id="thread_review_other"
-            )
+        second, runtime_b, client_b, planner_b, writer_b = await _start_human_review(
+            second_path, requests, thread_id="thread_review_other"
         )
         assert first.review_request is not None
         assert second.review_request is not None
@@ -1112,9 +1180,13 @@ def test_pending_review_rejects_new_request_stale_id_and_wrong_company_then_reje
 
     async def scenario():
         checkpoint_path = tmp_path / "review-reject.sqlite3"
-        waiting, runtime, client, planner_model, writer_model = (
-            await _start_human_review(checkpoint_path, requests)
-        )
+        (
+            waiting,
+            runtime,
+            client,
+            planner_model,
+            writer_model,
+        ) = await _start_human_review(checkpoint_path, requests)
         assert waiting.review_request is not None
         review_id = waiting.review_request.review_id
         try:
@@ -1248,9 +1320,13 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
 
     async def scenario():
         checkpoint_path = tmp_path / "review-expiry.sqlite3"
-        waiting, runtime, client, planner_model, writer_model = (
-            await _start_human_review(checkpoint_path, requests)
-        )
+        (
+            waiting,
+            runtime,
+            client,
+            planner_model,
+            writer_model,
+        ) = await _start_human_review(checkpoint_path, requests)
         assert waiting.review_request is not None
         try:
             async with open_checkpointer(checkpoint_path) as saver:
@@ -1476,11 +1552,7 @@ def test_new_request_closes_expired_review_before_starting_fresh_work(
                         )
                     assert denied.value.code == expected_code
                     after = await graph.aget_state(
-                        {
-                            "configurable": {
-                                "thread_id": "thread_review_boundaries"
-                            }
-                        }
+                        {"configurable": {"thread_id": "thread_review_boundaries"}}
                     )
                     after_json = json.dumps(
                         after.values,
@@ -1525,7 +1597,14 @@ def test_new_request_closes_expired_review_before_starting_fresh_work(
                         denied_execution_id=f"exec_attacker_{suffix}",
                         expected_code="THREAD_SCOPE_MISMATCH",
                     )
-                for suffix, denied_request, denied_runtime, denied_request_id, denied_execution_id, expected_code in (
+                for (
+                    suffix,
+                    denied_request,
+                    denied_runtime,
+                    denied_request_id,
+                    denied_execution_id,
+                    expected_code,
+                ) in (
                     (
                         "case",
                         _request().model_copy(update={"case_id": "case_other"}),
@@ -1638,13 +1717,17 @@ def test_pending_review_with_hidden_target_rejects_runtime_drift_before_expiry(
 
     async def scenario():
         checkpoint_path = tmp_path / "hidden-review-scope.sqlite3"
-        waiting, runtime, client, planner_model, writer_model = (
-            await _start_human_review(
-                checkpoint_path,
-                requests,
-                support_request=_request(asset_id=None),
-                selector_responses=(AIMessage(content="done"),),
-            )
+        (
+            waiting,
+            runtime,
+            client,
+            planner_model,
+            writer_model,
+        ) = await _start_human_review(
+            checkpoint_path,
+            requests,
+            support_request=_request(asset_id=None),
+            selector_responses=(AIMessage(content="done"),),
         )
         assert waiting.review_request is not None
         expires_at = waiting.review_request.expires_at
@@ -1654,9 +1737,7 @@ def test_pending_review_with_hidden_target_rejects_runtime_drift_before_expiry(
             user_id="usr_pedro",
             company_id="comp_mineracao_andes",
             permissions=permissions,
-            central_asset_id=runtime_overrides.get(
-                "central_asset_id", "asset_G501"
-            ),
+            central_asset_id=runtime_overrides.get("central_asset_id", "asset_G501"),
             configured_model_id=runtime_overrides.get(
                 "configured_model_id", "mdl_vib_v3"
             ),
@@ -1735,9 +1816,13 @@ def test_human_edit_preserves_selected_order_and_releases_through_gate(
 
     async def scenario():
         path = tmp_path / "review-edit.sqlite3"
-        waiting, runtime, client, planner_model, writer_model = (
-            await _start_human_review(path, requests)
-        )
+        (
+            waiting,
+            runtime,
+            client,
+            planner_model,
+            writer_model,
+        ) = await _start_human_review(path, requests)
         assert waiting.review_request is not None
         selected = tuple(reversed(waiting.review_request.eligible_evidence_ids[:2]))
         try:
@@ -1847,9 +1932,13 @@ def test_permission_revoked_before_regate_blocks_release_without_second_review(
 
     async def scenario():
         path = tmp_path / "review-revoked.sqlite3"
-        waiting, runtime, client, planner_model, writer_model = (
-            await _start_human_review(path, requests)
-        )
+        (
+            waiting,
+            runtime,
+            client,
+            planner_model,
+            writer_model,
+        ) = await _start_human_review(path, requests)
         assert waiting.review_request is not None
         revoked = ReadToolRuntime.create(
             user_id="usr_pedro",
@@ -1937,9 +2026,13 @@ def test_review_boundary_without_read_never_returns_technical_state(
 
     async def scenario():
         path = tmp_path / f"review-no-read-{operation}.sqlite3"
-        waiting, runtime, client, planner_model, writer_model = (
-            await _start_human_review(path, requests)
-        )
+        (
+            waiting,
+            runtime,
+            client,
+            planner_model,
+            writer_model,
+        ) = await _start_human_review(path, requests)
         assert waiting.review_request is not None
         received_at = (
             waiting.review_request.expires_at
@@ -2079,8 +2172,7 @@ def test_planner_explicit_review_is_not_converted_to_guide_and_has_no_second_loo
     monkeypatch.setattr(
         entrypoint_module,
         "_utc_now",
-        lambda: created_at
-        + (timedelta(hours=24) if expired else timedelta(minutes=1)),
+        lambda: created_at + (timedelta(hours=24) if expired else timedelta(minutes=1)),
     )
     requests: list[httpx.Request] = []
     explicit_review = PlannerTerminalDecision(
@@ -2090,18 +2182,20 @@ def test_planner_explicit_review_is_not_converted_to_guide_and_has_no_second_loo
 
     async def scenario():
         path = tmp_path / f"planner-explicit-review-{expired}.sqlite3"
-        waiting, runtime, client, planner_model, writer_model = (
-            await _start_human_review(
-                path,
-                requests,
-                writer_model=_EchoWriterModel(),
-                terminal_decision=explicit_review,
-            )
+        (
+            waiting,
+            runtime,
+            client,
+            planner_model,
+            writer_model,
+        ) = await _start_human_review(
+            path,
+            requests,
+            writer_model=_EchoWriterModel(),
+            terminal_decision=explicit_review,
         )
         assert waiting.review_request is not None
-        assert waiting.review_request.allowed_operations == (
-            ReviewOperation.REJECT,
-        )
+        assert waiting.review_request.allowed_operations == (ReviewOperation.REJECT,)
         try:
             async with open_checkpointer(path) as saver:
                 graph = build_agent_graph(
@@ -2165,9 +2259,13 @@ def test_crash_after_review_audit_with_revoked_read_regates_without_duplicate(
 
     async def scenario():
         path = tmp_path / "review-audit-crash.sqlite3"
-        waiting, runtime, client, planner_model, writer_model = (
-            await _start_human_review(path, requests)
-        )
+        (
+            waiting,
+            runtime,
+            client,
+            planner_model,
+            writer_model,
+        ) = await _start_human_review(path, requests)
         assert waiting.review_request is not None
         reply = ReviewApproveReply(
             review_id=waiting.review_request.review_id,
@@ -2322,9 +2420,9 @@ def test_planner_rejects_coerced_rotation_in_raw_read_artifact(
         )
         result = await execute_get_asset("asset_G501", runtime)
         raw_artifact = result.artifact.model_dump(mode="json")
-        raw_artifact["outcome"]["asset"]["technical_configuration"][
-            "rotation_rpm"
-        ] = "1780.0"
+        raw_artifact["outcome"]["asset"]["technical_configuration"]["rotation_rpm"] = (
+            "1780.0"
+        )
 
         class CoercedReadToolNode:
             def __init__(self, *args, **kwargs):
@@ -2334,9 +2432,7 @@ def test_planner_rejects_coerced_rotation_in_raw_read_artifact(
                 return {
                     "messages": [
                         ToolMessage(
-                            content=json.dumps(
-                                result.content.model_dump(mode="json")
-                            ),
+                            content=json.dumps(result.content.model_dump(mode="json")),
                             artifact=raw_artifact,
                             name="get_asset",
                             tool_call_id="call_coerced_rotation",
@@ -2515,19 +2611,19 @@ def test_each_planner_proposal_runs_through_tool_node_without_effect(
             request_id=request_id,
             thread_id=f"thread_{tool_name}",
             execution_id=f"exec_{tool_name}",
-                thread_scope=ThreadScope(
+            thread_scope=ThreadScope(
                 thread_id=f"thread_{tool_name}",
                 case_id=request.case_id,
                 company_id=runtime.identity.company_id,
                 user_id=runtime.identity.user_id,
             ),
-                tool_calls=trusted_calls,
-                tool_observations=trusted_observations,
-                ledger=compile_observations(
-                    trusted_observations,
-                    recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
-                ),
-                planner_usage=PlannerUsage(
+            tool_calls=trusted_calls,
+            tool_observations=trusted_observations,
+            ledger=compile_observations(
+                trusted_observations,
+                recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+            ),
+            planner_usage=PlannerUsage(
                 request_id=request_id,
                 selection_count=len(trusted_calls),
             ),
@@ -2535,9 +2631,7 @@ def test_each_planner_proposal_runs_through_tool_node_without_effect(
         )
         config = {"configurable": {"thread_id": state.thread_id}}
         try:
-            async with open_checkpointer(
-                tmp_path / f"{tool_name}.sqlite3"
-            ) as saver:
+            async with open_checkpointer(tmp_path / f"{tool_name}.sqlite3") as saver:
                 graph = _build_planner_graph(saver, model)
                 await graph.ainvoke(
                     state.model_dump(mode="json"),
@@ -3420,9 +3514,7 @@ def test_other_action_failures_still_use_writer_and_release_gate(
             status_code,
             json={
                 "code": (
-                    "VALIDATION_ERROR"
-                    if status_code == 400
-                    else "INTERNAL_ERROR"
+                    "VALIDATION_ERROR" if status_code == 400 else "INTERNAL_ERROR"
                 ),
                 "message": "Falha remota sanitizada.",
             },
@@ -3568,7 +3660,9 @@ def test_writer_graph_projection_excludes_every_non_allowlisted_state_sentinel(
             client=client,
         )
         try:
-            async with open_checkpointer(tmp_path / "writer-allowlist.sqlite3") as saver:
+            async with open_checkpointer(
+                tmp_path / "writer-allowlist.sqlite3"
+            ) as saver:
                 graph = build_agent_graph(
                     saver,
                     planner=Planner(planner_model),
@@ -3856,6 +3950,7 @@ def test_writer_failure_stops_safely_without_hidden_retry(
         ),
     )
     writer_model = _SequenceWriterGraphModel(responses=responses)
+    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
 
     async def scenario():
         client = IndustrialApiClient(
@@ -3875,11 +3970,12 @@ def test_writer_failure_stops_safely_without_hidden_retry(
             async with open_checkpointer(
                 tmp_path / f"writer-failure-{expected_code}.sqlite3"
             ) as saver:
-                return await invoke_agent(
+                state = await invoke_agent(
                     build_agent_graph(
                         saver,
                         planner=Planner(planner_model),
                         writer=Writer(writer_model),
+                        telemetry=telemetry,
                     ),
                     request=_request(),
                     runtime=runtime,
@@ -3887,10 +3983,11 @@ def test_writer_failure_stops_safely_without_hidden_retry(
                     request_id=f"req_writer_failure_{expected_code}",
                     execution_id=f"exec_writer_failure_{expected_code}",
                 )
+                return state, telemetry
         finally:
             await client.aclose()
 
-    state = asyncio.run(scenario())
+    state, telemetry = asyncio.run(scenario())
 
     assert state.writer_attempts == expected_attempts
     assert state.writer_failure is not None
@@ -3904,6 +4001,17 @@ def test_writer_failure_stops_safely_without_hidden_retry(
     assert "inválido" not in state_wire
     assert "RAW_SECRET_OUTPUT" not in state_wire
     assert len(writer_model._payloads) == expected_attempts
+    assert [
+        dict(span.attributes)["attempt"]
+        for span in telemetry.spans
+        if span.name is SpanName.WRITER
+    ] == list(range(1, expected_attempts + 1))
+    assert all(
+        dict(span.attributes)["outcome"] == "error"
+        and dict(span.attributes)["error_code"] == "model_error"
+        for span in telemetry.spans
+        if span.name is SpanName.WRITER
+    )
 
 
 def test_write_policy_never_creates_a_second_intent_for_request_id(tmp_path):
@@ -4042,7 +4150,9 @@ def test_policy_requires_confirmation_when_proposal_exceeds_original_approval(
             async with open_checkpointer(tmp_path / "planner-deny.sqlite3") as saver:
                 return await invoke_agent(
                     _build_planner_graph(saver, model),
-                    request=_request(message="Atualize a criticidade do ativo central."),
+                    request=_request(
+                        message="Atualize a criticidade do ativo central."
+                    ),
                     runtime=runtime,
                     thread_id="thread_planner_deny",
                     request_id="req_planner_deny",
@@ -4118,7 +4228,9 @@ def test_planner_confirmation_resume_reaches_writer_gate_without_repeating_effec
         )
         request = _request(message="Atualize a criticidade do ativo central.")
         try:
-            async with open_checkpointer(tmp_path / "confirmed-writer.sqlite3") as saver:
+            async with open_checkpointer(
+                tmp_path / "confirmed-writer.sqlite3"
+            ) as saver:
                 graph = build_agent_graph(
                     saver,
                     planner=Planner(planner_model),
@@ -4753,11 +4865,15 @@ def test_public_new_request_archives_ledger_through_sqlite_reopen(tmp_path):
     assert second.ledger.items == ()
     assert second.ledger_history == (first.ledger,)
     assert restored.ledger_history == (first.ledger,)
-    assert all(item.request_id == "req_ledger_history_one" for item in restored.ledger_history[0].items)
+    assert all(
+        item.request_id == "req_ledger_history_one"
+        for item in restored.ledger_history[0].items
+    )
 
 
 def test_unexpected_tool_failure_terminates_safely_without_retry(tmp_path):
     attempts = 0
+    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
 
     def handler(_: httpx.Request) -> httpx.Response:
         nonlocal attempts
@@ -4794,7 +4910,7 @@ def test_unexpected_tool_failure_terminates_safely_without_retry(tmp_path):
         )
         try:
             async with open_checkpointer(tmp_path / "tool-failure.sqlite3") as saver:
-                graph = _build_planner_graph(saver, model)
+                graph = _build_planner_graph(saver, model, telemetry=telemetry)
                 state = await invoke_agent(
                     graph,
                     request=_request(),
@@ -4821,6 +4937,9 @@ def test_unexpected_tool_failure_terminates_safely_without_retry(tmp_path):
     assert state.planner_failure.code == "tool_execution_failed"
     assert state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
     assert "sensitive adapter failure" not in repr(snapshot.values)
+    tool_span = next(span for span in telemetry.spans if span.name is SpanName.TOOL)
+    assert dict(tool_span.attributes)["outcome"] == "error"
+    assert dict(tool_span.attributes)["error_code"] == "tool_error"
 
 
 def test_planner_reserves_fixed_write_steps_before_proposal_tool(tmp_path):
@@ -4865,7 +4984,9 @@ def test_planner_reserves_fixed_write_steps_before_proposal_tool(tmp_path):
             async with open_checkpointer(tmp_path / "budget.sqlite3") as saver:
                 return await invoke_agent(
                     _build_planner_graph(saver, model),
-                    request=_request(message="Atualize a criticidade do ativo central."),
+                    request=_request(
+                        message="Atualize a criticidade do ativo central."
+                    ),
                     runtime=runtime,
                     thread_id="thread_budgeted_proposal",
                     request_id="req_budgeted_proposal",
