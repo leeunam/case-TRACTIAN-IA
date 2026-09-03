@@ -25,7 +25,7 @@ from tractian_agent.human_review import (
     ReviewResumeEnvelope,
     ReviewerIdentity,
     build_reviewed_draft,
-    canonical_digest,
+    review_resolution_subject_digest,
 )
 from tractian_agent.state import AgentState, ResumeAnchor, ReviewReply, ThreadScope
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
@@ -575,6 +575,10 @@ def _review_command(
             "AMBIGUOUS_REVIEW", "o checkpoint deve possuir uma revisão pendente"
         )
     request = state.review_request
+    if received_at < request.created_at:
+        raise AgentInvocationProtocolError(
+            "INVALID_REVIEW_TIME", "o relógio confiável precede a revisão"
+        )
     if reply.review_id != request.review_id:
         raise AgentInvocationProtocolError(
             "STALE_REVIEW", "o reply pertence a outra revisão"
@@ -614,15 +618,24 @@ def _terminal_review_replay(
     reply: ReviewReply,
     reviewer: ReviewerIdentity,
 ) -> bool:
-    audit = state.review_audit
-    if audit is None or state.review_request is None:
+    if state.review_request is None:
         return False
-    return (
-        reply.review_id == audit.review_id
-        and reviewer.reviewer_id == audit.reviewer_id
-        and reviewer.company_id == audit.company_id
-        and reply.operation == audit.operation.value
-        and canonical_digest(reply) == audit.reply_digest
+    resolution_digest = review_resolution_subject_digest(reply, reviewer)
+    if state.review_expiry is not None:
+        return (
+            reply.review_id == state.review_expiry.review_id
+            and resolution_digest == state.review_expiry.resolution_digest
+        )
+    audit = state.review_audit
+    return bool(
+        audit is not None
+        and reply.review_id == audit.review_id
+        and state.review_resolution is not None
+        and resolution_digest
+        == review_resolution_subject_digest(
+            state.review_resolution.reply,
+            state.review_resolution.reviewer,
+        )
     )
 
 
@@ -713,6 +726,12 @@ async def invoke_agent(
                 # continua o gate pendente sem gravar uma segunda auditoria.
                 review_reply = None
                 reviewer = None
+            internal_review_continuation = (
+                not new_request
+                and persisted.final_result is None
+                and persisted.review_audit is not None
+                and snapshot.next == ("release_gate",)
+            )
             if persisted.final_result is not None:
                 _validate_terminal_resume_anchor(persisted, checkpoint_anchor)
                 if snapshot.next:
@@ -749,7 +768,9 @@ async def invoke_agent(
                 runtime,
                 planner_enabled=planner_enabled,
                 include_current_flow=not new_request,
-                allow_review_resume=review_reply is not None,
+                allow_review_resume=(
+                    review_reply is not None or internal_review_continuation
+                ),
             )
             if (
                 planner_enabled
@@ -828,6 +849,12 @@ async def invoke_agent(
             if not new_request and persisted.final_result is not None:
                 if review_reply is not None and reviewer is not None:
                     if _terminal_review_replay(persisted, review_reply, reviewer):
+                        _validate_current_read_access(
+                            persisted,
+                            runtime,
+                            planner_enabled=planner_enabled,
+                            include_current_flow=True,
+                        )
                         return persisted
                     raise AgentInvocationProtocolError(
                         "DIVERGENT_REVIEW",
@@ -1016,6 +1043,5 @@ async def invoke_agent(
             runtime,
             planner_enabled=planner_enabled,
             include_current_flow=True,
-            allow_review_resume=review_reply is not None,
         )
     return final_state

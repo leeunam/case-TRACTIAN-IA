@@ -700,6 +700,7 @@ class ReleaseGateReason(str, Enum):
     CONFIRMATION_REQUIRED = "confirmation_required"
     HUMAN_REVIEW_REQUESTED = "human_review_requested"
     HUMAN_DISPOSITION_REQUIRED = "human_disposition_required"
+    STEP_BUDGET_EXHAUSTED = "step_budget_exhausted"
     WRITER_FAILURE = "writer_failure"
     REQUEST_MISMATCH = "request_mismatch"
     DECISION_MISMATCH = "decision_mismatch"
@@ -728,6 +729,12 @@ class ReleaseGateRecord(FrozenStateModel):
     review_audit_digest: str | None = Field(default=None, pattern=r"^sha256:v1:[0-9a-f]{64}$")
 
 
+class ReviewStateModel(FrozenStateModel):
+    """Base estrita no Python e compatível com round-trip JSON explícito."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
 class ReviewOperation(str, Enum):
     APPROVE = "approve"
     EDIT = "edit"
@@ -740,7 +747,7 @@ class ReviewQuestion(str, Enum):
     ASSESS_BLOCKING_SAFETY = "assess_blocking_safety"
 
 
-class ReviewerIdentity(FrozenStateModel):
+class ReviewerIdentity(ReviewStateModel):
     reviewer_id: str = Field(min_length=1, pattern=r"^\S+$")
     company_id: str = Field(min_length=1, pattern=r"^\S+$")
     permission: Literal["review"]
@@ -759,10 +766,12 @@ def _review_contract_digest(value: object) -> str:
     return f"sha256:v1:{hashlib.sha256(encoded).hexdigest()}"
 
 
-class ReviewRequest(FrozenStateModel):
+class ReviewRequest(ReviewStateModel):
     review_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     request_id: str = Field(min_length=1, pattern=r"^\S+$")
     request_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    thread_scope_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    basis_permissions: tuple[Permission, ...]
     gate_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     gate_basis: ReleaseGateRecord
     draft_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
@@ -785,6 +794,15 @@ class ReviewRequest(FrozenStateModel):
             for item in value
         ):
             raise ValueError("ID de evidência elegível inválido")
+        return value
+
+    @field_validator("basis_permissions")
+    @classmethod
+    def _validate_basis_permissions(
+        cls, value: tuple[Permission, ...]
+    ) -> tuple[Permission, ...]:
+        if value != tuple(sorted(set(value))):
+            raise ValueError("permissões da base devem ser únicas e ordenadas")
         return value
 
     @field_validator("created_at", "expires_at")
@@ -831,6 +849,8 @@ class ReviewRequest(FrozenStateModel):
         identity_fields = {
             "request_id": self.request_id,
             "request_digest": self.request_digest,
+            "thread_scope_digest": self.thread_scope_digest,
+            "basis_permissions": list(self.basis_permissions),
             "gate_digest": self.gate_digest,
             "draft_digest": self.draft_digest,
             "reason": self.reason.value,
@@ -848,7 +868,7 @@ class ReviewRequest(FrozenStateModel):
         return self
 
 
-class ReviewInterruptPayload(FrozenStateModel):
+class ReviewInterruptPayload(ReviewStateModel):
     review_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     reason: ReleaseGateReason
     question: ReviewQuestion
@@ -859,12 +879,12 @@ class ReviewInterruptPayload(FrozenStateModel):
     expires_at: datetime
 
 
-class ReviewApproveReply(FrozenStateModel):
+class ReviewApproveReply(ReviewStateModel):
     review_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     operation: Literal["approve"]
 
 
-class ReviewEditReply(FrozenStateModel):
+class ReviewEditReply(ReviewStateModel):
     review_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     operation: Literal["edit"]
     evidence_ids: tuple[str, ...]
@@ -883,7 +903,7 @@ class ReviewEditReply(FrozenStateModel):
         return value
 
 
-class ReviewRejectReply(FrozenStateModel):
+class ReviewRejectReply(ReviewStateModel):
     review_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     operation: Literal["reject"]
 
@@ -894,7 +914,29 @@ ReviewReply: TypeAlias = Annotated[
 ]
 
 
-class ReviewedDraft(FrozenStateModel):
+class ReviewResolution(ReviewStateModel):
+    """Envelope confiável persistido; nunca integra o payload do interrupt."""
+
+    review_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    reply: ReviewReply
+    reviewer: ReviewerIdentity
+    received_at: datetime
+
+    @field_validator("received_at")
+    @classmethod
+    def _require_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timedelta(0):
+            raise ValueError("resolução exige instante UTC aware")
+        return value
+
+    @model_validator(mode="after")
+    def _bind_reply(self) -> ReviewResolution:
+        if self.reply.review_id != self.review_id:
+            raise ValueError("resolução pertence a outra revisão")
+        return self
+
+
+class ReviewedDraft(ReviewStateModel):
     decision: AgentDecision
     evidence_ids: tuple[str, ...]
     limitation_refs: tuple[str, ...]
@@ -920,14 +962,16 @@ class ReviewedDraft(FrozenStateModel):
         return value
 
 
-class ReviewAudit(FrozenStateModel):
+class ReviewAudit(ReviewStateModel):
     review_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     review_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     reviewer_id: str = Field(min_length=1, pattern=r"^\S+$")
     company_id: str = Field(min_length=1, pattern=r"^\S+$")
+    reviewer_permission: Literal["review"]
     operation: ReviewOperation
     received_at: datetime
     reply_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    resolution_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     before_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     after_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     structural_change: bool = Field(strict=True)
@@ -940,9 +984,10 @@ class ReviewAudit(FrozenStateModel):
         return value
 
 
-class ReviewExpiry(FrozenStateModel):
+class ReviewExpiry(ReviewStateModel):
     review_id: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     review_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    resolution_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     expired_at: datetime
 
     @field_validator("expired_at")
@@ -1369,6 +1414,7 @@ class AgentState(FrozenStateModel):
     writer_attempts: int = Field(default=0, ge=0, le=2, strict=True)
     release_gate: ReleaseGateRecord | None = None
     review_request: ReviewRequest | None = None
+    review_resolution: ReviewResolution | None = None
     reviewed_draft: ReviewedDraft | None = None
     review_audit: ReviewAudit | None = None
     review_expiry: ReviewExpiry | None = None
@@ -1599,6 +1645,7 @@ class AgentState(FrozenStateModel):
 
     @field_validator(
         "review_request",
+        "review_resolution",
         "reviewed_draft",
         "review_audit",
         "review_expiry",
@@ -1614,6 +1661,7 @@ class AgentState(FrozenStateModel):
             return value
         model = {
             "review_request": ReviewRequest,
+            "review_resolution": ReviewResolution,
             "reviewed_draft": ReviewedDraft,
             "review_audit": ReviewAudit,
             "review_expiry": ReviewExpiry,
@@ -1811,6 +1859,7 @@ class AgentState(FrozenStateModel):
                 value is not None
                 for value in (
                     self.reviewed_draft,
+                    self.review_resolution,
                     self.review_audit,
                     self.review_expiry,
                 )
@@ -1818,18 +1867,46 @@ class AgentState(FrozenStateModel):
                 raise ValueError("resultado de revisão exige solicitação persistida")
             return
         from tractian_agent.human_review import (
-            ReviewApproveReply,
-            ReviewEditReply,
-            ReviewRejectReply,
             build_review_request,
             canonical_digest,
+            render_review_expired_result,
+            render_review_rejected_result,
+            review_audit_is_canonical,
         )
+        from tractian_agent.release_gate import ReleaseGateContext, evaluate_release
 
         request = self.review_request
+        basis_context = ReleaseGateContext(
+            request_id=self.request_id,
+            decision=request.subject_decision,
+            ledger=self.ledger,
+            draft=self.writer_draft,
+            permissions=frozenset(request.basis_permissions),
+            intents=tuple(
+                intent
+                for intent in self.intents
+                if intent.request_id == self.request_id
+            ),
+            proposal=self.pending_proposal,
+            trusted_write_context=self.trusted_write_context,
+            planner_terminal=self.planner_terminal,
+            approval=self.approval,
+            missing_information=(
+                self.planner_terminal.missing_information
+                if self.planner_terminal is not None
+                else None
+            ),
+            writer_failure=self.writer_failure,
+        )
+        canonical_gate = evaluate_release(basis_context)
+        if canonical_gate != request.gate_basis:
+            raise ValueError("base do gate diverge do estado que originou a revisão")
         expected = build_review_request(
             request_id=self.request_id,
             request=self.request,
-            gate=request.gate_basis,
+            thread_scope=self.thread_scope,
+            permissions=frozenset(request.basis_permissions),
+            gate=canonical_gate,
             ledger=self.ledger,
             draft=self.writer_draft,
             created_at=request.created_at,
@@ -1838,58 +1915,46 @@ class AgentState(FrozenStateModel):
             raise ValueError("solicitação de revisão diverge da base canônica")
         if self.review_audit is not None and self.review_expiry is not None:
             raise ValueError("auditoria e expiração são mutuamente exclusivas")
+        resolution = self.review_resolution
         if self.review_expiry is not None:
             if (
-                self.review_expiry.review_id != request.review_id
+                resolution is not None
+                or self.review_expiry.review_id != request.review_id
                 or self.review_expiry.review_digest != canonical_digest(request)
                 or self.review_expiry.expired_at < request.expires_at
                 or self.reviewed_draft is not None
+                or self.final_result != render_review_expired_result()
             ):
                 raise ValueError("expiração diverge da revisão persistida")
             return
+        if resolution is None:
+            if self.review_audit is not None:
+                raise ValueError("resultado da revisão exige envelope confiável")
+        elif (
+            resolution.review_id != request.review_id
+            or resolution.reviewer.company_id != self.identity.company_id
+            or resolution.received_at < request.created_at
+            or resolution.reply.operation
+            not in {operation.value for operation in request.allowed_operations}
+        ):
+            raise ValueError("envelope confiável diverge da revisão")
         audit = self.review_audit
         if audit is None:
-            if self.reviewed_draft is not None:
+            if self.reviewed_draft is not None or resolution is not None:
                 raise ValueError("draft revisado exige auditoria")
             return
+        assert resolution is not None
         if audit.company_id != self.identity.company_id:
             raise ValueError("auditoria pertence a outra empresa")
-        if (
-            audit.review_id != request.review_id
-            or audit.review_digest != canonical_digest(request)
-            or audit.before_digest != canonical_digest(request.draft)
-            or audit.received_at >= request.expires_at
-        ):
-            raise ValueError("auditoria diverge da revisão persistida")
-        if audit.operation is ReviewOperation.APPROVE:
-            reply: ReviewReply = ReviewApproveReply(
-                review_id=request.review_id,
-                operation="approve",
-            )
-        elif audit.operation is ReviewOperation.EDIT:
-            if self.reviewed_draft is None:
-                raise ValueError("edição auditada exige draft revisado")
-            reply = ReviewEditReply(
-                review_id=request.review_id,
-                operation="edit",
-                evidence_ids=self.reviewed_draft.evidence_ids,
-                next_step=self.reviewed_draft.next_step,
-            )
-        else:
-            reply = ReviewRejectReply(
-                review_id=request.review_id,
-                operation="reject",
-            )
-        expected_after = canonical_digest(self.reviewed_draft)
-        if (
-            audit.reply_digest != canonical_digest(reply)
-            or audit.after_digest != expected_after
-            or audit.structural_change
-            != (audit.before_digest != audit.after_digest)
+        if not review_audit_is_canonical(
+            request, audit, self.reviewed_draft, self.ledger, resolution
         ):
             raise ValueError("auditoria de revisão foi adulterada")
         if audit.operation is ReviewOperation.REJECT:
-            if self.reviewed_draft is not None:
+            if (
+                self.reviewed_draft is not None
+                or self.final_result != render_review_rejected_result()
+            ):
                 raise ValueError("rejeição não aceita draft revisado")
         elif self.reviewed_draft is None:
             raise ValueError("aprovação ou edição exige draft revisado")
@@ -1903,7 +1968,9 @@ class AgentState(FrozenStateModel):
 
         from tractian_agent.release_gate import (
             ReleaseGateContext,
+            build_budget_exhausted_gate,
             evaluate_release,
+            render_budget_exhausted_result,
             render_non_release_result,
             render_released_result,
         )
@@ -1937,8 +2004,18 @@ class AgentState(FrozenStateModel):
                 self.review_request if self.review_audit is not None else None
             ),
             review_audit=self.review_audit,
+            review_resolution=self.review_resolution,
         )
-        expected_gate = evaluate_release(context)
+        budget_exhausted = (
+            self.release_gate.reason is ReleaseGateReason.STEP_BUDGET_EXHAUSTED
+        )
+        if budget_exhausted and self.step_count != self.step_limit:
+            raise ValueError("esgotamento do gate exige orçamento consumido")
+        expected_gate = (
+            build_budget_exhausted_gate(context)
+            if budget_exhausted
+            else evaluate_release(context)
+        )
         if self.release_gate != expected_gate:
             raise ValueError("atestado do gate diverge da recomputação")
         if self.final_result is None:
@@ -1950,7 +2027,9 @@ class AgentState(FrozenStateModel):
                 raise ValueError("atestado pendente não corresponde à revisão")
             return
         expected_result = (
-            render_released_result(context, expected_gate)
+            render_budget_exhausted_result(context, expected_gate)
+            if budget_exhausted
+            else render_released_result(context, expected_gate)
             if expected_gate.outcome is ReleaseGateOutcome.RELEASE
             else render_non_release_result(context, expected_gate)
         )
@@ -2107,7 +2186,7 @@ class AgentState(FrozenStateModel):
         if (
             same_request
             and self.review_request is not None
-            and self.review_audit is None
+            and self.final_result is None
             and permissions != self.permissions
         ):
             # O atestado anterior é apenas a base imutável da revisão. A
@@ -2134,6 +2213,7 @@ class AgentState(FrozenStateModel):
                 writer_attempts=0,
                 release_gate=None,
                 review_request=None,
+                review_resolution=None,
                 reviewed_draft=None,
                 review_audit=None,
                 review_expiry=None,

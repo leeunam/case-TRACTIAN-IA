@@ -29,6 +29,7 @@ from tractian_agent.state import (
     ReleaseGateRecord,
     ReviewAudit,
     ReviewRequest,
+    ReviewResolution,
     ReviewedDraft,
     WriterDraft,
     WriterFailureRecord,
@@ -92,6 +93,7 @@ class ReleaseGateContext(StrictModel):
     writer_failure: WriterFailureRecord | None = None
     review_request: ReviewRequest | None = None
     review_audit: ReviewAudit | None = None
+    review_resolution: ReviewResolution | None = None
 
     @model_validator(mode="after")
     def _require_current_intents(self) -> ReleaseGateContext:
@@ -189,6 +191,27 @@ def _review(
         context,
         ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW,
         reason,
+    )
+
+
+def build_budget_exhausted_gate(
+    context: ReleaseGateContext,
+) -> ReleaseGateRecord:
+    """Atestado terminal próprio quando nem o gate pode consumir outro passo."""
+
+    return _review(context, ReleaseGateReason.STEP_BUDGET_EXHAUSTED)
+
+
+def render_budget_exhausted_result(
+    context: ReleaseGateContext,
+    attestation: ReleaseGateRecord,
+) -> FinalResult:
+    if attestation != build_budget_exhausted_gate(context):
+        raise ValueError("atestado não corresponde ao esgotamento do gate")
+    return FinalResult(
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+        message="O orçamento seguro do fluxo foi esgotado antes da liberação.",
+        next_step=WriterNextStep.AWAIT_HUMAN_REVIEW,
     )
 
 
@@ -413,7 +436,8 @@ def evaluate_release(context: ReleaseGateContext) -> ReleaseGateRecord:
     if reviewed:
         request = context.review_request
         audit = context.review_audit
-        if request is None or audit is None:
+        resolution = context.review_resolution
+        if request is None or audit is None or resolution is None:
             return _review(context, ReleaseGateReason.REQUEST_MISMATCH)
         if (
             request.request_id != context.request_id
@@ -423,7 +447,9 @@ def evaluate_release(context: ReleaseGateContext) -> ReleaseGateRecord:
             or audit.before_digest != _digest(request.draft)
             or audit.after_digest != _digest(context.draft)
             or audit.operation.value not in {"approve", "edit"}
-            or not review_audit_is_canonical(request, audit, context.draft)
+            or not review_audit_is_canonical(
+                request, audit, context.draft, context.ledger, resolution
+            )
         ):
             return _review(context, ReleaseGateReason.REQUEST_MISMATCH)
     if context.ledger.request_id not in {context.request_id, None} or (
@@ -452,13 +478,30 @@ def evaluate_release(context: ReleaseGateContext) -> ReleaseGateRecord:
     limitation_refs = tuple(
         limitation.limitation_ref for limitation in expected.limitations
     )
+    reviewed_empty_is_safe = reviewed and (
+        (context.decision, context.draft.next_step)
+        in {
+            (
+                AgentDecision.REQUEST_INFORMATION,
+                WriterNextStep.PROVIDE_INFORMATION,
+            ),
+            (
+                AgentDecision.REQUEST_CONFIRMATION,
+                WriterNextStep.CONFIRM_ACTION,
+            ),
+            (
+                AgentDecision.REQUIRE_HUMAN_REVIEW,
+                WriterNextStep.AWAIT_HUMAN_REVIEW,
+            ),
+        }
+    )
     if (
         not reviewed
         and context.draft.evidence_ids != evidence_ids
     ) or (
         reviewed
         and (
-            not context.draft.evidence_ids
+            (not context.draft.evidence_ids and not reviewed_empty_is_safe)
             or any(item not in evidence_ids for item in context.draft.evidence_ids)
         )
     ):
@@ -622,7 +665,9 @@ def render_non_release_result(
 
 __all__ = [
     "ReleaseGateContext",
+    "build_budget_exhausted_gate",
     "evaluate_release",
+    "render_budget_exhausted_result",
     "render_non_release_result",
     "render_released_result",
 ]

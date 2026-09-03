@@ -33,10 +33,14 @@ from tractian_agent.human_review import (
     ReviewResumeEnvelope,
     build_review_audit,
     build_review_request,
+    build_review_resolution,
     build_reviewed_draft,
     canonical_digest,
     review_interrupt_payload,
     review_is_valid,
+    review_resolution_subject_digest,
+    render_review_expired_result,
+    render_review_rejected_result,
 )
 from tractian_agent.planner import (
     Planner,
@@ -48,7 +52,9 @@ from tractian_agent.planner import (
 )
 from tractian_agent.release_gate import (
     ReleaseGateContext,
+    build_budget_exhausted_gate,
     evaluate_release,
+    render_budget_exhausted_result,
     render_non_release_result,
     render_released_result,
 )
@@ -70,7 +76,6 @@ from tractian_agent.state import (
     ToolObservation,
     WriterFailureCode,
     WriterFailureRecord,
-    WriterNextStep,
     canonical_non_idempotent_resume_terminal,
     validate_exact_json_model,
     validate_exact_read_artifact,
@@ -120,11 +125,11 @@ from tractian_agent.writer import Writer, WriterProtocolError
 
 MINIMAL_GRAPH_STEP_COUNT = 3
 REPROCESS_GRAPH_STEP_COUNT = 5
-PLANNER_MINIMAL_GRAPH_STEP_COUNT = 6
-PLANNER_WRITE_GRAPH_STEP_COUNT = 8
+PLANNER_MINIMAL_GRAPH_STEP_COUNT = 8
+PLANNER_WRITE_GRAPH_STEP_COUNT = 10
 PLANNER_GRAPH_STEP_LIMIT = 24
-_PLANNER_FIXED_WRITE_STEPS = 7
-_PLANNER_TERMINAL_STEPS = 4
+_PLANNER_FIXED_WRITE_STEPS = 9
+_PLANNER_TERMINAL_STEPS = 6
 _IDEMPOTENCY_TTL = timedelta(days=7)
 _AMBIGUOUS_ERROR_CATEGORIES = frozenset(
     {
@@ -968,6 +973,7 @@ def _release_gate_context(state: AgentState) -> ReleaseGateContext:
         writer_failure=state.writer_failure,
         review_request=state.review_request,
         review_audit=state.review_audit,
+        review_resolution=state.review_resolution,
     )
 
 
@@ -975,11 +981,20 @@ def _release_gate(state: AgentState) -> dict[str, object]:
     try:
         advanced = state.advance_step()
     except ValueError:
-        return _planner_failure_update(
-            state,
-            stage="planner_finalize",
-            code="step_limit_exhausted",
-            anchor=ResumeAnchor.PLANNER_FINALIZE,
+        context = _release_gate_context(state)
+        attestation = build_budget_exhausted_gate(context)
+        return _checkpoint_update(
+            _replace_state(
+                state,
+                resume_anchor=ResumeAnchor.RELEASE_GATE,
+                decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+                final_result=render_budget_exhausted_result(context, attestation),
+                review=ReviewRecord(
+                    status=ReviewStatus.REQUIRED,
+                    reason="release_gate:step_budget_exhausted",
+                ),
+                release_gate=attestation,
+            )
         )
     context = _release_gate_context(advanced)
     attestation = evaluate_release(context)
@@ -996,6 +1011,8 @@ def _release_gate(state: AgentState) -> dict[str, object]:
             review_request = build_review_request(
                 request_id=advanced.request_id,
                 request=advanced.request,
+                thread_scope=advanced.thread_scope,
+                permissions=advanced.permissions,
                 gate=attestation,
                 ledger=advanced.ledger,
                 draft=advanced.writer_draft,
@@ -1051,21 +1068,25 @@ def _await_human_review(state: AgentState) -> dict[str, object]:
     if envelope.reviewer.company_id != state.identity.company_id:
         raise ValueError("revisor pertence a outra empresa")
     advanced = state.advance_step()
+    resolution = build_review_resolution(
+        request=request,
+        reply=envelope.reply,
+        reviewer=envelope.reviewer,
+        received_at=envelope.received_at,
+    )
     if not review_is_valid(request, envelope.received_at):
         return _checkpoint_update(
             _replace_state(
                 advanced,
                 resume_anchor=ResumeAnchor.AWAIT_HUMAN_REVIEW,
-                final_result=FinalResult(
-                    decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
-                    message=(
-                        "A revisão expirou; uma nova solicitação é necessária."
-                    ),
-                    next_step=WriterNextStep.AWAIT_HUMAN_REVIEW,
-                ),
+                final_result=render_review_expired_result(),
+                release_gate=request.gate_basis,
                 review_expiry=ReviewExpiry(
                     review_id=request.review_id,
                     review_digest=canonical_digest(request),
+                    resolution_digest=review_resolution_subject_digest(
+                        envelope.reply, envelope.reviewer
+                    ),
                     expired_at=envelope.received_at,
                 ),
             )
@@ -1073,25 +1094,21 @@ def _await_human_review(state: AgentState) -> dict[str, object]:
     if envelope.reply.operation == "reject":
         audit = build_review_audit(
             request=request,
-            reply=envelope.reply,
-            reviewer=envelope.reviewer,
-            received_at=envelope.received_at,
+            resolution=resolution,
             reviewed_draft=None,
         )
         return _checkpoint_update(
             _replace_state(
                 advanced,
                 resume_anchor=ResumeAnchor.AWAIT_HUMAN_REVIEW,
-                final_result=FinalResult(
-                    decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
-                    message="A revisão humana rejeitou a liberação da resposta.",
-                    next_step=WriterNextStep.AWAIT_HUMAN_REVIEW,
-                ),
+                final_result=render_review_rejected_result(),
+                release_gate=request.gate_basis,
                 review=ReviewRecord(
                     status=ReviewStatus.REJECTED,
                     reason="human_review:rejected",
                 ),
                 review_audit=audit,
+                review_resolution=resolution,
             )
         )
     if not isinstance(envelope.reply, (ReviewApproveReply, ReviewEditReply)):
@@ -1099,9 +1116,7 @@ def _await_human_review(state: AgentState) -> dict[str, object]:
     reviewed_draft = build_reviewed_draft(request, envelope.reply, advanced.ledger)
     audit = build_review_audit(
         request=request,
-        reply=envelope.reply,
-        reviewer=envelope.reviewer,
-        received_at=envelope.received_at,
+        resolution=resolution,
         reviewed_draft=reviewed_draft,
     )
     return _checkpoint_update(
@@ -1111,6 +1126,7 @@ def _await_human_review(state: AgentState) -> dict[str, object]:
             final_result=None,
             reviewed_draft=reviewed_draft,
             review_audit=audit,
+            review_resolution=resolution,
             review=ReviewRecord(
                 status=ReviewStatus.APPROVED,
                 reason=f"human_review:{envelope.reply.operation}",

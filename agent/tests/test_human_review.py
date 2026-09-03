@@ -9,15 +9,23 @@ from tractian_agent.contracts import ResponseMode
 from tractian_agent.evidence import canonical_evidence_id
 from tractian_agent.human_review import (
     ReviewApproveReply,
+    ReviewAudit,
     ReviewEditReply,
+    ReviewExpiry,
+    ReviewInterruptPayload,
     ReviewOperation,
     ReviewQuestion,
     ReviewRejectReply,
     ReviewReply,
+    ReviewRequest,
+    ReviewResolution,
+    ReviewedDraft,
     ReviewerIdentity,
     build_review_audit,
     build_reviewed_draft,
     build_review_request,
+    build_review_resolution,
+    review_audit_is_canonical,
     review_is_valid,
     review_interrupt_payload,
 )
@@ -31,6 +39,7 @@ from tractian_agent.state import (
     JsonSnapshot,
     ReleaseGateOutcome,
     ReleaseGateReason,
+    ThreadScope,
     WriterDraft,
     WriterFailureCode,
     WriterFailureRecord,
@@ -39,6 +48,32 @@ from tractian_agent.state import (
 
 
 NOW = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+
+
+def _thread_scope(thread_id: str = "thread_review_01") -> ThreadScope:
+    return ThreadScope(
+        thread_id=thread_id,
+        case_id="case_tkt_inv_04",
+        company_id="comp_mineracao_andes",
+        user_id="usr_pedro",
+    )
+
+
+def _reviewer() -> ReviewerIdentity:
+    return ReviewerIdentity(
+        reviewer_id="reviewer_01",
+        company_id="comp_mineracao_andes",
+        permission="review",
+    )
+
+
+def _resolution(request, reply, *, received_at=NOW + timedelta(minutes=1)):
+    return build_review_resolution(
+        request=request,
+        reply=reply,
+        reviewer=_reviewer(),
+        received_at=received_at,
+    )
 
 
 def _ledger() -> EvidenceLedger:
@@ -90,6 +125,8 @@ def _request():
                 "company_id": "comp_mineracao_andes",
             },
         },
+        thread_scope=_thread_scope(),
+        permissions=context.permissions,
         gate=gate,
         ledger=context.ledger,
         draft=context.draft,
@@ -126,6 +163,62 @@ def test_review_request_is_deterministic_strict_frozen_and_exactly_24_hours():
         )
     with pytest.raises(ValidationError):
         first.review_id = "changed"  # type: ignore[misc]
+
+
+def test_review_contracts_reject_python_coercions_but_round_trip_json():
+    request = _request()
+    payload = review_interrupt_payload(request)
+    edit = ReviewEditReply(
+        review_id=request.review_id,
+        operation="edit",
+        evidence_ids=request.eligible_evidence_ids,
+        next_step=WriterNextStep.MONITOR,
+    )
+    reviewed = build_reviewed_draft(request, edit, _ledger())
+    audit = build_review_audit(
+        request=request,
+        resolution=_resolution(request, edit),
+        reviewed_draft=reviewed,
+    )
+    expiry = ReviewExpiry(
+        review_id=request.review_id,
+        review_digest=audit.review_digest,
+        resolution_digest=audit.resolution_digest,
+        expired_at=request.expires_at,
+    )
+    resolution = _resolution(request, edit)
+    models = (request, payload, edit, reviewed, audit, expiry, resolution)
+    for model in models:
+        assert type(model).model_validate_json(model.model_dump_json()) == model
+
+    coercions = (
+        (ReviewRequest, {**request.model_dump(), "eligible_evidence_ids": list(request.eligible_evidence_ids)}),
+        (ReviewInterruptPayload, {**payload.model_dump(), "allowed_operations": list(payload.allowed_operations)}),
+        (ReviewEditReply, {**edit.model_dump(), "evidence_ids": list(edit.evidence_ids)}),
+        (ReviewedDraft, {**reviewed.model_dump(), "next_step": "monitor"}),
+        (ReviewAudit, {**audit.model_dump(), "received_at": audit.received_at.isoformat()}),
+        (ReviewExpiry, {**expiry.model_dump(), "expired_at": expiry.expired_at.isoformat()}),
+        (ReviewResolution, {**resolution.model_dump(), "received_at": resolution.received_at.isoformat()}),
+    )
+    for model_type, value in coercions:
+        with pytest.raises(ValidationError):
+            model_type.model_validate(value)
+
+    with pytest.raises(ValidationError):
+        ReviewerIdentity.model_validate(
+            {
+                "reviewer_id": 1,
+                "company_id": "comp_mineracao_andes",
+                "permission": "review",
+            }
+        )
+    with pytest.raises(ValidationError):
+        ReviewApproveReply.model_validate(
+            {
+                "review_id": request.review_id,
+                "operation": True,
+            }
+        )
 
 
 def test_interrupt_payload_has_recursive_allowlist_and_no_sensitive_values():
@@ -225,6 +318,8 @@ def test_approve_is_not_offered_without_a_valid_draft():
     request = build_review_request(
         request_id=context.request_id,
         request={"safe": True},
+        thread_scope=_thread_scope(),
+        permissions=context.permissions,
         gate=gate,
         ledger=context.ledger,
         draft=None,
@@ -251,16 +346,26 @@ def test_approve_clears_only_safe_human_disposition_and_releases():
     )
     audit = build_review_audit(
         request=request,
+        resolution=build_review_resolution(
+            request=request,
+            reply=reply,
+            reviewer=reviewer,
+            received_at=NOW + timedelta(minutes=1),
+        ),
+        reviewed_draft=reviewed,
+    )
+    resolution = build_review_resolution(
+        request=request,
         reply=reply,
         reviewer=reviewer,
         received_at=NOW + timedelta(minutes=1),
-        reviewed_draft=reviewed,
     )
     regated = context.model_copy(
         update={
             "draft": reviewed,
             "review_request": request,
             "review_audit": audit,
+            "review_resolution": resolution,
         }
     )
 
@@ -284,13 +389,7 @@ def test_edit_preserves_human_order_but_derives_limitations_and_regates():
     reviewed = build_reviewed_draft(request, reply, context.ledger)
     audit = build_review_audit(
         request=request,
-        reply=reply,
-        reviewer=ReviewerIdentity(
-            reviewer_id="reviewer_01",
-            company_id="comp_mineracao_andes",
-            permission="review",
-        ),
-        received_at=NOW + timedelta(minutes=1),
+        resolution=_resolution(request, reply),
         reviewed_draft=reviewed,
     )
 
@@ -302,6 +401,7 @@ def test_edit_preserves_human_order_but_derives_limitations_and_regates():
                 "draft": reviewed,
                 "review_request": request,
                 "review_audit": audit,
+                "review_resolution": _resolution(request, reply),
             }
         )
     ).outcome is ReleaseGateOutcome.RELEASE
@@ -327,6 +427,8 @@ def test_hard_gate_reason_cannot_be_approved_or_overridden_by_edit():
     request = build_review_request(
         request_id=context.request_id,
         request={"safe": True},
+        thread_scope=_thread_scope(),
+        permissions=context.permissions,
         gate=gate,
         ledger=context.ledger,
         draft=context.draft,
@@ -351,20 +453,15 @@ def test_hard_gate_reason_cannot_be_approved_or_overridden_by_edit():
         ),
         context.ledger,
     )
+    edit_reply = ReviewEditReply(
+        review_id=request.review_id,
+        operation="edit",
+        evidence_ids=request.eligible_evidence_ids,
+        next_step=WriterNextStep.MONITOR,
+    )
     audit = build_review_audit(
         request=request,
-        reply=ReviewEditReply(
-            review_id=request.review_id,
-            operation="edit",
-            evidence_ids=request.eligible_evidence_ids,
-            next_step=WriterNextStep.MONITOR,
-        ),
-        reviewer=ReviewerIdentity(
-            reviewer_id="reviewer_01",
-            company_id="comp_mineracao_andes",
-            permission="review",
-        ),
-        received_at=NOW + timedelta(minutes=1),
+        resolution=_resolution(request, edit_reply),
         reviewed_draft=edited,
     )
     assert evaluate_release(
@@ -373,6 +470,7 @@ def test_hard_gate_reason_cannot_be_approved_or_overridden_by_edit():
                 "draft": edited,
                 "review_request": request,
                 "review_audit": audit,
+                "review_resolution": _resolution(request, edit_reply),
             }
         )
     ).reason is ReleaseGateReason.PERMISSION_INCOMPATIBLE
@@ -393,6 +491,8 @@ def test_writer_failure_can_be_structurally_edited_without_model_call():
     request = build_review_request(
         request_id=context.request_id,
         request={"safe": True},
+        thread_scope=_thread_scope(),
+        permissions=context.permissions,
         gate=gate,
         ledger=context.ledger,
         draft=None,
@@ -407,13 +507,7 @@ def test_writer_failure_can_be_structurally_edited_without_model_call():
     reviewed = build_reviewed_draft(request, reply, context.ledger)
     audit = build_review_audit(
         request=request,
-        reply=reply,
-        reviewer=ReviewerIdentity(
-            reviewer_id="reviewer_01",
-            company_id="comp_mineracao_andes",
-            permission="review",
-        ),
-        received_at=NOW + timedelta(minutes=1),
+        resolution=_resolution(request, reply),
         reviewed_draft=reviewed,
     )
 
@@ -423,6 +517,7 @@ def test_writer_failure_can_be_structurally_edited_without_model_call():
                 "draft": reviewed,
                 "review_request": request,
                 "review_audit": audit,
+                "review_resolution": _resolution(request, reply),
             }
         )
     ).outcome is ReleaseGateOutcome.RELEASE
@@ -438,9 +533,12 @@ def test_reject_audit_contains_only_structural_digests_and_expiry_is_exclusive()
     )
     audit = build_review_audit(
         request=request,
-        reply=reply,
-        reviewer=reviewer,
-        received_at=request.expires_at - timedelta(microseconds=1),
+        resolution=build_review_resolution(
+            request=request,
+            reply=reply,
+            reviewer=reviewer,
+            received_at=request.expires_at - timedelta(microseconds=1),
+        ),
         reviewed_draft=None,
     )
 
@@ -480,13 +578,7 @@ def test_regate_rejects_audit_tamper():
     reviewed = build_reviewed_draft(request, reply, context.ledger)
     audit = build_review_audit(
         request=request,
-        reply=reply,
-        reviewer=ReviewerIdentity(
-            reviewer_id="reviewer_01",
-            company_id="comp_mineracao_andes",
-            permission="review",
-        ),
-        received_at=NOW + timedelta(minutes=1),
+        resolution=_resolution(request, reply),
         reviewed_draft=reviewed,
     )
     tampered = audit.model_copy(
@@ -499,8 +591,151 @@ def test_regate_rejects_audit_tamper():
                 "draft": reviewed,
                 "review_request": request,
                 "review_audit": tampered,
+                "review_resolution": _resolution(request, reply),
             }
         )
     )
     assert result.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
     assert result.reason is ReleaseGateReason.REQUEST_MISMATCH
+
+
+def test_review_id_is_bound_to_thread_scope():
+    first = _request()
+    context = _reviewable_context()
+    second = build_review_request(
+        request_id=context.request_id,
+        request={
+            "case_id": "case_tkt_inv_04",
+            "ticket_id": "TKT-INV-04",
+            "asset_id": "asset_G501",
+            "message": "Não exponha este texto no interrupt.",
+            "identity": {
+                "user_id": "usr_pedro",
+                "company_id": "comp_mineracao_andes",
+            },
+        },
+        thread_scope=_thread_scope("thread_review_02"),
+        permissions=context.permissions,
+        gate=evaluate_release(context),
+        ledger=context.ledger,
+        draft=context.draft,
+        created_at=NOW,
+    )
+
+    assert first.thread_scope_digest != second.thread_scope_digest
+    assert first.review_id != second.review_id
+
+
+def test_approve_audit_rejects_reviewed_draft_not_derived_from_original():
+    context = _reviewable_context()
+    request = _request()
+    reply = ReviewApproveReply(review_id=request.review_id, operation="approve")
+    resolution = _resolution(request, reply)
+    forged = ReviewedDraft(
+        decision=AgentDecision.GUIDE,
+        evidence_ids=(),
+        limitation_refs=(),
+        next_step=WriterNextStep.MONITOR,
+    )
+    forged_audit = build_review_audit(
+        request=request,
+        resolution=resolution,
+        reviewed_draft=forged,
+    )
+
+    assert not review_audit_is_canonical(
+        request, forged_audit, forged, context.ledger, resolution
+    )
+    regated = evaluate_release(
+        context.model_copy(
+            update={
+                "draft": forged,
+                "review_request": request,
+                "review_resolution": resolution,
+                "review_audit": forged_audit,
+            }
+        )
+    )
+    assert regated.reason is ReleaseGateReason.REQUEST_MISMATCH
+
+
+def test_audit_binds_trusted_author_and_boundary_time():
+    request = _request()
+    reply = ReviewRejectReply(review_id=request.review_id, operation="reject")
+    resolution = _resolution(request, reply)
+    audit = build_review_audit(
+        request=request,
+        resolution=resolution,
+        reviewed_draft=None,
+    )
+
+    forged_author = audit.model_copy(update={"reviewer_id": "reviewer_forged"})
+    assert not review_audit_is_canonical(
+        request, forged_author, None, _ledger(), resolution
+    )
+    forged_time = audit.model_copy(
+        update={"received_at": audit.received_at + timedelta(seconds=1)}
+    )
+    assert not review_audit_is_canonical(
+        request, forged_time, None, _ledger(), resolution
+    )
+    with pytest.raises(ValueError, match="precede"):
+        build_review_resolution(
+            request=request,
+            reply=reply,
+            reviewer=_reviewer(),
+            received_at=request.created_at - timedelta(microseconds=1),
+        )
+
+
+def test_request_information_writer_failure_accepts_fact_free_safe_edit():
+    context = ReleaseGateContext(
+        request_id="req_review_01",
+        decision=AgentDecision.REQUEST_INFORMATION,
+        ledger=EvidenceLedger(request_id="req_review_01"),
+        draft=None,
+        permissions=frozenset({"read"}),
+        missing_information="qual é o identificador da análise?",
+        writer_failure=WriterFailureRecord(
+            code=WriterFailureCode.INVALID_STRUCTURED_OUTPUT,
+            attempts=2,
+            repairable=True,
+        ),
+    )
+    request = build_review_request(
+        request_id=context.request_id,
+        request={"safe": True},
+        thread_scope=_thread_scope(),
+        permissions=context.permissions,
+        gate=evaluate_release(context),
+        ledger=context.ledger,
+        draft=None,
+        created_at=NOW,
+    )
+    reply = ReviewEditReply(
+        review_id=request.review_id,
+        operation="edit",
+        evidence_ids=(),
+        next_step=WriterNextStep.PROVIDE_INFORMATION,
+    )
+
+    reviewed = build_reviewed_draft(request, reply, context.ledger)
+    assert reviewed.evidence_ids == ()
+    assert reviewed.next_step is WriterNextStep.PROVIDE_INFORMATION
+    resolution = _resolution(request, reply)
+    audit = build_review_audit(
+        request=request,
+        resolution=resolution,
+        reviewed_draft=reviewed,
+    )
+    regated = evaluate_release(
+        context.model_copy(
+            update={
+                "draft": reviewed,
+                "review_request": request,
+                "review_resolution": resolution,
+                "review_audit": audit,
+            }
+        )
+    )
+    assert regated.outcome is ReleaseGateOutcome.REQUEST_INFORMATION, regated.reason

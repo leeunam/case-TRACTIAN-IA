@@ -14,6 +14,7 @@ from tractian_agent.state import (
     AgentDecision,
     EvidenceLedger,
     EvidenceQuality,
+    FinalResult,
     ReleaseGateReason,
     ReleaseGateRecord,
     ReviewApproveReply,
@@ -26,11 +27,14 @@ from tractian_agent.state import (
     ReviewRejectReply,
     ReviewReply,
     ReviewRequest,
+    ReviewResolution,
     ReviewedDraft,
     ReviewerIdentity,
+    ThreadScope,
     WriterDraft,
     WriterNextStep,
 )
+from tractian_agent.tools.runtime import Permission
 from tractian_agent.writer import build_writer_context
 
 
@@ -95,6 +99,8 @@ def build_review_request(
     *,
     request_id: str,
     request: object,
+    thread_scope: ThreadScope,
+    permissions: frozenset[Permission],
     gate: ReleaseGateRecord,
     ledger: EvidenceLedger,
     draft: WriterDraft | None,
@@ -122,6 +128,8 @@ def build_review_request(
     identity_fields = {
         "request_id": request_id,
         "request_digest": request_digest,
+        "thread_scope_digest": canonical_digest(thread_scope),
+        "basis_permissions": sorted(permissions),
         "gate_digest": gate_digest,
         "draft_digest": draft_digest,
         "reason": gate.reason.value,
@@ -138,6 +146,8 @@ def build_review_request(
         ),
         request_id=request_id,
         request_digest=request_digest,
+        thread_scope_digest=canonical_digest(thread_scope),
+        basis_permissions=tuple(sorted(permissions)),
         gate_digest=gate_digest,
         gate_basis=gate,
         draft_digest=draft_digest,
@@ -180,15 +190,40 @@ def build_reviewed_draft(
         evidence_ids = request.draft.evidence_ids
     else:
         evidence_ids = reply.evidence_ids
-    if not evidence_ids or any(
+    empty_is_safe = (
+        isinstance(reply, ReviewEditReply)
+        and not evidence_ids
+        and (
+            (request.subject_decision, reply.next_step)
+            in {
+                (
+                    AgentDecision.REQUEST_INFORMATION,
+                    WriterNextStep.PROVIDE_INFORMATION,
+                ),
+                (
+                    AgentDecision.REQUEST_CONFIRMATION,
+                    WriterNextStep.CONFIRM_ACTION,
+                ),
+                (
+                    AgentDecision.REQUIRE_HUMAN_REVIEW,
+                    WriterNextStep.AWAIT_HUMAN_REVIEW,
+                ),
+            }
+        )
+    )
+    if (not evidence_ids and not empty_is_safe) or any(
         item not in request.eligible_evidence_ids for item in evidence_ids
     ):
         raise ValueError("edição aceita somente evidências elegíveis atuais")
-    limitations = build_writer_context(
-        decision=request.subject_decision,
-        ledger=ledger,
-        missing_information=None,
-    ).limitations
+    limitations = (
+        ()
+        if isinstance(reply, ReviewApproveReply)
+        else build_writer_context(
+            decision=request.subject_decision,
+            ledger=ledger,
+            missing_information=None,
+        ).limitations
+    )
     next_step = (
         WriterNextStep.MONITOR
         if isinstance(reply, ReviewApproveReply)
@@ -200,7 +235,11 @@ def build_reviewed_draft(
     return ReviewedDraft(
         decision=request.subject_decision,
         evidence_ids=evidence_ids,
-        limitation_refs=tuple(sorted(item.limitation_ref for item in limitations)),
+        limitation_refs=(
+            request.draft.limitation_refs
+            if isinstance(reply, ReviewApproveReply)
+            else tuple(sorted(item.limitation_ref for item in limitations))
+        ),
         next_step=next_step,
     )
 
@@ -208,15 +247,18 @@ def build_reviewed_draft(
 def build_review_audit(
     *,
     request: ReviewRequest,
-    reply: ReviewReply,
-    reviewer: ReviewerIdentity,
-    received_at: datetime,
+    resolution: ReviewResolution,
     reviewed_draft: ReviewedDraft | None,
 ) -> ReviewAudit:
+    reply = resolution.reply
+    reviewer = resolution.reviewer
+    received_at = resolution.received_at
     if reply.review_id != request.review_id:
         raise ValueError("reply pertence a outra revisão")
     if received_at.tzinfo is None or received_at.utcoffset() != timedelta(0):
         raise ValueError("received_at exige UTC aware")
+    if not review_is_valid(request, received_at):
+        raise ValueError("received_at está fora da janela da revisão")
     before = canonical_digest(request.draft)
     after = canonical_digest(reviewed_draft)
     return ReviewAudit(
@@ -224,9 +266,11 @@ def build_review_audit(
         review_digest=canonical_digest(request),
         reviewer_id=reviewer.reviewer_id,
         company_id=reviewer.company_id,
+        reviewer_permission=reviewer.permission,
         operation=ReviewOperation(reply.operation),
         received_at=received_at,
         reply_digest=canonical_digest(_REPLY_ADAPTER.dump_python(reply, mode="json")),
+        resolution_digest=review_resolution_digest(resolution),
         before_digest=before,
         after_digest=after,
         structural_change=before != after,
@@ -236,57 +280,102 @@ def build_review_audit(
 def review_is_valid(request: ReviewRequest, received_at: datetime) -> bool:
     if received_at.tzinfo is None or received_at.utcoffset() != timedelta(0):
         raise ValueError("received_at exige UTC aware")
-    return received_at < request.expires_at
+    return request.created_at <= received_at < request.expires_at
+
+
+def build_review_resolution(
+    *,
+    request: ReviewRequest,
+    reply: ReviewReply,
+    reviewer: ReviewerIdentity,
+    received_at: datetime,
+) -> ReviewResolution:
+    if reply.review_id != request.review_id:
+        raise ValueError("reply pertence a outra revisão")
+    if received_at.tzinfo is None or received_at.utcoffset() != timedelta(0):
+        raise ValueError("received_at exige UTC aware")
+    if received_at < request.created_at:
+        raise ValueError("received_at precede a criação da revisão")
+    return ReviewResolution(
+        review_id=request.review_id,
+        reply=reply,
+        reviewer=reviewer,
+        received_at=received_at,
+    )
+
+
+def review_resolution_digest(resolution: ReviewResolution) -> str:
+    return canonical_digest(resolution)
+
+
+def review_resolution_subject_digest(
+    reply: ReviewReply,
+    reviewer: ReviewerIdentity,
+) -> str:
+    """Fingerprint estrutural do conteúdo confiável, sem o relógio do retry."""
+
+    return canonical_digest(
+        {
+            "reply": _REPLY_ADAPTER.dump_python(reply, mode="json"),
+            "reviewer": reviewer.model_dump(mode="json"),
+        }
+    )
+
+
+def render_review_rejected_result() -> FinalResult:
+    return FinalResult(
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+        message="A revisão humana rejeitou a liberação da resposta.",
+        next_step=WriterNextStep.AWAIT_HUMAN_REVIEW,
+    )
+
+
+def render_review_expired_result() -> FinalResult:
+    return FinalResult(
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+        message="A revisão expirou; uma nova solicitação é necessária.",
+        next_step=WriterNextStep.AWAIT_HUMAN_REVIEW,
+    )
 
 
 def review_audit_is_canonical(
     request: ReviewRequest,
     audit: ReviewAudit,
     reviewed_draft: ReviewedDraft | None,
+    ledger: EvidenceLedger,
+    resolution: ReviewResolution,
 ) -> bool:
-    if audit.operation is ReviewOperation.APPROVE:
-        reply: ReviewReply = ReviewApproveReply(
-            review_id=request.review_id,
-            operation="approve",
+    reply = resolution.reply
+    if audit.operation.value != reply.operation:
+        return False
+    try:
+        expected_reviewed = (
+            None
+            if audit.operation is ReviewOperation.REJECT
+            else build_reviewed_draft(request, reply, ledger)
         )
-    elif audit.operation is ReviewOperation.EDIT:
-        if reviewed_draft is None:
+        if expected_reviewed != reviewed_draft:
             return False
-        reply = ReviewEditReply(
-            review_id=request.review_id,
-            operation="edit",
-            evidence_ids=reviewed_draft.evidence_ids,
-            next_step=reviewed_draft.next_step,
+        return audit == build_review_audit(
+            request=request,
+            resolution=resolution,
+            reviewed_draft=expected_reviewed,
         )
-    else:
-        reply = ReviewRejectReply(
-            review_id=request.review_id,
-            operation="reject",
-        )
-    before = canonical_digest(request.draft)
-    after = canonical_digest(reviewed_draft)
-    return (
-        audit.review_id == request.review_id
-        and audit.review_digest == canonical_digest(request)
-        and audit.operation in request.allowed_operations
-        and audit.received_at < request.expires_at
-        and audit.reply_digest == canonical_digest(reply)
-        and audit.before_digest == before
-        and audit.after_digest == after
-        and audit.structural_change == (before != after)
-        and (
-            (audit.operation is ReviewOperation.REJECT)
-            == (reviewed_draft is None)
-        )
-    )
+    except (ValueError, TypeError):
+        return False
 
 
 __all__ = [
     "ReviewApproveReply", "ReviewAudit", "ReviewEditReply", "ReviewExpiry",
     "ReviewInterruptPayload", "ReviewOperation", "ReviewQuestion",
     "ReviewRejectReply", "ReviewReply", "ReviewRequest", "ReviewedDraft",
-    "ReviewerIdentity", "ReviewResumeEnvelope", "build_review_audit", "build_review_request",
+    "ReviewResolution", "ReviewerIdentity", "ReviewResumeEnvelope", "build_review_audit", "build_review_request",
+    "build_review_resolution",
     "build_reviewed_draft", "canonical_digest", "review_interrupt_payload",
     "review_is_valid",
     "review_audit_is_canonical",
+    "review_resolution_digest",
+    "review_resolution_subject_digest",
+    "render_review_expired_result",
+    "render_review_rejected_result",
 ]

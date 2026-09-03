@@ -27,6 +27,7 @@ from tractian_agent.human_review import (
     ReviewEditReply,
     ReviewRejectReply,
     ReviewerIdentity,
+    build_review_request,
 )
 from tractian_agent.evidence import compile_observations
 from tractian_agent.graph import build_agent_graph
@@ -45,6 +46,7 @@ from tractian_agent.state import (
     ThreadScope,
     ToolObservation,
     ReleaseGateOutcome,
+    ReleaseGateReason,
     WriterDraft,
     WriterNextStep,
 )
@@ -342,6 +344,8 @@ async def _start_human_review(
     *,
     writer_model=None,
     terminal_decision=None,
+    step_limit=None,
+    thread_id="thread_review_boundaries",
 ):
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -393,9 +397,10 @@ async def _start_human_review(
             graph,
             request=_request(),
             runtime=runtime,
-            thread_id="thread_review_boundaries",
+            thread_id=thread_id,
             request_id="req_review_boundaries",
             execution_id="exec_review_boundaries",
+            step_limit=step_limit,
         )
     return waiting, runtime, client, planner_model, writer_model
 
@@ -717,6 +722,25 @@ def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
             assert waiting.review_request is not None
             with pytest.raises(ValidationError):
                 waiting.review_request.review_id = "changed"
+            assert waiting.release_gate is not None
+            forged_gate = waiting.release_gate.model_copy(
+                update={"reason": ReleaseGateReason.NEXT_STEP_MISMATCH}
+            )
+            forged_request = build_review_request(
+                request_id=waiting.request_id,
+                request=waiting.request,
+                thread_scope=waiting.thread_scope,
+                permissions=waiting.permissions,
+                gate=forged_gate,
+                ledger=waiting.ledger,
+                draft=waiting.writer_draft,
+                created_at=waiting.review_request.created_at,
+            )
+            forged_state = waiting.model_dump(mode="json")
+            forged_state["release_gate"] = None
+            forged_state["review_request"] = forged_request.model_dump(mode="json")
+            with pytest.raises(ValidationError, match="base do gate"):
+                AgentState.model_validate(forged_state)
             async with open_checkpointer(checkpoint_path) as reopened_saver:
                 reopened_graph = build_agent_graph(
                     reopened_saver,
@@ -801,8 +825,258 @@ def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
     assert completed.release_gate.review_digest is not None
     assert completed.release_gate.review_audit_digest is not None
     assert completed.step_count <= 24
+    assert completed.approval == waiting.approval is None
     assert replayed == completed
     assert divergent_code == "DIVERGENT_REVIEW"
+
+
+def test_eight_step_read_path_fails_closed_before_unfinishable_review(
+    tmp_path,
+    monkeypatch,
+):
+    created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
+    requests: list[httpx.Request] = []
+
+    async def scenario():
+        state, runtime, client, planner_model, writer_model = (
+            await _start_human_review(
+                tmp_path / "review-budget-eight.sqlite3",
+                requests,
+                step_limit=8,
+            )
+        )
+        await client.aclose()
+        return state, planner_model, writer_model
+
+    state, planner_model, writer_model = asyncio.run(scenario())
+    assert state.step_count <= 8
+    assert state.final_result is not None
+    assert state.final_result.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
+    assert state.review_request is None
+    assert state.planner_failure is not None
+    assert state.planner_failure.code == "step_limit_exhausted"
+    assert writer_model._events == []
+    assert planner_model._terminal_index == 1
+    assert len(requests) == 1
+
+
+def test_legacy_review_checkpoint_exhausted_at_regate_uses_gate_terminal(
+    tmp_path,
+    monkeypatch,
+):
+    created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
+    monkeypatch.setattr(
+        entrypoint_module, "_utc_now", lambda: created_at + timedelta(minutes=1)
+    )
+    requests: list[httpx.Request] = []
+
+    async def scenario():
+        path = tmp_path / "review-regate-exhausted.sqlite3"
+        waiting, runtime, client, planner_model, writer_model = (
+            await _start_human_review(path, requests)
+        )
+        assert waiting.review_request is not None
+        try:
+            async with open_checkpointer(path) as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=Writer(writer_model),
+                )
+                snapshot = await graph.aget_state(
+                    {"configurable": {"thread_id": "thread_review_boundaries"}}
+                )
+                limited = waiting.model_copy(
+                    update={"step_limit": waiting.step_count + 1}
+                )
+                await graph.aupdate_state(
+                    snapshot.config,
+                    limited.model_dump(mode="json"),
+                    as_node="release_gate",
+                )
+                await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_review_boundaries",
+                    request_id="req_review_boundaries",
+                    execution_id="exec_regate_exhausted_arm_interrupt",
+                )
+                return await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_review_boundaries",
+                    request_id="req_review_boundaries",
+                    execution_id="exec_regate_exhausted",
+                    review_reply=ReviewApproveReply(
+                        review_id=waiting.review_request.review_id,
+                        operation="approve",
+                    ),
+                    reviewer=ReviewerIdentity(
+                        reviewer_id="reviewer_budget",
+                        company_id="comp_mineracao_andes",
+                        permission="review",
+                    ),
+                )
+        finally:
+            await client.aclose()
+
+    completed = asyncio.run(scenario())
+    assert completed.step_count == completed.step_limit
+    assert completed.planner_failure is None
+    assert completed.release_gate is not None
+    assert completed.release_gate.reason is ReleaseGateReason.STEP_BUDGET_EXHAUSTED
+    assert completed.final_result is not None
+    assert completed.final_result.evidence_ids == ()
+    assert len(requests) == 1
+
+
+def test_concurrent_review_replies_are_literal_idempotent_or_divergent(
+    tmp_path,
+    monkeypatch,
+):
+    created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
+    monkeypatch.setattr(
+        entrypoint_module, "_utc_now", lambda: created_at + timedelta(minutes=1)
+    )
+    requests: list[httpx.Request] = []
+
+    async def run_pair(name, *, divergent):
+        path = tmp_path / f"review-concurrent-{name}.sqlite3"
+        waiting, runtime, client, planner_model, writer_model = (
+            await _start_human_review(path, requests)
+        )
+        assert waiting.review_request is not None
+        approve = ReviewApproveReply(
+            review_id=waiting.review_request.review_id,
+            operation="approve",
+        )
+        second_reply = (
+            ReviewRejectReply(
+                review_id=waiting.review_request.review_id,
+                operation="reject",
+            )
+            if divergent
+            else approve
+        )
+        reviewer = ReviewerIdentity(
+            reviewer_id="reviewer_concurrent",
+            company_id="comp_mineracao_andes",
+            permission="review",
+        )
+        try:
+            async with open_checkpointer(path) as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=Writer(writer_model),
+                )
+
+                async def submit(reply, suffix):
+                    return await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=runtime,
+                        thread_id="thread_review_boundaries",
+                        request_id="req_review_boundaries",
+                        execution_id=f"exec_concurrent_{name}_{suffix}",
+                        review_reply=reply,
+                        reviewer=reviewer,
+                    )
+
+                return await asyncio.gather(
+                    submit(approve, "first"),
+                    submit(second_reply, "second"),
+                    return_exceptions=True,
+                )
+        finally:
+            await client.aclose()
+
+    async def scenario():
+        return await run_pair("same", divergent=False), await run_pair(
+            "different", divergent=True
+        )
+
+    same, different = asyncio.run(scenario())
+    assert all(isinstance(result, AgentState) for result in same)
+    assert same[0] == same[1]
+    completed = [result for result in different if isinstance(result, AgentState)]
+    errors = [
+        result
+        for result in different
+        if isinstance(result, AgentInvocationProtocolError)
+    ]
+    assert len(completed) == 1
+    assert len(errors) == 1
+    assert errors[0].code == "DIVERGENT_REVIEW"
+    assert len(requests) == 2
+
+
+def test_review_reply_cannot_cross_threads_with_same_request_and_clock(
+    tmp_path,
+    monkeypatch,
+):
+    created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
+    monkeypatch.setattr(
+        entrypoint_module, "_utc_now", lambda: created_at + timedelta(minutes=1)
+    )
+    requests: list[httpx.Request] = []
+
+    async def scenario():
+        first_path = tmp_path / "review-thread-a.sqlite3"
+        second_path = tmp_path / "review-thread-b.sqlite3"
+        first, runtime_a, client_a, _, _ = await _start_human_review(
+            first_path, requests
+        )
+        second, runtime_b, client_b, planner_b, writer_b = (
+            await _start_human_review(
+                second_path, requests, thread_id="thread_review_other"
+            )
+        )
+        assert first.review_request is not None
+        assert second.review_request is not None
+        try:
+            async with open_checkpointer(second_path) as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_b),
+                    writer=Writer(writer_b),
+                )
+                with pytest.raises(AgentInvocationProtocolError) as stale:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=runtime_b,
+                        thread_id="thread_review_other",
+                        request_id="req_review_boundaries",
+                        execution_id="exec_cross_thread_reply",
+                        review_reply=ReviewRejectReply(
+                            review_id=first.review_request.review_id,
+                            operation="reject",
+                        ),
+                        reviewer=ReviewerIdentity(
+                            reviewer_id="reviewer_cross_thread",
+                            company_id="comp_mineracao_andes",
+                            permission="review",
+                        ),
+                    )
+            return (
+                first.review_request.review_id,
+                second.review_request.review_id,
+                stale.value.code,
+            )
+        finally:
+            await client_a.aclose()
+            await client_b.aclose()
+
+    first_id, second_id, code = asyncio.run(scenario())
+    assert first_id != second_id
+    assert code == "STALE_REVIEW"
 
 
 def test_pending_review_rejects_new_request_stale_id_and_wrong_company_then_rejects(
@@ -906,6 +1180,15 @@ def test_pending_review_rejects_new_request_stale_id_and_wrong_company_then_reje
     assert rejected.review_audit.operation.value == "reject"
     assert rejected.reviewed_draft is None
     assert len(requests) == 1
+    for field, value in (
+        ("message", "A revisão foi aprovada."),
+        ("evidence_ids", ["sha256:v1:" + "f" * 64]),
+        ("next_step", WriterNextStep.MONITOR.value),
+    ):
+        wire = json.loads(rejected.model_dump_json())
+        wire["final_result"][field] = value
+        with pytest.raises(ValidationError):
+            AgentState.model_validate(wire)
 
 
 def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
@@ -932,7 +1215,7 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
                     planner=Planner(planner_model),
                     writer=Writer(writer_model),
                 )
-                return await invoke_agent(
+                expired = await invoke_agent(
                     graph,
                     request=_request(),
                     runtime=runtime,
@@ -949,16 +1232,63 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
                         permission="review",
                     ),
                 )
+                replayed = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_review_boundaries",
+                    request_id="req_review_boundaries",
+                    execution_id="exec_expired_review_replay",
+                    review_reply=ReviewApproveReply(
+                        review_id=waiting.review_request.review_id,
+                        operation="approve",
+                    ),
+                    reviewer=ReviewerIdentity(
+                        reviewer_id="reviewer_not_recorded",
+                        company_id="comp_mineracao_andes",
+                        permission="review",
+                    ),
+                )
+                with pytest.raises(AgentInvocationProtocolError) as divergent:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=runtime,
+                        thread_id="thread_review_boundaries",
+                        request_id="req_review_boundaries",
+                        execution_id="exec_expired_review_divergent",
+                        review_reply=ReviewApproveReply(
+                            review_id=waiting.review_request.review_id,
+                            operation="approve",
+                        ),
+                        reviewer=ReviewerIdentity(
+                            reviewer_id="reviewer_other",
+                            company_id="comp_mineracao_andes",
+                            permission="review",
+                        ),
+                    )
+                return expired, replayed, divergent.value.code
         finally:
             await client.aclose()
 
-    expired = asyncio.run(scenario())
+    expired, replayed, divergent_code = asyncio.run(scenario())
     assert expired.final_result is not None
     assert expired.review_expiry is not None
     assert expired.review_expiry.expired_at == expired.review_request.expires_at
     assert expired.review_audit is None
     assert "reviewer_not_recorded" not in expired.model_dump_json()
+    assert replayed == expired
+    assert divergent_code == "DIVERGENT_REVIEW"
     assert len(requests) == 1
+    for field, value in (
+        ("message", "A revisão continua válida."),
+        ("evidence_ids", ["sha256:v1:" + "f" * 64]),
+        ("next_step", WriterNextStep.MONITOR.value),
+    ):
+        wire = json.loads(expired.model_dump_json())
+        wire["final_result"][field] = value
+        with pytest.raises(ValidationError):
+            AgentState.model_validate(wire)
 
 
 def test_human_edit_preserves_selected_order_and_releases_through_gate(
@@ -1005,16 +1335,71 @@ def test_human_edit_preserves_selected_order_and_releases_through_gate(
                         permission="review",
                     ),
                 )
-            return completed, selected
+                literal = ReviewEditReply(
+                    review_id=waiting.review_request.review_id,
+                    operation="edit",
+                    evidence_ids=selected,
+                    next_step=WriterNextStep.MONITOR,
+                )
+                replayed = await invoke_agent(
+                    graph,
+                    request=_request(),
+                    runtime=runtime,
+                    thread_id="thread_review_boundaries",
+                    request_id="req_review_boundaries",
+                    execution_id="exec_edit_review_replay",
+                    review_reply=literal,
+                    reviewer=ReviewerIdentity(
+                        reviewer_id="reviewer_01",
+                        company_id="comp_mineracao_andes",
+                        permission="review",
+                    ),
+                )
+                divergent_codes = []
+                for suffix, divergent_reply in (
+                    (
+                        "order",
+                        literal.model_copy(
+                            update={"evidence_ids": tuple(reversed(selected))}
+                        ),
+                    ),
+                    (
+                        "next",
+                        literal.model_copy(
+                            update={
+                                "next_step": WriterNextStep.REQUEST_HUMAN_DISPOSITION
+                            }
+                        ),
+                    ),
+                ):
+                    with pytest.raises(AgentInvocationProtocolError) as divergent:
+                        await invoke_agent(
+                            graph,
+                            request=_request(),
+                            runtime=runtime,
+                            thread_id="thread_review_boundaries",
+                            request_id="req_review_boundaries",
+                            execution_id=f"exec_edit_review_divergent_{suffix}",
+                            review_reply=divergent_reply,
+                            reviewer=ReviewerIdentity(
+                                reviewer_id="reviewer_01",
+                                company_id="comp_mineracao_andes",
+                                permission="review",
+                            ),
+                        )
+                    divergent_codes.append(divergent.value.code)
+            return completed, selected, replayed, divergent_codes
         finally:
             await client.aclose()
 
-    completed, selected = asyncio.run(scenario())
+    completed, selected, replayed, divergent_codes = asyncio.run(scenario())
     assert completed.reviewed_draft is not None
     assert completed.reviewed_draft.evidence_ids == selected
     assert completed.final_result is not None
     assert completed.final_result.evidence_ids == selected
     assert completed.release_gate.outcome is ReleaseGateOutcome.RELEASE
+    assert replayed == completed
+    assert divergent_codes == ["DIVERGENT_REVIEW", "DIVERGENT_REVIEW"]
     assert len(requests) == 1
 
 
@@ -1049,35 +1434,145 @@ def test_permission_revoked_before_regate_blocks_release_without_second_review(
                     planner=Planner(planner_model),
                     writer=Writer(writer_model),
                 )
-                completed = await invoke_agent(
-                    graph,
-                    request=_request(),
-                    runtime=revoked,
-                    thread_id="thread_review_boundaries",
-                    request_id="req_review_boundaries",
-                    execution_id="exec_revoked_review",
-                    review_reply=ReviewApproveReply(
-                        review_id=waiting.review_request.review_id,
-                        operation="approve",
-                    ),
-                    reviewer=ReviewerIdentity(
-                        reviewer_id="reviewer_01",
-                        company_id="comp_mineracao_andes",
-                        permission="review",
-                    ),
-                )
+                with pytest.raises(AgentInvocationProtocolError) as denied:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=revoked,
+                        thread_id="thread_review_boundaries",
+                        request_id="req_review_boundaries",
+                        execution_id="exec_revoked_review",
+                        review_reply=ReviewApproveReply(
+                            review_id=waiting.review_request.review_id,
+                            operation="approve",
+                        ),
+                        reviewer=ReviewerIdentity(
+                            reviewer_id="reviewer_01",
+                            company_id="comp_mineracao_andes",
+                            permission="review",
+                        ),
+                    )
+                with pytest.raises(AgentInvocationProtocolError) as replay_denied:
+                    await invoke_agent(
+                        graph,
+                        request=_request(),
+                        runtime=revoked,
+                        thread_id="thread_review_boundaries",
+                        request_id="req_review_boundaries",
+                        execution_id="exec_revoked_review_replay",
+                        review_reply=ReviewApproveReply(
+                            review_id=waiting.review_request.review_id,
+                            operation="approve",
+                        ),
+                        reviewer=ReviewerIdentity(
+                            reviewer_id="reviewer_01",
+                            company_id="comp_mineracao_andes",
+                            permission="review",
+                        ),
+                    )
                 snapshot = await graph.aget_state(
                     {"configurable": {"thread_id": "thread_review_boundaries"}}
                 )
-            return completed, snapshot
+            return (
+                denied.value.code,
+                replay_denied.value.code,
+                AgentState.model_validate(snapshot.values),
+                snapshot,
+            )
         finally:
             await runtime.client.aclose()
 
-    completed, snapshot = asyncio.run(scenario())
-    assert completed.release_gate.reason.value == "permission_incompatible"
-    assert completed.release_gate.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
-    assert completed.final_result is not None
-    assert completed.final_result.evidence_ids == ()
+    denial_code, replay_code, internal, snapshot = asyncio.run(scenario())
+    assert denial_code == "READ_PERMISSION_REQUIRED"
+    assert replay_code == "READ_PERMISSION_REQUIRED"
+    assert internal.release_gate.reason.value == "permission_incompatible"
+    assert internal.release_gate.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW
+    assert internal.final_result is not None
+    assert internal.final_result.evidence_ids == ()
+    assert snapshot.next == ()
+    assert snapshot.interrupts == ()
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("operation", ["edit", "reject", "expiry"])
+def test_review_boundary_without_read_never_returns_technical_state(
+    operation,
+    tmp_path,
+    monkeypatch,
+):
+    created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
+    requests: list[httpx.Request] = []
+
+    async def scenario():
+        path = tmp_path / f"review-no-read-{operation}.sqlite3"
+        waiting, runtime, client, planner_model, writer_model = (
+            await _start_human_review(path, requests)
+        )
+        assert waiting.review_request is not None
+        received_at = (
+            waiting.review_request.expires_at
+            if operation == "expiry"
+            else created_at + timedelta(minutes=1)
+        )
+        monkeypatch.setattr(entrypoint_module, "_utc_now", lambda: received_at)
+        revoked = ReadToolRuntime.create(
+            user_id="usr_pedro",
+            company_id="comp_mineracao_andes",
+            permissions=frozenset(),
+            central_asset_id="asset_G501",
+            client=client,
+        )
+        reply = (
+            ReviewEditReply(
+                review_id=waiting.review_request.review_id,
+                operation="edit",
+                evidence_ids=waiting.review_request.eligible_evidence_ids,
+                next_step=WriterNextStep.MONITOR,
+            )
+            if operation == "edit"
+            else ReviewRejectReply(
+                review_id=waiting.review_request.review_id,
+                operation="reject",
+            )
+        )
+        reviewer = ReviewerIdentity(
+            reviewer_id="reviewer_no_read",
+            company_id="comp_mineracao_andes",
+            permission="review",
+        )
+        try:
+            async with open_checkpointer(path) as saver:
+                graph = build_agent_graph(
+                    saver,
+                    planner=Planner(planner_model),
+                    writer=Writer(writer_model),
+                )
+                codes = []
+                for suffix in ("first", "replay"):
+                    with pytest.raises(AgentInvocationProtocolError) as denied:
+                        await invoke_agent(
+                            graph,
+                            request=_request(),
+                            runtime=revoked,
+                            thread_id="thread_review_boundaries",
+                            request_id="req_review_boundaries",
+                            execution_id=f"exec_no_read_{operation}_{suffix}",
+                            review_reply=reply,
+                            reviewer=reviewer,
+                        )
+                    codes.append(denied.value.code)
+                snapshot = await graph.aget_state(
+                    {"configurable": {"thread_id": "thread_review_boundaries"}}
+                )
+            return codes, AgentState.model_validate(snapshot.values), snapshot
+        finally:
+            await runtime.client.aclose()
+
+    codes, internal, snapshot = asyncio.run(scenario())
+    assert codes == ["READ_PERMISSION_REQUIRED", "READ_PERMISSION_REQUIRED"]
+    assert internal.final_result is not None
+    assert internal.final_result.evidence_ids == ()
     assert snapshot.next == ()
     assert snapshot.interrupts == ()
     assert len(requests) == 1
@@ -1210,7 +1705,7 @@ def test_planner_explicit_review_is_not_converted_to_guide_and_has_no_second_loo
     assert snapshot.interrupts == ()
 
 
-def test_crash_after_review_audit_replays_same_reply_into_gate_without_duplicate(
+def test_crash_after_review_audit_with_revoked_read_regates_without_duplicate(
     tmp_path,
     monkeypatch,
 ):
@@ -1273,27 +1768,44 @@ def test_crash_after_review_audit_replays_same_reply_into_gate_without_duplicate
                     planner=Planner(planner_model),
                     writer=Writer(writer_model),
                 )
-                completed = await invoke_agent(
-                    resumed_graph,
-                    request=_request(),
-                    runtime=runtime,
-                    thread_id="thread_review_boundaries",
-                    request_id="req_review_boundaries",
-                    execution_id="exec_replay_after_crash",
-                    review_reply=reply,
-                    reviewer=reviewer,
+                revoked = ReadToolRuntime.create(
+                    user_id="usr_pedro",
+                    company_id="comp_mineracao_andes",
+                    permissions=frozenset(),
+                    central_asset_id="asset_G501",
+                    client=client,
                 )
-            return audited, snapshot, completed
+                with pytest.raises(AgentInvocationProtocolError) as denied:
+                    await invoke_agent(
+                        resumed_graph,
+                        request=_request(),
+                        runtime=revoked,
+                        thread_id="thread_review_boundaries",
+                        request_id="req_review_boundaries",
+                        execution_id="exec_replay_after_crash",
+                        review_reply=reply,
+                        reviewer=reviewer,
+                    )
+                completed_snapshot = await resumed_graph.aget_state(
+                    {"configurable": {"thread_id": "thread_review_boundaries"}}
+                )
+            return (
+                audited,
+                snapshot,
+                AgentState.model_validate(completed_snapshot.values),
+                denied.value.code,
+            )
         finally:
             await client.aclose()
 
-    audited, snapshot, completed = asyncio.run(scenario())
+    audited, snapshot, completed, denial_code = asyncio.run(scenario())
     assert audited.final_result is None
     assert audited.review_audit is not None
     assert snapshot.next == ("release_gate",)
     assert completed.final_result is not None
     assert completed.review_audit == audited.review_audit
-    assert completed.release_gate.outcome is ReleaseGateOutcome.RELEASE
+    assert completed.release_gate.reason is ReleaseGateReason.PERMISSION_INCOMPATIBLE
+    assert denial_code == "READ_PERMISSION_REQUIRED"
     assert len(requests) == 1
 
 

@@ -1030,7 +1030,7 @@ def test_planner_direct_write_reserves_writer_repair_and_gate_budget():
                     thread_id="thread_planner_budget_rejected",
                     request_id="req_planner_budget_rejected",
                     execution_id="exec_planner_budget_rejected",
-                    step_limit=7,
+                    step_limit=9,
                     proposal=proposal,
                     original_approval=approval,
                 )
@@ -1042,7 +1042,7 @@ def test_planner_direct_write_reserves_writer_repair_and_gate_budget():
                 thread_id="thread_planner_budget_accepted",
                 request_id="req_planner_budget_accepted",
                 execution_id="exec_planner_budget_accepted",
-                step_limit=8,
+                step_limit=10,
                 proposal=proposal,
                 original_approval=approval,
             )
@@ -1053,7 +1053,7 @@ def test_planner_direct_write_reserves_writer_repair_and_gate_budget():
     assert error.code == "STEP_LIMIT_EXHAUSTED"
     assert rejected.state_config is not None
     assert rejected.invoke_config is None
-    assert accepted.step_limit == 8
+    assert accepted.step_limit == 10
 
 
 @pytest.mark.parametrize(

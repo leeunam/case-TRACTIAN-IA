@@ -448,10 +448,14 @@ um próximo passo enumerado, inclusive reconstruir o draft após duas falhas do
 writer, mas sempre volta ao mesmo gate; se continuar bloqueada, encerra com
 aviso seguro e não abre uma segunda revisão.
 
-**Evidência de aceite (02/09/2026):** `make test` passou com 99 testes da API e
-1.646 do agente; os 235 fluxos de escrita passaram separadamente, assim como
+**Evidência de aceite (03/09/2026):** `make test` passou com 99 testes da API e
+1.658 do agente; os 235 fluxos de escrita passaram separadamente, assim como
 Ruff e `uv lock --check --offline`. A retomada com SQLite reaberto preservou
-planner, writer, tools e ações já concluídos sem nova chamada.
+planner, writer, tools e ações já concluídos sem nova chamada. Testes adversariais
+adicionais cobrem perda de `read` em todas as operações e replay, terminais
+canônicos, base/auditoria adulteradas, drift de permissão, edição sem fatos para
+pedido de informação, coerções, orçamento, concorrência e isolamento entre
+threads.
 
 ## Fase 10 — Logfire
 
