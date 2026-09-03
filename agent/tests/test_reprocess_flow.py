@@ -22,6 +22,7 @@ from tractian_agent.contracts import (
 )
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
 from tractian_agent.graph import build_agent_graph
+from tractian_agent.observability import RecordingTelemetry, SpanName
 from tractian_agent.state import AgentDecision, AgentState, ThreadScope
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.write_contracts import (
@@ -198,6 +199,7 @@ def test_policy_deny_finishes_in_two_steps_without_interrupt_key_or_http(
     tmp_path: Path,
 ):
     requests: list[httpx.Request] = []
+    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
 
     async def scenario():
         runtime = _runtime(
@@ -206,7 +208,7 @@ def test_policy_deny_finishes_in_two_steps_without_interrupt_key_or_http(
         )
         try:
             async with open_checkpointer(tmp_path / "checkpoints.sqlite3") as saver:
-                graph = build_agent_graph(saver)
+                graph = build_agent_graph(saver, telemetry=telemetry)
                 state = await invoke_agent(
                     graph,
                     request=_request(),
@@ -230,6 +232,14 @@ def test_policy_deny_finishes_in_two_steps_without_interrupt_key_or_http(
     assert state.intents[0].idempotency_key is None
     assert snapshot.interrupts == ()
     assert requests == []
+    policy_span = next(span for span in telemetry.spans if span.name is SpanName.POLICY)
+    assert dict(policy_span.attributes)["outcome"] == "denied"
+    assert dict(policy_span.attributes)["error_code"] == "policy_blocked"
+    response_span = next(
+        span for span in telemetry.spans if span.name is SpanName.RESPONSE
+    )
+    assert dict(response_span.attributes)["outcome"] == "denied"
+    assert dict(response_span.attributes)["error_code"] == "policy_blocked"
 
 
 def test_missing_approval_interrupts_with_persisted_intent_and_safe_prompt(
@@ -301,6 +311,7 @@ def test_confirmation_resume_approves_with_trusted_scope_and_completes(
                     execution_id="exec_reprocess_waiting",
                     proposal=_proposal(),
                 )
+
                 async def forbidden_update(*args, **kwargs):
                     raise AssertionError(
                         "snapshot interrompido não pode usar aupdate_state"
@@ -332,9 +343,7 @@ def test_confirmation_resume_approves_with_trusted_scope_and_completes(
     assert completed.approval.source is ApprovalSource.CONFIRMATION
     assert completed.approval.target_id == "an_9901"
     assert completed.intents[0].status is IntentStatus.COMPLETED
-    assert (
-        completed.intents[0].approval_source is ApprovalSource.CONFIRMATION
-    )
+    assert completed.intents[0].approval_source is ApprovalSource.CONFIRMATION
     assert len(requests) == 2
 
 
@@ -357,12 +366,8 @@ def test_write_boundary_fails_before_first_checkpoint(
     async def scenario():
         write_runtime = _runtime(
             lambda request: requests.append(request),
-            central_asset_id=(
-                "asset_other" if boundary == "asset" else "asset_M101"
-            ),
-            current_case_id=(
-                "case_other" if boundary == "case" else "case_tkt_exe_12"
-            ),
+            central_asset_id=("asset_other" if boundary == "asset" else "asset_M101"),
+            current_case_id=("case_other" if boundary == "case" else "case_tkt_exe_12"),
         )
         runtime: ReadToolRuntime = write_runtime
         if boundary == "runtime":
@@ -390,11 +395,7 @@ def test_write_boundary_fails_before_first_checkpoint(
                         proposal=_proposal(),
                     )
                 snapshot = await graph.aget_state(
-                    {
-                        "configurable": {
-                            "thread_id": f"thread_boundary_{boundary}"
-                        }
-                    }
+                    {"configurable": {"thread_id": f"thread_boundary_{boundary}"}}
                 )
                 return error.value, snapshot
         finally:
@@ -433,11 +434,7 @@ def test_original_approval_rejects_confirmation_source_before_checkpoint(
                         ),
                     )
                 snapshot = await graph.aget_state(
-                    {
-                        "configurable": {
-                            "thread_id": "thread_invalid_original_source"
-                        }
-                    }
+                    {"configurable": {"thread_id": "thread_invalid_original_source"}}
                 )
                 return error.value, snapshot
         finally:
@@ -650,9 +647,7 @@ def test_invalid_confirmation_shapes_fail_before_mutation_or_http(
                     execution_id="exec_reprocess_waiting",
                     proposal=_proposal(),
                 )
-                config = {
-                    "configurable": {"thread_id": f"thread_reprocess_{mode}"}
-                }
+                config = {"configurable": {"thread_id": f"thread_reprocess_{mode}"}}
                 before = await graph.aget_state(config)
                 if mode == "multiple":
                     original_get_state = graph.aget_state
@@ -810,9 +805,7 @@ def test_terminal_replay_rejects_write_scope_drift_before_return(
                     original_approval=_approval(),
                 )
                 config = {
-                    "configurable": {
-                        "thread_id": f"thread_terminal_drift_{drift}"
-                    }
+                    "configurable": {"thread_id": f"thread_terminal_drift_{drift}"}
                 }
                 before = await graph.aget_state(config)
                 replay_proposal = _proposal()
@@ -886,9 +879,7 @@ def test_terminal_confirmation_replay_rejects_opposite_consumed_decision(
                         decision="approve",
                     ),
                 )
-                config = {
-                    "configurable": {"thread_id": "thread_terminal_opposite"}
-                }
+                config = {"configurable": {"thread_id": "thread_terminal_opposite"}}
                 before = await graph.aget_state(config)
                 with pytest.raises(AgentInvocationProtocolError) as error:
                     await invoke_agent(
@@ -1121,23 +1112,21 @@ def test_active_legacy_intent_blocks_write_without_adoption_or_http(tmp_path: Pa
             async with open_checkpointer(tmp_path / "checkpoints.sqlite3") as saver:
                 graph = build_agent_graph(saver)
                 initial = AgentState(
-                        request=_request(),
-                        identity=runtime.identity,
-                        permissions=runtime.permissions,
-                        request_id="req_legacy_seed",
+                    request=_request(),
+                    identity=runtime.identity,
+                    permissions=runtime.permissions,
+                    request_id="req_legacy_seed",
+                    thread_id="thread_legacy_active",
+                    execution_id="exec_legacy_seed",
+                    thread_scope=ThreadScope(
                         thread_id="thread_legacy_active",
-                        execution_id="exec_legacy_seed",
-                        thread_scope=ThreadScope(
-                            thread_id="thread_legacy_active",
-                            case_id="case_tkt_exe_12",
-                            company_id="comp_forja_br",
-                            user_id="usr_ana",
-                        ),
-                        trusted_write_context=_trusted_context(),
-                        step_limit=3,
-                        intents=(
-                            _legacy_intent(IntentStatus.AWAITING_CONFIRMATION),
-                        ),
+                        case_id="case_tkt_exe_12",
+                        company_id="comp_forja_br",
+                        user_id="usr_ana",
+                    ),
+                    trusted_write_context=_trusted_context(),
+                    step_limit=3,
+                    intents=(_legacy_intent(IntentStatus.AWAITING_CONFIRMATION),),
                 )
                 await graph.ainvoke(
                     initial.model_dump(mode="json"),
@@ -1238,9 +1227,7 @@ def test_historical_write_request_id_cannot_create_a_second_intent(
                         proposal=_proposal(),
                         original_approval=_approval(),
                     )
-                config = {
-                    "configurable": {"thread_id": "thread_historical_request"}
-                }
+                config = {"configurable": {"thread_id": "thread_historical_request"}}
                 before = await graph.aget_state(config)
                 with pytest.raises(AgentInvocationProtocolError) as error:
                     await invoke_agent(
@@ -1374,9 +1361,7 @@ def _receipt(*, accepted: bool = True) -> ActionReceipt:
         accepted=accepted,
         action_id="act_matrix_01",
         message=(
-            "Reprocesso aceito."
-            if accepted
-            else "Reprocesso recusado pela plataforma."
+            "Reprocesso aceito." if accepted else "Reprocesso recusado pela plataforma."
         ),
     )
 
@@ -1530,7 +1515,9 @@ def test_reprocess_result_matrix_uses_at_most_one_same_key_retry(
     assert observed_keys == [intent.idempotency_key] * expected_attempts
     assert pending_results == []
     if intent.status is IntentStatus.COMPLETED:
-        evidence = [item for item in state.ledger.items if item.intent_id == intent.intent_id]
+        evidence = [
+            item for item in state.ledger.items if item.intent_id == intent.intent_id
+        ]
         assert len(evidence) == 1
         assert evidence[0].value.to_python() is True
     else:
@@ -1633,9 +1620,9 @@ def test_reprocess_malformed_http_response_uses_status_before_category(
     assert len(get_requests) == expected_attempts
     assert len(post_requests) == expected_attempts
     assert len(requests) == expected_attempts * 2
-    assert {
-        request.headers["idempotency-key"] for request in post_requests
-    } == {intent.idempotency_key}
+    assert {request.headers["idempotency-key"] for request in post_requests} == {
+        intent.idempotency_key
+    }
 
 
 def test_prepared_checkpoint_is_observable_before_operation_http(
@@ -1659,11 +1646,7 @@ def test_prepared_checkpoint_is_observable_before_operation_http(
                     idempotency_key,
                 ):
                     snapshot = await graph.aget_state(
-                        {
-                            "configurable": {
-                                "thread_id": "thread_prepared_observable"
-                            }
-                        }
+                        {"configurable": {"thread_id": "thread_prepared_observable"}}
                     )
                     observed.append(AgentState.model_validate(snapshot.values))
                     return await original_execute(
@@ -1730,9 +1713,7 @@ def test_pre_dispatch_integrity_mismatch_fails_with_zero_http(
         request_id="req_integrity",
         scope=scope,
         payload_hash=(
-            "sha256:v1:" + "b" * 64
-            if mismatch == "hash"
-            else _expected_payload_hash()
+            "sha256:v1:" + "b" * 64 if mismatch == "hash" else _expected_payload_hash()
         ),
         decision=WritePolicyResult(
             decision=PolicyDecision.ALLOW,
@@ -1828,9 +1809,7 @@ def test_same_execution_authorization_change_fails_before_operation(
         request=_request(),
         identity=runtime.identity,
         permissions=(
-            frozenset({"read"})
-            if change == "permission"
-            else runtime.permissions
+            frozenset({"read"}) if change == "permission" else runtime.permissions
         ),
         request_id="req_authorization_same_execution",
         thread_id="thread_authorization_same_execution",
@@ -1970,7 +1949,9 @@ def test_remote_commit_with_lost_response_retries_same_key_and_single_action(
             },
         )
         if len(posts) == 1:
-            raise httpx.ReadTimeout("resposta perdida depois do commit", request=request)
+            raise httpx.ReadTimeout(
+                "resposta perdida depois do commit", request=request
+            )
         return httpx.Response(200, json=receipt)
 
     async def scenario():
@@ -2122,11 +2103,7 @@ def test_restart_after_prepared_reuses_the_exact_persisted_key(
                 before = AgentState.model_validate(
                     (
                         await graph.aget_state(
-                            {
-                                "configurable": {
-                                    "thread_id": "thread_restart_prepared"
-                                }
-                            }
+                            {"configurable": {"thread_id": "thread_restart_prepared"}}
                         )
                     ).values
                 )
@@ -2199,9 +2176,7 @@ def test_prepared_resume_rejects_read_only_runtime_before_mutation(
                         proposal=_proposal(),
                         original_approval=_approval(),
                     )
-                config = {
-                    "configurable": {"thread_id": "thread_prepared_read_runtime"}
-                }
+                config = {"configurable": {"thread_id": "thread_prepared_read_runtime"}}
                 before = await graph.aget_state(config)
                 with pytest.raises(AgentInvocationProtocolError) as error:
                     await invoke_agent(
@@ -2321,11 +2296,7 @@ def test_expired_key_after_restart_is_uncertain_without_new_key_or_operation(
                 prepared = AgentState.model_validate(
                     (
                         await graph.aget_state(
-                            {
-                                "configurable": {
-                                    "thread_id": "thread_expired_restart"
-                                }
-                            }
+                            {"configurable": {"thread_id": "thread_expired_restart"}}
                         )
                     ).values
                 )
@@ -2405,9 +2376,8 @@ def test_terminal_checkpoint_failure_restarts_from_prepared_and_replays_receipt(
                     new_versions,
                 ):
                     nonlocal terminal_put_failed
-                    if (
-                        IntentStatus.COMPLETED.value
-                        in _checkpoint_intent_statuses(checkpoint)
+                    if IntentStatus.COMPLETED.value in _checkpoint_intent_statuses(
+                        checkpoint
                     ):
                         terminal_put_failed = True
                         raise RuntimeError("falha injetada no checkpoint terminal")
@@ -2425,10 +2395,7 @@ def test_terminal_checkpoint_failure_restarts_from_prepared_and_replays_receipt(
                     task_path="",
                 ):
                     nonlocal terminal_put_failed
-                    if (
-                        IntentStatus.COMPLETED.value
-                        in _write_intent_statuses(writes)
-                    ):
+                    if IntentStatus.COMPLETED.value in _write_intent_statuses(writes):
                         terminal_put_failed = True
                         raise RuntimeError("falha injetada no checkpoint terminal")
                     return await original_put_writes(
@@ -2459,9 +2426,7 @@ def test_terminal_checkpoint_failure_restarts_from_prepared_and_replays_receipt(
                         await reopened_graph.aget_state(
                             {
                                 "configurable": {
-                                    "thread_id": (
-                                        "thread_terminal_checkpoint_failure"
-                                    )
+                                    "thread_id": ("thread_terminal_checkpoint_failure")
                                 }
                             }
                         )

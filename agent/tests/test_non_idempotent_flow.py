@@ -22,6 +22,7 @@ from tractian_agent.contracts import (
 )
 from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
 from tractian_agent.graph import build_agent_graph
+from tractian_agent.observability import RecordingTelemetry, SpanName
 from tractian_agent.state import AgentDecision, AgentState, ThreadScope
 from tractian_agent.tools.runtime import ReadToolRuntime, WriteToolRuntime
 from tractian_agent.write_contracts import (
@@ -209,9 +210,7 @@ def _runtime(
         user_id="usr_ana",
         company_id="comp_forja_br",
         permissions=(
-            frozenset({"read", case.permission})
-            if permissions is None
-            else permissions
+            frozenset({"read", case.permission}) if permissions is None else permissions
         ),
         central_asset_id=central_asset_id,
         current_case_id=current_case_id,
@@ -275,9 +274,7 @@ def _checkpoint_intent_statuses(checkpoint: dict[str, object]) -> set[str]:
         return set()
     raw_intents = channel_values.get("intents", ())
     return {
-        intent.status.value
-        if isinstance(intent, WriteIntent)
-        else intent["status"]
+        intent.status.value if isinstance(intent, WriteIntent) else intent["status"]
         for intent in raw_intents
         if isinstance(intent, WriteIntent)
         or (isinstance(intent, dict) and isinstance(intent.get("status"), str))
@@ -565,9 +562,7 @@ def test_interrupt_approve_uses_persisted_scope_and_flat_prompt(
     assert completed.approval.target_id == case.target_id
     assert completed.approval.material_parameters == case.approval.material_parameters
     assert completed.intents[0].status is IntentStatus.COMPLETED
-    assert (
-        completed.intents[0].approval_source is ApprovalSource.CONFIRMATION
-    )
+    assert completed.intents[0].approval_source is ApprovalSource.CONFIRMATION
 
 
 @pytest.mark.parametrize("case", ACTION_CASES, ids=lambda case: case.slug)
@@ -796,9 +791,9 @@ def test_non_idempotent_malformed_http_response_never_retries(
     assert len(requests) == expected_gets + 1
     assert sum(request.method == "GET" for request in requests) == expected_gets
     assert "idempotency-key" not in write_requests[0].headers
-    assert (
-        state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
-    ) is (expected_status is IntentStatus.UNCERTAIN)
+    assert (state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW) is (
+        expected_status is IntentStatus.UNCERTAIN
+    )
 
 
 @pytest.mark.parametrize("case", ACTION_CASES, ids=lambda case: case.slug)
@@ -822,11 +817,7 @@ def test_prepared_checkpoint_is_observable_without_key_before_operation(
 
                 async def inspect_prepared(proposal, operation_runtime):
                     snapshot = await graph.aget_state(
-                        {
-                            "configurable": {
-                                "thread_id": f"thread_prepared_{case.slug}"
-                            }
-                        }
+                        {"configurable": {"thread_id": f"thread_prepared_{case.slug}"}}
                     )
                     observed.append(AgentState.model_validate(snapshot.values))
                     return ActionReceipt(
@@ -981,12 +972,15 @@ def test_same_execution_revalidation_fails_before_operation_with_real_checkpoint
     assert intent.status is IntentStatus.FAILED
     assert intent.attempts == 0
     assert intent.error is not None
-    assert intent.error.code == {
-        "permission": "AUTHORIZATION_CHANGED_BEFORE_DISPATCH",
-        "approval": "AUTHORIZATION_CHANGED_BEFORE_DISPATCH",
-        "scope": "INTENT_SCOPE_MISMATCH",
-        "hash": "PAYLOAD_HASH_MISMATCH",
-    }[drift]
+    assert (
+        intent.error.code
+        == {
+            "permission": "AUTHORIZATION_CHANGED_BEFORE_DISPATCH",
+            "approval": "AUTHORIZATION_CHANGED_BEFORE_DISPATCH",
+            "scope": "INTENT_SCOPE_MISMATCH",
+            "hash": "PAYLOAD_HASH_MISMATCH",
+        }[drift]
+    )
     assert state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
     assert requests == []
 
@@ -1339,8 +1333,7 @@ def test_public_reopen_reaches_the_conservative_guard_despite_runtime_drift(
     assert uncertain.intents[0].attempts == 0
     assert uncertain.intents[0].error is not None
     assert (
-        uncertain.intents[0].error.code
-        == "NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME"
+        uncertain.intents[0].error.code == "NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME"
     )
     assert operation_calls == 1
 
@@ -1423,9 +1416,8 @@ def test_terminal_checkpoint_failure_restarts_uncertain_without_second_effect(
                     new_versions,
                 ):
                     nonlocal terminal_failed
-                    if (
-                        IntentStatus.COMPLETED.value
-                        in _checkpoint_intent_statuses(checkpoint)
+                    if IntentStatus.COMPLETED.value in _checkpoint_intent_statuses(
+                        checkpoint
                     ):
                         terminal_failed = True
                         raise RuntimeError("falha injetada no checkpoint terminal")
@@ -1443,10 +1435,7 @@ def test_terminal_checkpoint_failure_restarts_uncertain_without_second_effect(
                     task_path="",
                 ):
                     nonlocal terminal_failed
-                    if (
-                        IntentStatus.COMPLETED.value
-                        in _write_intent_statuses(writes)
-                    ):
+                    if IntentStatus.COMPLETED.value in _write_intent_statuses(writes):
                         terminal_failed = True
                         raise RuntimeError("falha injetada no checkpoint terminal")
                     return await original_put_writes(
@@ -1503,8 +1492,7 @@ def test_terminal_checkpoint_failure_restarts_uncertain_without_second_effect(
     assert uncertain.intents[0].attempts == 0
     assert uncertain.intents[0].error is not None
     assert (
-        uncertain.intents[0].error.code
-        == "NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME"
+        uncertain.intents[0].error.code == "NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME"
     )
     assert uncertain.review is None
     assert len(_write_requests(requests, case)) == 1
@@ -1528,6 +1516,7 @@ def test_specialist_preflight_error_counts_one_operation_and_zero_post(
 ):
     case = ACTION_CASES[0]
     requests: list[httpx.Request] = []
+    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -1557,8 +1546,8 @@ def test_specialist_preflight_error_counts_one_operation_and_zero_post(
             async with open_checkpointer(
                 tmp_path / f"checkpoints-{preflight_result}.sqlite3"
             ) as saver:
-                return await invoke_agent(
-                    build_agent_graph(saver),
+                state = await invoke_agent(
+                    build_agent_graph(saver, telemetry=telemetry),
                     request=_request(),
                     runtime=runtime,
                     thread_id=f"thread_preflight_{preflight_result}",
@@ -1567,16 +1556,32 @@ def test_specialist_preflight_error_counts_one_operation_and_zero_post(
                     proposal=case.proposal,
                     original_approval=case.approval,
                 )
+                return state, telemetry
         finally:
             await runtime.client.aclose()
 
-    state = asyncio.run(scenario())
+    state, telemetry = asyncio.run(scenario())
     intent = state.intents[0]
 
     assert intent.status is expected_status
     assert intent.attempts == 1
     assert _write_requests(requests, case) == []
     assert len(requests) == (0 if preflight_result == "missing_read" else 1)
+    assert not any(span.name is SpanName.ACTION for span in telemetry.spans)
+    execute_node = next(
+        span
+        for span in telemetry.spans
+        if span.name is SpanName.NODE
+        and dict(span.attributes)["node"] == "execute_action"
+    )
+    expected_outcome = (
+        "uncertain" if expected_status is IntentStatus.UNCERTAIN else "error"
+    )
+    assert dict(execute_node.attributes)["outcome"] == expected_outcome
+    assert dict(execute_node.attributes)["error_code"] == "action_error"
+    response = next(span for span in telemetry.spans if span.name is SpanName.RESPONSE)
+    assert dict(response.attributes)["outcome"] == expected_outcome
+    assert dict(response.attributes)["error_code"] == "action_error"
 
 
 @pytest.mark.parametrize("case", ACTION_CASES, ids=lambda case: case.slug)
@@ -1702,12 +1707,8 @@ def test_runtime_scope_drift_fails_at_boundary_before_checkpoint(
         runtime = _runtime(
             lambda request: requests.append(request),
             case,
-            current_case_id=(
-                "case_other" if boundary == "case" else "case_tkt_exe_12"
-            ),
-            central_asset_id=(
-                "asset_other" if boundary == "asset" else "asset_M101"
-            ),
+            current_case_id=("case_other" if boundary == "case" else "case_tkt_exe_12"),
+            central_asset_id=("asset_other" if boundary == "asset" else "asset_M101"),
         )
         try:
             async with open_checkpointer(
@@ -2070,9 +2071,7 @@ def test_policy_deny_without_interrupt_is_not_confirmation_replay(
                             runtime=runtime,
                             thread_id=f"thread_policy_deny_{case.slug}",
                             request_id=f"req_policy_deny_{case.slug}",
-                            execution_id=(
-                                f"exec_policy_deny_{case.slug}_{decision}"
-                            ),
+                            execution_id=(f"exec_policy_deny_{case.slug}_{decision}"),
                             confirmation=ConfirmationReply(
                                 intent_id=denied.intents[0].intent_id,
                                 decision=decision,

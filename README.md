@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável e checkpointer SQLite de desenvolvimento. Em 03/09/2026, `make test` passou com 99 testes da API e 1.689 do agente (1.788 no total); permanece somente o `PendingDeprecationWarning` conhecido de `python_multipart`. As Fases 1 a 9 estão concluídas. O grafo atual ainda não é um agente de produção: Logfire e runner Pydantic Evals continuam planejados em [`TASKS.md`](./TASKS.md).
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável, checkpointer SQLite de desenvolvimento e fachada manual Logfire opt-in. As Fases 1 a 10 estão concluídas. O runner Pydantic Evals continua planejado em [`TASKS.md`](./TASKS.md), portanto o grafo ainda não é um agente de produção.
 
 ## Problema
 
@@ -85,7 +85,62 @@ permanece imutável durante drift de permissão; um contrato estrito derivado
 distingue a continuação anterior ao julgamento daquela posterior à auditoria e
 é removido depois do segundo gate.
 
-O **ledger de evidências** associa fatos às fontes consultadas no estado da execução. Ele recebe somente observações de leitura validadas e recibos tipados de intenções terminais; texto livre de LLM, proposals e mensagens de recibo não viram fatos. O Logfire receberá traces e métricas para consulta humana e operação; ele não será o banco principal do ledger nem uma fonte que o agente consulta durante o atendimento. Logfire ainda não está implementado.
+O **ledger de evidências** associa fatos às fontes consultadas no estado da execução. Ele recebe somente observações de leitura validadas e recibos tipados de intenções terminais; texto livre de LLM, proposals e mensagens de recibo não viram fatos. A telemetria Logfire serve apenas à consulta humana e à operação; não é o banco principal do ledger nem uma fonte consultada pelo agente.
+
+### Observabilidade manual e opt-in
+
+`build_agent_graph(..., telemetry=...)` recebe uma fachada injetável. Sem
+configuração explícita, `NullTelemetry` é usada e não importa nem configura o
+SDK. `invoke_agent` mantém o retorno histórico `AgentState`, enquanto
+`invoke_agent_observed` devolve esse mesmo estado com um `trace_id` opaco no
+envelope. O ID técnico nunca entra no estado, no resultado final ou no SQLite.
+
+A exportação requer simultaneamente:
+
+- `TRACTIAN_LOGFIRE_ENABLED=true`, exatamente em minúsculas;
+- um único `LOGFIRE_TOKEN`, sem espaços ou vírgulas e com até 4 KiB;
+- `TRACTIAN_LOGFIRE_PSEUDONYM_KEY` com 32 bytes a 4 KiB em UTF-8.
+
+Ausência ou formato local inválido mantém a fachada nula antes de carregar o
+SDK. Os três valores são copiados uma única vez e a configuração usa exatamente
+esse snapshot, inclusive quando a origem é um `Mapping` mutável. Revogação
+remota do token não pode ser validada offline. O SDK é configurado uma vez na
+construção e somente spans manuais são permitidos. Antes de importar qualquer
+modelo, o pacote acrescenta `logfire-plugin` a `PYDANTIC_DISABLE_PLUGINS`
+(preservando plugins existentes e os sentinelas globais), de modo que
+LangChain/LangGraph, HTTPX, FastAPI e Pydantic não sejam auto-instrumentados.
+
+Os nomes exportáveis são fixos: `tractian.agent.request`, `node`, `planner`,
+`writer`, `tool`, `policy`, `action`, `gate`, `review`, `response` e
+`evaluation`, todos sob o prefixo `tractian.agent.`. Atributos aceitam apenas
+versão, enums/flags/contadores fechados, nomes de catálogo, `trace_id` e
+referências HMAC. IDs literais, mensagens, argumentos, retornos, evidências,
+targets, URLs, payloads, segredos e exceções não entram na telemetria. Métricas
+usam somente `stage`, `outcome`, `error_code`, `planner_enabled` e `replayed`;
+nenhum ID é label. O runtime emite zero spans de avaliação; a operação tipada
+existe apenas para o futuro runner da Fase 11.
+
+O span `action` começa somente quando um `POST` ou `PATCH` modificador é
+despachado. Leituras de preflight não criam tentativa, e uma nova tentativa só
+existe se um novo modificador alcançar o transporte. Falhas da fachada, do SDK,
+de spans ou de métricas são isoladas inclusive quando levantam `BaseException`;
+cancelamentos e exceções originados pelo negócio continuam sendo propagados com
+a mesma identidade e traceback.
+
+A retenção inicial de 30 dias e os limites de volume/cardinalidade são controles
+operacionais externos da conta Logfire: devem ser configurados e monitorados
+fora deste runtime. O código limita token/chave, contratos e labels, mas não
+afirma controlar retenção do backend. Rotacionar a chave quebra deliberadamente
+a correlação histórica dos pseudônimos.
+
+O aceite integrado percorreu consulta completa, ledger, writer e gate; leituras
+parciais, conflitantes, obsoletas e com falha; revisão humana após reabertura do
+SQLite; cinco escritas, retry e replay; e exportação real em memória pelo SDK.
+Subprocessos limpos provaram que o caminho padrão não carrega o Logfire nem o
+plugin Pydantic. O span de resposta registra somente a decisão fechada e o
+resultado operacional. A matriz focada passou com 71 testes, os fluxos de
+escrita com 235 e `make test` com 99 testes da API e 1.759 do agente. O único
+warning é a depreciação pendente já conhecida de `python_multipart` no Starlette.
 
 ### Persistência e idempotência
 
@@ -253,7 +308,7 @@ Prompt curto recomendado:
 
 ## Limitações atuais
 
-- Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, revisão humana retomável, fluxos de escrita e checkpointer. Ele ainda não possui Logfire nem runner Pydantic Evals; portanto não é um agente de produção.
+- Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, revisão humana retomável, fluxos de escrita, checkpointer e telemetria manual Logfire opt-in. Ele ainda não possui runner Pydantic Evals; portanto não é um agente de produção.
 - As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
 - O simulador não representa todas as garantias transacionais de produção.
 - As rotas de ação do simulador devolvem recibos, mas não alteram os recursos Parquet; um novo GET não comprova a mutação solicitada.

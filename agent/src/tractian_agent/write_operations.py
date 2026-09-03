@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
@@ -12,6 +13,15 @@ from tractian_agent.contracts import (
     ApiErrorCategory,
     IdempotencyKey,
     StrictModel,
+)
+from tractian_agent.observability import (
+    ActionSpanAttributes,
+    ErrorCode,
+    Outcome,
+    SpanName,
+    current_action_attempt,
+    current_execution_trace,
+    span_fail_open,
 )
 from tractian_agent.tools.analyses import (
     AnalysisScopeValidationError,
@@ -90,24 +100,50 @@ async def _request_action(
     runtime: WriteToolRuntime,
     idempotency_key: IdempotencyKey | None = None,
 ) -> ActionReceipt | ApiError:
-    result = await runtime.client.request_json(
-        method,
-        path,
-        response_model=ActionReceipt,
-        identity=runtime.identity,
-        body=body,
-        idempotency_key=idempotency_key,
-    )
-    if isinstance(result, ApiError):
-        return result
-    if isinstance(result.data, ActionReceipt):
-        return result.data
-    return ApiError(
-        category=ApiErrorCategory.INVALID_RESPONSE,
-        code="INVALID_SCHEMA_RESPONSE",
-        message="A resposta da API não corresponde ao contrato esperado.",
-        status_code=result.status_code,
-    )
+    trace = current_execution_trace()
+    attempt = current_action_attempt()
+
+    async def dispatch() -> ActionReceipt | ApiError:
+        result = await runtime.client.request_json(
+            method,
+            path,
+            response_model=ActionReceipt,
+            identity=runtime.identity,
+            body=body,
+            idempotency_key=idempotency_key,
+        )
+        if isinstance(result, ApiError):
+            return result
+        if isinstance(result.data, ActionReceipt):
+            return result.data
+        return ApiError(
+            category=ApiErrorCategory.INVALID_RESPONSE,
+            code="INVALID_SCHEMA_RESPONSE",
+            message="A resposta da API não corresponde ao contrato esperado.",
+            status_code=result.status_code,
+        )
+
+    if trace is None or attempt is None:
+        return await dispatch()
+    action, ordinal = attempt
+    with span_fail_open(
+        trace,
+        SpanName.ACTION,
+        ActionSpanAttributes(action=action, attempt=ordinal),
+    ) as action_span:
+        try:
+            outcome = await dispatch()
+        except BaseException as error:
+            if isinstance(error, asyncio.CancelledError):
+                action_span.finish(Outcome.CANCELLED, ErrorCode.CANCELLED)
+            else:
+                action_span.finish(Outcome.ERROR, ErrorCode.ACTION)
+            raise
+        if isinstance(outcome, ApiError):
+            action_span.finish(Outcome.ERROR, ErrorCode.ACTION)
+        elif not outcome.accepted:
+            action_span.finish(Outcome.DENIED, ErrorCode.ACTION)
+        return outcome
 
 
 async def execute_reprocess_analysis(
