@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 import json
+import os
 import re
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +23,6 @@ from tractian_agent.entrypoint import (
     invoke_agent_observed,
 )
 from tractian_agent.graph import build_agent_graph
-from tractian_agent.graph import _observed_action_dispatch
 
 from tractian_agent.observability import (
     ActionName,
@@ -38,16 +41,20 @@ from tractian_agent.observability import (
     ResponseSpanAttributes,
     SpanName,
     TraceId,
+    bind_action_attempt,
     build_agent_telemetry,
     current_execution_trace,
 )
 from tractian_agent.tools.runtime import ReadToolRuntime
 from tractian_agent.tools.runtime import WriteToolRuntime
+from tractian_agent.state import AgentState
 from tractian_agent.write_policy import (
     ApprovalSource,
     ReprocessProposal,
     TrustedActionApproval,
+    UpdateAssetCriticalityProposal,
 )
+from tractian_agent.write_operations import execute_update_asset_criticality
 
 
 def test_trace_id_and_hmac_references_are_opaque_and_domain_separated():
@@ -241,6 +248,152 @@ def test_sdk_import_or_configuration_failure_returns_null(failure_stage):
     assert isinstance(telemetry, NullTelemetry)
 
 
+def test_opt_in_uses_one_protected_environment_snapshot():
+    original = {
+        "TRACTIAN_LOGFIRE_ENABLED": "true",
+        "LOGFIRE_TOKEN": "original-token",
+        "TRACTIAN_LOGFIRE_PSEUDONYM_KEY": "p" * 32,
+    }
+    replacement = {
+        "TRACTIAN_LOGFIRE_ENABLED": "false",
+        "LOGFIRE_TOKEN": "replacement-token",
+        "TRACTIAN_LOGFIRE_PSEUDONYM_KEY": "q" * 32,
+    }
+
+    class MutatingEnvironment(Mapping):
+        def __init__(self):
+            self.reads = {key: 0 for key in original}
+
+        def __iter__(self):
+            return iter(original)
+
+        def __len__(self):
+            return len(original)
+
+        def __getitem__(self, key):
+            value = original[key] if self.reads[key] == 0 else replacement[key]
+            self.reads[key] += 1
+            return value
+
+    calls = []
+
+    class AdvancedOptions:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    configured = SimpleNamespace()
+    sdk = SimpleNamespace(
+        AdvancedOptions=AdvancedOptions,
+        configure=lambda **kwargs: calls.append(kwargs) or configured,
+    )
+    environment = MutatingEnvironment()
+
+    telemetry = build_agent_telemetry(environment, sdk_loader=lambda: sdk)
+
+    assert isinstance(telemetry, LogfireTelemetry)
+    assert calls[0]["token"] == "original-token"
+    assert environment.reads == {key: 1 for key in original}
+
+
+def test_environment_snapshot_failure_is_null_and_inert():
+    class BrokenEnvironment(Mapping):
+        def __iter__(self):
+            raise _TelemetryBaseError
+
+        def __len__(self):
+            raise _TelemetryBaseError
+
+        def __getitem__(self, key):
+            raise _TelemetryBaseError
+
+    assert isinstance(build_agent_telemetry(BrokenEnvironment()), NullTelemetry)
+
+
+def test_build_telemetry_without_argument_reads_real_environment_snapshot(
+    monkeypatch,
+):
+    monkeypatch.setenv("TRACTIAN_LOGFIRE_ENABLED", "true")
+    monkeypatch.setenv("LOGFIRE_TOKEN", "environment-token")
+    monkeypatch.setenv("TRACTIAN_LOGFIRE_PSEUDONYM_KEY", "p" * 32)
+    calls = []
+
+    class AdvancedOptions:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    configured = SimpleNamespace()
+    sdk = SimpleNamespace(
+        AdvancedOptions=AdvancedOptions,
+        configure=lambda **kwargs: calls.append(kwargs) or configured,
+    )
+
+    telemetry = build_agent_telemetry(sdk_loader=lambda: sdk)
+
+    assert isinstance(telemetry, LogfireTelemetry)
+    assert calls[0]["token"] == "environment-token"
+
+
+@pytest.mark.parametrize(
+    ("existing", "expected"),
+    [
+        (None, "logfire-plugin"),
+        ("another-plugin", "another-plugin,logfire-plugin"),
+        ("true", "true"),
+        ("TRUE", "TRUE,logfire-plugin"),
+        ("1", "1"),
+        ("__all__", "__all__"),
+    ],
+)
+def test_fresh_default_import_disables_logfire_pydantic_plugin_before_models(
+    existing,
+    expected,
+):
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TRACTIAN_LOGFIRE_ENABLED": "true",
+            "LOGFIRE_TOKEN": "token-sentinel",
+            "TRACTIAN_LOGFIRE_PSEUDONYM_KEY": "key-sentinel-" + "k" * 32,
+            "LOGFIRE_PYDANTIC_PLUGIN_RECORD": "all",
+        }
+    )
+    if existing is None:
+        environment.pop("PYDANTIC_DISABLE_PLUGINS", None)
+    else:
+        environment["PYDANTIC_DISABLE_PLUGINS"] = existing
+    code = """
+import json
+import os
+import sys
+from tractian_agent.contracts import Identity, SupportRequest
+import tractian_agent.state
+import tractian_agent.entrypoint
+SupportRequest(
+    case_id="case_plugin_guard",
+    ticket_id="TKT-PLUGIN-GUARD",
+    asset_id="asset_plugin_guard",
+    message="request-message-sentinel",
+    identity=Identity(user_id="user-plugin-guard", company_id="company-plugin-guard"),
+)
+print(json.dumps({
+    "disabled": os.environ.get("PYDANTIC_DISABLE_PLUGINS"),
+    "logfire_modules": sorted(name for name in sys.modules if name == "logfire" or name.startswith("logfire.")),
+}))
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    result = json.loads(completed.stdout)
+
+    assert result["disabled"] == expected
+    assert result["logfire_modules"] == []
+
+
 def test_logfire_backend_failure_is_inert_and_never_receives_business_exception():
     exits = []
     attributes = []
@@ -413,6 +566,99 @@ def test_evaluation_span_is_explicit_and_pseudonymized():
     assert "raw-benchmark-sentinel" not in serialized
 
 
+def test_real_sdk_in_memory_export_is_recursively_sanitized_and_omits_none():
+    import logfire
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    client = logfire.configure(
+        local=True,
+        send_to_logfire=False,
+        console=False,
+        inspect_arguments=False,
+        add_baggage_to_attributes=False,
+        distributed_tracing=False,
+        additional_span_processors=[SimpleSpanProcessor(exporter)],
+        advanced=logfire.AdvancedOptions(
+            emit_configuration_span=False,
+            resource_detectors=(),
+        ),
+    )
+    telemetry = LogfireTelemetry(pseudonym_key=b"p" * 32, client=client)
+    sentinels = (
+        "request-message-sentinel",
+        "authorization-header-sentinel",
+        "evidence-value-sentinel",
+        "artifact-content-sentinel",
+        "provider-error-sentinel",
+        "golden-gabarito-sentinel",
+        "token-secret-sentinel",
+    )
+    trace = telemetry.start_execution(
+        ExecutionCorrelations(
+            request_id="|".join(sentinels),
+            thread_id=sentinels[1],
+            execution_id=sentinels[2],
+            case_id=sentinels[3],
+            company_id=sentinels[4],
+            user_id=sentinels[5],
+            planner_enabled=False,
+        )
+    )
+
+    with trace.activate():
+        with trace.span(SpanName.REQUEST, trace.request_attributes):
+            with trace.span(
+                SpanName.NODE,
+                NodeSpanAttributes(node=GraphNodeName.INGEST),
+            ):
+                pass
+    client.force_flush()
+
+    exported = exporter.get_finished_spans()
+    assert exported
+    root = next(span for span in exported if span.name == SpanName.REQUEST.value)
+    assert "experiment_ref" not in root.attributes
+    assert "benchmark_case_ref" not in root.attributes
+    recursive_export = [
+        {
+            "name": span.name,
+            "attributes": dict(span.attributes or {}),
+            "events": [
+                {"name": event.name, "attributes": dict(event.attributes or {})}
+                for event in span.events
+            ],
+            "resource": dict(span.resource.attributes),
+            "scope": {
+                "name": span.instrumentation_scope.name,
+                "version": span.instrumentation_scope.version,
+                "schema_url": span.instrumentation_scope.schema_url,
+                "attributes": dict(span.instrumentation_scope.attributes or {}),
+            },
+            "links": [
+                {
+                    "trace_id": link.context.trace_id,
+                    "span_id": link.context.span_id,
+                    "attributes": dict(link.attributes or {}),
+                }
+                for link in span.links
+            ],
+            "status": {
+                "code": span.status.status_code.name,
+                "description": span.status.description,
+            },
+            "sdk_json": span.to_json(),
+        }
+        for span in exported
+    ]
+    serialized = json.dumps(recursive_export, default=str, sort_keys=True).casefold()
+    for sentinel in sentinels:
+        assert sentinel.casefold() not in serialized
+
+
 class _MinimalGraph:
     planner_enabled = False
 
@@ -440,6 +686,83 @@ class _MinimalGraph:
     async def aupdate_state(self, config, values, *, as_node):
         self.values = values
         return config
+
+
+class _TelemetryBaseError(BaseException):
+    pass
+
+
+class _FaultContext:
+    def __init__(self, *, fail_enter=False, fail_exit=False, value=None, error_factory):
+        self._fail_enter = fail_enter
+        self._fail_exit = fail_exit
+        self._value = value
+        self._error_factory = error_factory
+
+    def __enter__(self):
+        if self._fail_enter:
+            raise self._error_factory()
+        return self._value
+
+    def __exit__(self, *args):
+        if self._fail_exit:
+            raise self._error_factory()
+        return False
+
+
+class _FaultSpanHandle:
+    def __init__(self, error_factory):
+        self._error_factory = error_factory
+
+    def finish(self, *args):
+        raise self._error_factory()
+
+
+class _FaultTelemetry(RecordingTelemetry):
+    def __init__(self, stage, error_factory):
+        super().__init__(pseudonym_key=b"p" * 32)
+        self._stage = stage
+        self._error_factory = error_factory
+
+    def start_execution(self, correlations):
+        if self._stage == "start_execution":
+            raise self._error_factory()
+        trace = super().start_execution(correlations)
+        if self._stage == "activate_call":
+            trace.activate = lambda: (_ for _ in ()).throw(self._error_factory())
+        elif self._stage == "activate_enter":
+            trace.activate = lambda: _FaultContext(
+                fail_enter=True,
+                error_factory=self._error_factory,
+            )
+        elif self._stage == "activate_exit":
+            trace.activate = lambda: _FaultContext(
+                fail_exit=True,
+                error_factory=self._error_factory,
+            )
+        elif self._stage == "span_call":
+            trace.span = lambda *args: (_ for _ in ()).throw(self._error_factory())
+        elif self._stage == "span_enter":
+            trace.span = lambda *args: _FaultContext(
+                fail_enter=True,
+                error_factory=self._error_factory,
+            )
+        elif self._stage == "span_exit":
+            trace.span = lambda *args: _FaultContext(
+                fail_exit=True,
+                value=_FaultSpanHandle(self._error_factory),
+                error_factory=self._error_factory,
+            )
+        elif self._stage == "span_finish":
+            trace.span = lambda *args: _FaultContext(
+                value=_FaultSpanHandle(self._error_factory),
+                error_factory=self._error_factory,
+            )
+        elif self._stage == "metrics":
+            trace._record_metrics = lambda *args, **kwargs: (_ for _ in ()).throw(
+                self._error_factory()
+            )
+        return trace
 
 
 def test_observed_envelope_does_not_change_or_persist_the_public_state():
@@ -494,9 +817,132 @@ def test_observed_envelope_does_not_change_or_persist_the_public_state():
     ]
 
 
-def test_real_fallback_graph_records_only_the_nodes_that_execute(tmp_path):
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "start_execution",
+        "activate_call",
+        "activate_enter",
+        "activate_exit",
+        "span_call",
+        "span_enter",
+        "span_exit",
+        "span_finish",
+        "metrics",
+    ],
+)
+@pytest.mark.parametrize("error_factory", [_TelemetryBaseError, asyncio.CancelledError])
+def test_public_invocation_is_fail_open_for_every_telemetry_operation(
+    stage,
+    error_factory,
+):
     async def scenario():
-        telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
+        request = SupportRequest(
+            case_id="case_tkt_inv_04",
+            ticket_id="TKT-INV-04",
+            asset_id="asset_G501",
+            message="Mensagem não exportável.",
+            identity=Identity(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+            ),
+        )
+        async with IndustrialApiClient("https://industrial.invalid") as client:
+            runtime = ReadToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read"}),
+                central_asset_id="asset_G501",
+                client=client,
+            )
+            baseline = await invoke_agent(
+                _MinimalGraph(NullTelemetry()),
+                request=request,
+                runtime=runtime,
+                thread_id="thread_fault_matrix",
+                request_id="request_fault_matrix",
+                execution_id="execution_fault_matrix",
+            )
+            observed = await invoke_agent_observed(
+                _MinimalGraph(_FaultTelemetry(stage, error_factory)),
+                request=request,
+                runtime=runtime,
+                thread_id="thread_fault_matrix",
+                request_id="request_fault_matrix",
+                execution_id="execution_fault_matrix",
+            )
+        return baseline, observed
+
+    baseline, observed = asyncio.run(scenario())
+
+    assert observed.state.model_dump_json() == baseline.model_dump_json()
+    assert re.fullmatch(r"trc_[0-9a-f]{32}", observed.trace_id.value)
+
+
+@pytest.mark.parametrize(
+    "business_error", [LookupError("business"), asyncio.CancelledError()]
+)
+@pytest.mark.parametrize(
+    "telemetry_stage", ["activate_exit", "span_exit", "span_finish"]
+)
+def test_telemetry_failure_never_replaces_business_exception(
+    business_error,
+    telemetry_stage,
+):
+    class FailingGraph(_MinimalGraph):
+        async def ainvoke(self, input, config, *, context, durability):
+            self.values = input
+            raise business_error
+
+    async def scenario():
+        request = SupportRequest(
+            case_id="case_tkt_inv_04",
+            ticket_id="TKT-INV-04",
+            asset_id="asset_G501",
+            message="Mensagem não exportável.",
+            identity=Identity(user_id="usr_pedro", company_id="comp_mineracao_andes"),
+        )
+        async with IndustrialApiClient("https://industrial.invalid") as client:
+            runtime = ReadToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read"}),
+                central_asset_id="asset_G501",
+                client=client,
+            )
+            await invoke_agent_observed(
+                FailingGraph(_FaultTelemetry(telemetry_stage, _TelemetryBaseError)),
+                request=request,
+                runtime=runtime,
+                thread_id="thread_business_error",
+                request_id="request_business_error",
+                execution_id="execution_business_error",
+            )
+
+    with pytest.raises(type(business_error)) as raised:
+        asyncio.run(scenario())
+
+    assert raised.value is business_error
+    assert raised.value.__cause__ is None
+    traceback_names = []
+    traceback = raised.value.__traceback__
+    while traceback is not None:
+        traceback_names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    assert "ainvoke" in traceback_names
+
+
+@pytest.mark.parametrize("telemetry_kind", ["null", "recording"])
+def test_real_fallback_pairs_null_and_recording_without_business_drift(
+    tmp_path,
+    telemetry_kind,
+):
+    async def scenario():
+        telemetry = (
+            NullTelemetry()
+            if telemetry_kind == "null"
+            else RecordingTelemetry(pseudonym_key=b"p" * 32)
+        )
         request = SupportRequest(
             case_id="case_tkt_inv_04",
             ticket_id="TKT-INV-04",
@@ -532,21 +978,37 @@ def test_real_fallback_graph_records_only_the_nodes_that_execute(tmp_path):
 
     result, snapshot, telemetry = asyncio.run(scenario())
 
-    node_names = [
-        dict(span.attributes)["node"]
-        for span in telemetry.spans
-        if span.name is SpanName.NODE
-    ]
-    assert node_names == ["ingest", "route", "finish"]
+    if isinstance(telemetry, RecordingTelemetry):
+        node_names = [
+            dict(span.attributes)["node"]
+            for span in telemetry.spans
+            if span.name is SpanName.NODE
+        ]
+        assert node_names == ["ingest", "route", "finish"]
+    assert result.state == AgentState.model_validate(snapshot.values)
     assert result.trace_id.value not in json.dumps(snapshot.values, default=str)
-    assert not any(span.name is SpanName.EVALUATION for span in telemetry.spans)
+    if isinstance(telemetry, RecordingTelemetry):
+        assert not any(span.name is SpanName.EVALUATION for span in telemetry.spans)
 
 
-def test_reprocess_retry_records_two_distinct_action_attempts(tmp_path):
+@pytest.mark.parametrize("second_preflight_blocks", [False, True])
+@pytest.mark.parametrize("telemetry_kind", ["null", "recording"])
+def test_reprocess_retry_pairs_null_and_recording_and_records_real_attempts(
+    tmp_path,
+    second_preflight_blocks,
+    telemetry_kind,
+):
     posts = []
+    gets = []
 
     def handler(request):
         if request.method == "GET":
+            gets.append(request)
+            if second_preflight_blocks and len(gets) == 2:
+                return httpx.Response(
+                    503,
+                    json={"code": "SERVER_ERROR", "message": "preflight blocked"},
+                )
             return httpx.Response(
                 200,
                 json={
@@ -582,7 +1044,11 @@ def test_reprocess_retry_records_two_distinct_action_attempts(tmp_path):
         )
 
     async def scenario():
-        telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
+        telemetry = (
+            NullTelemetry()
+            if telemetry_kind == "null"
+            else RecordingTelemetry(pseudonym_key=b"p" * 32)
+        )
         request = SupportRequest(
             case_id="case_tkt_exe_12",
             ticket_id="TKT-EXE-12",
@@ -629,18 +1095,23 @@ def test_reprocess_retry_records_two_distinct_action_attempts(tmp_path):
 
     state, telemetry = asyncio.run(scenario())
 
-    action_attributes = [
-        dict(span.attributes)
-        for span in telemetry.spans
-        if span.name is SpanName.ACTION
-    ]
-    assert [attributes["attempt"] for attributes in action_attributes] == [1, 2]
-    assert all(
-        attributes["action"] == "reprocess_analysis" for attributes in action_attributes
-    )
-    assert any(span.name is SpanName.POLICY for span in telemetry.spans)
+    if isinstance(telemetry, RecordingTelemetry):
+        action_attributes = [
+            dict(span.attributes)
+            for span in telemetry.spans
+            if span.name is SpanName.ACTION
+        ]
+        assert [attributes["attempt"] for attributes in action_attributes] == (
+            [1] if second_preflight_blocks else [1, 2]
+        )
+        assert all(
+            attributes["action"] == "reprocess_analysis"
+            for attributes in action_attributes
+        )
+        assert any(span.name is SpanName.POLICY for span in telemetry.spans)
     assert state.intents[0].attempts == 2
-    assert len(posts) == 2
+    assert len(posts) == (1 if second_preflight_blocks else 2)
+    assert len(gets) == 2
 
 
 def test_concurrent_traces_and_cancellation_restore_context_without_sentinels():
@@ -741,17 +1212,39 @@ def test_cancelled_action_dispatch_preserves_cancellation_category():
         )
     )
 
-    async def cancelled_operation():
+    async def cancelled_transport(_request):
         raise asyncio.CancelledError
 
+    client = IndustrialApiClient(
+        "https://simulator.test",
+        transport=httpx.MockTransport(cancelled_transport),
+    )
+    runtime = WriteToolRuntime.create(
+        user_id="user",
+        company_id="company",
+        permissions=frozenset({"read", "action_high"}),
+        central_asset_id="asset_1",
+        current_case_id="case_1",
+        client=client,
+    )
+    proposal = UpdateAssetCriticalityProposal(
+        criticality="critical",
+        justification="Mudança autorizada.",
+    )
+
     async def scenario():
-        with trace.activate():
-            with pytest.raises(asyncio.CancelledError):
-                await _observed_action_dispatch(
-                    ActionName.REPROCESS_ANALYSIS,
+        try:
+            with (
+                trace.activate(),
+                bind_action_attempt(
+                    ActionName.UPDATE_ASSET_CRITICALITY,
                     1,
-                    cancelled_operation,
-                )
+                ),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await execute_update_asset_criticality(proposal, runtime)
+        finally:
+            await client.aclose()
 
     asyncio.run(scenario())
 

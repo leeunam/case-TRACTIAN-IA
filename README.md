@@ -102,9 +102,13 @@ A exportação requer simultaneamente:
 - `TRACTIAN_LOGFIRE_PSEUDONYM_KEY` com 32 bytes a 4 KiB em UTF-8.
 
 Ausência ou formato local inválido mantém a fachada nula antes de carregar o
-SDK. Revogação remota do token não pode ser validada offline. O SDK é configurado
-uma vez na construção e somente spans manuais são permitidos; auto-instrumentação
-de LangChain/LangGraph, HTTPX, FastAPI e Pydantic permanece desligada.
+SDK. Os três valores são copiados uma única vez e a configuração usa exatamente
+esse snapshot, inclusive quando a origem é um `Mapping` mutável. Revogação
+remota do token não pode ser validada offline. O SDK é configurado uma vez na
+construção e somente spans manuais são permitidos. Antes de importar qualquer
+modelo, o pacote acrescenta `logfire-plugin` a `PYDANTIC_DISABLE_PLUGINS`
+(preservando plugins existentes e os sentinelas globais), de modo que
+LangChain/LangGraph, HTTPX, FastAPI e Pydantic não sejam auto-instrumentados.
 
 Os nomes exportáveis são fixos: `tractian.agent.request`, `node`, `planner`,
 `writer`, `tool`, `policy`, `action`, `gate`, `review`, `response` e
@@ -115,6 +119,13 @@ targets, URLs, payloads, segredos e exceções não entram na telemetria. Métri
 usam somente `stage`, `outcome`, `error_code`, `planner_enabled` e `replayed`;
 nenhum ID é label. O runtime emite zero spans de avaliação; a operação tipada
 existe apenas para o futuro runner da Fase 11.
+
+O span `action` começa somente quando um `POST` ou `PATCH` modificador é
+despachado. Leituras de preflight não criam tentativa, e uma nova tentativa só
+existe se um novo modificador alcançar o transporte. Falhas da fachada, do SDK,
+de spans ou de métricas são isoladas inclusive quando levantam `BaseException`;
+cancelamentos e exceções originados pelo negócio continuam sendo propagados com
+a mesma identidade e traceback.
 
 A retenção inicial de 30 dias e os limites de volume/cardinalidade são controles
 operacionais externos da conta Logfire: devem ser configurados e monitorados

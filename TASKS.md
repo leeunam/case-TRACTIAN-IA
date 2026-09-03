@@ -1220,12 +1220,24 @@ da conta Logfire, não ao ledger nem ao código do atendimento.
 com implementação nula por padrão. A exportação exige simultaneamente
 `TRACTIAN_LOGFIRE_ENABLED=true`, `LOGFIRE_TOKEN` explícito e
 `TRACTIAN_LOGFIRE_PSEUDONYM_KEY`; configuração ausente, vazia ou inválida não
-configura o SDK nem toca a rede. Usar apenas spans manuais; instrumentações
-automáticas de LangChain/LangGraph, HTTPX, FastAPI e Pydantic ficam desligadas.
+configura o SDK nem toca a rede. A fronteira lê uma única vez os três valores e
+configura o SDK com esse snapshot imutável. Usar apenas spans manuais;
+instrumentações automáticas de LangChain/LangGraph, HTTPX, FastAPI e Pydantic
+ficam desligadas. O pacote acrescenta precocemente `logfire-plugin` a
+`PYDANTIC_DISABLE_PLUGINS`, preservando entradas existentes e sentinelas
+globais; por isso o agente requer Pydantic 2.7 ou posterior.
 Um `trace_id` opaco é criado na fronteira para cada execução, correlacionado por
 atributo e retornável como único identificador técnico. IDs de request, thread,
 execução, caso, empresa, pessoa e, quando aplicável, experimento/caso de
 benchmark são HMAC-SHA256 truncados antes do export.
+
+Tentativas de ação são contexto efêmero e só abrem span ao redor do `POST` ou
+`PATCH` modificador real, depois de qualquer GET de preflight. Toda operação da
+fachada e do backend é fail-open, inclusive para `BaseException`, mas uma
+exceção ou `CancelledError` do negócio é reemitida sem troca de objeto, causa ou
+traceback. Resultados de policy, gate, ação, revisão e tool são classificados
+somente por enums e contratos validados; mensagens e payloads não participam da
+decisão observacional.
 
 **Allowlist:** nomes fixos para request raiz, nó, planner, writer, tool,
 política, ação, gate, revisão, resposta e avaliação; atributos limitados a

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, nullcontext
+from contextlib import AbstractAsyncContextManager, ExitStack, nullcontext
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 import inspect
@@ -15,6 +15,7 @@ from uuid import uuid4
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import BaseTool
+from langgraph.errors import GraphInterrupt
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -47,7 +48,6 @@ from tractian_agent.human_review import (
 )
 from tractian_agent.observability import (
     ActionName,
-    ActionSpanAttributes,
     AgentTelemetry,
     ErrorCode,
     GateSpanAttributes,
@@ -65,7 +65,9 @@ from tractian_agent.observability import (
     ToolName,
     ToolSpanAttributes,
     WriterSpanAttributes,
+    bind_action_attempt,
     current_execution_trace,
+    span_fail_open,
 )
 from tractian_agent.planner import (
     Planner,
@@ -96,6 +98,7 @@ from tractian_agent.state import (
     ResumeAnchor,
     ReviewRecord,
     ReviewExpiry,
+    ReviewOperation as StateReviewOperation,
     ReviewStatus,
     ReleaseGateOutcome,
     ToolObservation,
@@ -245,9 +248,15 @@ def _observed_node(name: GraphNodeName, node: Any) -> Any:
             trace = current_execution_trace()
             if trace is None:
                 return await node(*args, **kwargs)
-            with trace.span(SpanName.NODE, NodeSpanAttributes(node=name)) as node_span:
+            with span_fail_open(
+                trace, SpanName.NODE, NodeSpanAttributes(node=name)
+            ) as node_span:
                 with _stage_scope(trace, name, args) as stage_span:
-                    result = await node(*args, **kwargs)
+                    try:
+                        result = await node(*args, **kwargs)
+                    except BaseException as error:
+                        _finish_raised_stage(name, error, node_span, stage_span)
+                        raise
                     _finish_failed_stage(name, result, node_span, stage_span)
                     return result
 
@@ -258,13 +267,46 @@ def _observed_node(name: GraphNodeName, node: Any) -> Any:
         trace = current_execution_trace()
         if trace is None:
             return node(*args, **kwargs)
-        with trace.span(SpanName.NODE, NodeSpanAttributes(node=name)) as node_span:
+        with span_fail_open(
+            trace, SpanName.NODE, NodeSpanAttributes(node=name)
+        ) as node_span:
             with _stage_scope(trace, name, args) as stage_span:
-                result = node(*args, **kwargs)
+                try:
+                    result = node(*args, **kwargs)
+                except BaseException as error:
+                    _finish_raised_stage(name, error, node_span, stage_span)
+                    raise
                 _finish_failed_stage(name, result, node_span, stage_span)
                 return result
 
     return sync_wrapper
+
+
+def _finish_raised_stage(
+    name: GraphNodeName,
+    error: BaseException,
+    node_span: Any,
+    stage_span: Any,
+) -> None:
+    if isinstance(error, GraphInterrupt):
+        outcome, error_code = Outcome.SUSPENDED, ErrorCode.NONE
+    elif isinstance(error, asyncio.CancelledError):
+        outcome, error_code = Outcome.CANCELLED, ErrorCode.CANCELLED
+    else:
+        outcome = Outcome.ERROR
+        error_code = {
+            GraphNodeName.PLANNER_SELECT: ErrorCode.MODEL,
+            GraphNodeName.PLANNER_FINALIZE: ErrorCode.MODEL,
+            GraphNodeName.WRITER: ErrorCode.MODEL,
+            GraphNodeName.PLANNER_TOOL: ErrorCode.TOOL,
+            GraphNodeName.WRITE_POLICY: ErrorCode.POLICY,
+            GraphNodeName.CONFIRMATION_GATE: ErrorCode.POLICY,
+            GraphNodeName.RELEASE_GATE: ErrorCode.GATE,
+            GraphNodeName.AWAIT_HUMAN_REVIEW: ErrorCode.REVIEW,
+        }.get(name, ErrorCode.RUNTIME)
+    node_span.finish(outcome, error_code)
+    if stage_span is not None:
+        stage_span.finish(outcome, error_code)
 
 
 def _finish_failed_stage(
@@ -275,40 +317,86 @@ def _finish_failed_stage(
 ) -> None:
     """Classifica falhas já convertidas no estado sem ler conteúdo livre."""
 
-    if not isinstance(result, Mapping):
+    classification = _closed_result_classification(name, result)
+    if classification is None:
         return
-    error_code = None
-    if name in {GraphNodeName.PLANNER_SELECT, GraphNodeName.PLANNER_FINALIZE}:
-        if result.get("planner_failure") is not None:
-            error_code = ErrorCode.MODEL
-    elif name is GraphNodeName.WRITER and result.get("writer_failure") is not None:
-        error_code = ErrorCode.MODEL
-    elif (
-        name is GraphNodeName.PLANNER_TOOL and result.get("planner_failure") is not None
-    ):
-        error_code = ErrorCode.TOOL
-    if error_code is None:
-        return
-    node_span.finish(Outcome.ERROR, error_code)
+    outcome, error_code = classification
+    node_span.finish(outcome, error_code)
     if stage_span is not None:
-        stage_span.finish(Outcome.ERROR, error_code)
+        stage_span.finish(outcome, error_code)
+
+
+def _closed_result_classification(
+    name: GraphNodeName,
+    result: object,
+) -> tuple[Outcome, ErrorCode] | None:
+    """Deriva status apenas de contratos persistíveis já validados."""
+
+    if not isinstance(result, Mapping):
+        return None
+    try:
+        state = AgentState.model_validate(result)
+    except (TypeError, ValueError):
+        return None
+    if name in {GraphNodeName.PLANNER_SELECT, GraphNodeName.PLANNER_FINALIZE}:
+        if state.planner_failure is not None:
+            return Outcome.ERROR, ErrorCode.MODEL
+    if name is GraphNodeName.WRITER and state.writer_failure is not None:
+        return Outcome.ERROR, ErrorCode.MODEL
+    if name is GraphNodeName.PLANNER_TOOL and state.planner_failure is not None:
+        return Outcome.ERROR, ErrorCode.TOOL
+    current_intents = tuple(
+        intent for intent in state.intents if intent.request_id == state.request_id
+    )
+    intent = current_intents[-1] if current_intents else None
+    if name in {GraphNodeName.WRITE_POLICY, GraphNodeName.CONFIRMATION_GATE}:
+        if intent is not None and intent.status is IntentStatus.DENIED:
+            return Outcome.DENIED, ErrorCode.POLICY
+        if intent is not None and intent.status is IntentStatus.AWAITING_CONFIRMATION:
+            return Outcome.SUSPENDED, ErrorCode.POLICY
+    if name is GraphNodeName.EXECUTE_ACTION and intent is not None:
+        if intent.status is IntentStatus.UNCERTAIN:
+            return Outcome.UNCERTAIN, ErrorCode.ACTION
+        if intent.status is IntentStatus.DENIED:
+            return Outcome.DENIED, ErrorCode.ACTION
+        if intent.status is IntentStatus.FAILED:
+            return Outcome.ERROR, ErrorCode.ACTION
+    if name is GraphNodeName.RELEASE_GATE and state.release_gate is not None:
+        if state.release_gate.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW:
+            return Outcome.SUSPENDED, ErrorCode.REVIEW
+        if state.release_gate.outcome is ReleaseGateOutcome.REQUEST_CONFIRMATION:
+            return Outcome.SUSPENDED, ErrorCode.GATE
+        if state.release_gate.outcome is ReleaseGateOutcome.REQUEST_INFORMATION:
+            return Outcome.DENIED, ErrorCode.GATE
+    if name is GraphNodeName.AWAIT_HUMAN_REVIEW:
+        if state.review_expiry is not None:
+            return Outcome.DENIED, ErrorCode.REVIEW
+        if (
+            state.review_audit is not None
+            and state.review_audit.operation is StateReviewOperation.REJECT
+        ):
+            return Outcome.DENIED, ErrorCode.REVIEW
+    return None
 
 
 def _stage_scope(trace: Any, name: GraphNodeName, args: tuple[Any, ...]) -> Any:
     state = args[0] if args and isinstance(args[0], AgentState) else None
     if name is GraphNodeName.PLANNER_SELECT:
-        return trace.span(
+        return span_fail_open(
+            trace,
             SpanName.PLANNER,
             PlannerSpanAttributes(operation=PlannerOperation.SELECT),
         )
     if name is GraphNodeName.PLANNER_FINALIZE:
-        return trace.span(
+        return span_fail_open(
+            trace,
             SpanName.PLANNER,
             PlannerSpanAttributes(operation=PlannerOperation.FINALIZE),
         )
     if name is GraphNodeName.WRITER:
         attempt = 1 if state is None else min(state.writer_attempts + 1, 2)
-        return trace.span(
+        return span_fail_open(
+            trace,
             SpanName.WRITER,
             WriterSpanAttributes(attempt=attempt),
         )
@@ -318,19 +406,21 @@ def _stage_scope(trace: Any, name: GraphNodeName, args: tuple[Any, ...]) -> Any:
             if name is GraphNodeName.WRITE_POLICY
             else PolicyOperation.CONFIRM
         )
-        return trace.span(
+        return span_fail_open(
+            trace,
             SpanName.POLICY,
             PolicySpanAttributes(operation=operation),
         )
     if name is GraphNodeName.RELEASE_GATE:
-        return trace.span(SpanName.GATE, GateSpanAttributes())
+        return span_fail_open(trace, SpanName.GATE, GateSpanAttributes())
     if name is GraphNodeName.AWAIT_HUMAN_REVIEW:
         operation = (
             TelemetryReviewOperation.RESUME
             if trace.review_resumed
             else TelemetryReviewOperation.WAIT
         )
-        return trace.span(
+        return span_fail_open(
+            trace,
             SpanName.REVIEW,
             ReviewSpanAttributes(operation=operation),
         )
@@ -342,26 +432,8 @@ async def _observed_action_dispatch(
     attempt: int,
     operation: Callable[[], Awaitable[ActionReceipt | ApiError]],
 ) -> ActionReceipt | ApiError:
-    trace = current_execution_trace()
-    if trace is None:
+    with bind_action_attempt(action, attempt):
         return await operation()
-    with trace.span(
-        SpanName.ACTION,
-        ActionSpanAttributes(action=action, attempt=attempt),
-    ) as action_span:
-        try:
-            result = await operation()
-        except BaseException as error:
-            if isinstance(error, asyncio.CancelledError):
-                action_span.finish(Outcome.CANCELLED, ErrorCode.CANCELLED)
-            else:
-                action_span.finish(Outcome.ERROR, ErrorCode.ACTION)
-            raise
-        if isinstance(result, ApiError):
-            action_span.finish(Outcome.ERROR, ErrorCode.ACTION)
-        elif not result.accepted:
-            action_span.finish(Outcome.DENIED, ErrorCode.ACTION)
-        return result
 
 
 def _checkpoint_update(state: AgentState) -> dict[str, object]:
@@ -813,6 +885,8 @@ async def _planner_tool(
             code="runtime_required",
             anchor=ResumeAnchor.PLANNER_TOOL,
         )
+    tool_stack = ExitStack()
+    tool_span = None
     try:
         call, selected_tool = _pending_planner_tool(advanced, context)
         tool_node = ToolNode((selected_tool,), handle_tool_errors=False)
@@ -835,21 +909,17 @@ async def _planner_tool(
         if trace is None:
             raw_output = await tool_node.ainvoke(tool_input, runtime=runtime)
         else:
-            with trace.span(
-                SpanName.TOOL,
-                ToolSpanAttributes(tool=ToolName(call.name)),
-            ) as tool_span:
-                try:
-                    raw_output = await tool_node.ainvoke(
-                        tool_input,
-                        runtime=runtime,
-                    )
-                except BaseException as error:
-                    if isinstance(error, asyncio.CancelledError):
-                        tool_span.finish(Outcome.CANCELLED, ErrorCode.CANCELLED)
-                    else:
-                        tool_span.finish(Outcome.ERROR, ErrorCode.TOOL)
-                    raise
+            tool_span = tool_stack.enter_context(
+                span_fail_open(
+                    trace,
+                    SpanName.TOOL,
+                    ToolSpanAttributes(tool=ToolName(call.name)),
+                )
+            )
+            raw_output = await tool_node.ainvoke(
+                tool_input,
+                runtime=runtime,
+            )
         if not isinstance(raw_output, Mapping):
             raise ValueError("ToolNode devolveu envelope inválido")
         messages = raw_output.get("messages")
@@ -917,6 +987,8 @@ async def _planner_tool(
 
         raw_artifact = validate_exact_read_artifact(call.name, message.artifact)
         artifact = PersistedToolArtifact.model_validate(raw_artifact)
+        if artifact.outcome.error is not None and tool_span is not None:
+            tool_span.finish(Outcome.ERROR, ErrorCode.TOOL)
         observation = ToolObservation(
             request_id=advanced.request_id,
             call_id=call.call_id,
@@ -941,7 +1013,13 @@ async def _planner_tool(
                 anchor=ResumeAnchor.PLANNER_TOOL,
             )
         return _checkpoint_update(updated)
+    except asyncio.CancelledError:
+        if tool_span is not None:
+            tool_span.finish(Outcome.CANCELLED, ErrorCode.CANCELLED)
+        raise
     except (PlannerProtocolError, TypeError, ValueError):
+        if tool_span is not None:
+            tool_span.finish(Outcome.ERROR, ErrorCode.TOOL)
         return _planner_failure_update(
             advanced,
             stage="planner_tool",
@@ -949,12 +1027,16 @@ async def _planner_tool(
             anchor=ResumeAnchor.PLANNER_TOOL,
         )
     except Exception:
+        if tool_span is not None:
+            tool_span.finish(Outcome.ERROR, ErrorCode.TOOL)
         return _planner_failure_update(
             advanced,
             stage="planner_tool",
             code="tool_execution_failed",
             anchor=ResumeAnchor.PLANNER_TOOL,
         )
+    finally:
+        tool_stack.close()
 
 
 def _after_planner_tool(

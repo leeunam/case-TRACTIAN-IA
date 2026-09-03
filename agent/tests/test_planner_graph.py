@@ -32,7 +32,12 @@ from tractian_agent.human_review import (
 )
 from tractian_agent.evidence import compile_observations
 from tractian_agent.graph import build_agent_graph
-from tractian_agent.observability import RecordingTelemetry, SpanName
+from tractian_agent.observability import (
+    ExecutionCorrelations,
+    NullTelemetry,
+    RecordingTelemetry,
+    SpanName,
+)
 from tractian_agent.planner import (
     Planner,
     PlannerDecisionKind,
@@ -530,7 +535,11 @@ def _trusted_proposal_history(
     return (), ()
 
 
-def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path):
+@pytest.mark.parametrize("telemetry_kind", ["null", "recording"])
+def test_planner_read_pairs_null_and_recording_without_business_drift(
+    tmp_path,
+    telemetry_kind,
+):
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -564,7 +573,11 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
     )
     writer_model = _EchoWriterModel()
     writer = Writer(writer_model)
-    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
+    telemetry = (
+        NullTelemetry()
+        if telemetry_kind == "null"
+        else RecordingTelemetry(pseudonym_key=b"p" * 32)
+    )
 
     async def scenario():
         checkpoint_path = tmp_path / "planner.sqlite3"
@@ -662,21 +675,24 @@ def test_planner_graph_executes_real_read_with_tool_node_and_finalizes(tmp_path)
         "terminal_request",
     ]
     assert writer_model._events == ["with_structured_output", "writer_request"]
-    specialized = {span.name for span in telemetry.spans}
-    assert {
-        SpanName.REQUEST,
-        SpanName.PLANNER,
-        SpanName.TOOL,
-        SpanName.WRITER,
-        SpanName.GATE,
-        SpanName.RESPONSE,
-    } <= specialized
-    assert SpanName.EVALUATION not in specialized
+    if isinstance(telemetry, RecordingTelemetry):
+        specialized = {span.name for span in telemetry.spans}
+        assert {
+            SpanName.REQUEST,
+            SpanName.PLANNER,
+            SpanName.TOOL,
+            SpanName.WRITER,
+            SpanName.GATE,
+            SpanName.RESPONSE,
+        } <= specialized
+        assert SpanName.EVALUATION not in specialized
 
 
-def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
+@pytest.mark.parametrize("telemetry_kind", ["null", "recording"])
+def test_human_review_reopen_pairs_null_and_recording_without_business_drift(
     tmp_path,
     monkeypatch,
+    telemetry_kind,
 ):
     requests: list[httpx.Request] = []
 
@@ -710,7 +726,11 @@ def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
         ),
     )
     writer_model = _HumanDispositionWriterModel()
-    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
+    telemetry = (
+        NullTelemetry()
+        if telemetry_kind == "null"
+        else RecordingTelemetry(pseudonym_key=b"p" * 32)
+    )
     created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
     monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
     monkeypatch.setattr(
@@ -874,40 +894,41 @@ def test_human_approval_resumes_reopened_sqlite_without_repeating_producers(
     assert completed.approval == waiting.approval is None
     assert replayed == completed
     assert divergent_code == "DIVERGENT_REVIEW"
-    roots = [
-        dict(span.attributes)
-        for span in telemetry.spans
-        if span.name is SpanName.REQUEST
-    ]
-    assert len(roots) == 4
-    assert len({root["trace_id"] for root in roots}) == 4
-    assert len({root["request_ref"] for root in roots}) == 1
-    assert len({root["thread_ref"] for root in roots}) == 1
-    assert len({root["execution_ref"] for root in roots}) == 4
-    reviews = [
-        dict(span.attributes)
-        for span in telemetry.spans
-        if span.name is SpanName.REVIEW
-    ]
-    assert reviews[0]["outcome"] == "suspended"
-    assert [review["operation"] for review in reviews] == ["wait", "resume"]
-    responses = [
-        dict(span.attributes)
-        for span in telemetry.spans
-        if span.name is SpanName.RESPONSE
-    ]
-    assert [response["outcome"] for response in responses] == [
-        "suspended",
-        "ok",
-        "replayed",
-        "error",
-    ]
-    replay_trace_id = responses[2]["trace_id"]
-    assert [
-        span.name
-        for span in telemetry.spans
-        if dict(span.attributes)["trace_id"] == replay_trace_id
-    ] == [SpanName.RESPONSE, SpanName.REQUEST]
+    if isinstance(telemetry, RecordingTelemetry):
+        roots = [
+            dict(span.attributes)
+            for span in telemetry.spans
+            if span.name is SpanName.REQUEST
+        ]
+        assert len(roots) == 4
+        assert len({root["trace_id"] for root in roots}) == 4
+        assert len({root["request_ref"] for root in roots}) == 1
+        assert len({root["thread_ref"] for root in roots}) == 1
+        assert len({root["execution_ref"] for root in roots}) == 4
+        reviews = [
+            dict(span.attributes)
+            for span in telemetry.spans
+            if span.name is SpanName.REVIEW
+        ]
+        assert reviews[0]["outcome"] == "suspended"
+        assert [review["operation"] for review in reviews] == ["wait", "resume"]
+        responses = [
+            dict(span.attributes)
+            for span in telemetry.spans
+            if span.name is SpanName.RESPONSE
+        ]
+        assert [response["outcome"] for response in responses] == [
+            "suspended",
+            "ok",
+            "replayed",
+            "error",
+        ]
+        replay_trace_id = responses[2]["trace_id"]
+        assert [
+            span.name
+            for span in telemetry.spans
+            if dict(span.attributes)["trace_id"] == replay_trace_id
+        ] == [SpanName.RESPONSE, SpanName.REQUEST]
 
 
 def test_eight_step_read_path_fails_closed_before_unfinishable_review(
@@ -1171,6 +1192,7 @@ def test_pending_review_rejects_new_request_stale_id_and_wrong_company_then_reje
     tmp_path,
     monkeypatch,
 ):
+    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
     created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
     monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
     monkeypatch.setattr(
@@ -1195,6 +1217,7 @@ def test_pending_review_rejects_new_request_stale_id_and_wrong_company_then_reje
                     saver,
                     planner=Planner(planner_model),
                     writer=Writer(writer_model),
+                    telemetry=telemetry,
                 )
                 with pytest.raises(AgentInvocationProtocolError) as pending:
                     await invoke_agent(
@@ -1277,6 +1300,14 @@ def test_pending_review_rejects_new_request_stale_id_and_wrong_company_then_reje
     assert rejected.review.reason == "human_review:rejected"
     assert rejected.release_gate == rejected.review_request.gate_basis
     assert len(requests) == 1
+    review_span = next(span for span in telemetry.spans if span.name is SpanName.REVIEW)
+    assert dict(review_span.attributes)["outcome"] == "denied"
+    assert dict(review_span.attributes)["error_code"] == "review_blocked"
+    reject_response = [
+        span for span in telemetry.spans if span.name is SpanName.RESPONSE
+    ][-1]
+    assert dict(reject_response.attributes)["outcome"] == "denied"
+    assert dict(reject_response.attributes)["error_code"] == "review_blocked"
     for field, value in (
         ("message", "A revisão foi aprovada."),
         ("evidence_ids", ["sha256:v1:" + "f" * 64]),
@@ -1311,6 +1342,7 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
     tmp_path,
     monkeypatch,
 ):
+    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
     created_at = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
     monkeypatch.setattr(graph_module, "_utc_now", lambda: created_at)
     monkeypatch.setattr(
@@ -1334,6 +1366,7 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
                     saver,
                     planner=Planner(planner_model),
                     writer=Writer(writer_model),
+                    telemetry=telemetry,
                 )
                 expired = await invoke_agent(
                     graph,
@@ -1411,6 +1444,9 @@ def test_review_received_exactly_at_expiry_finishes_without_fictitious_reviewer(
     assert replayed == expired
     assert divergent_code == "DIVERGENT_REVIEW"
     assert len(requests) == 1
+    review_span = next(span for span in telemetry.spans if span.name is SpanName.REVIEW)
+    assert dict(review_span.attributes)["outcome"] == "denied"
+    assert dict(review_span.attributes)["error_code"] == "review_blocked"
     for field, value in (
         ("message", "A revisão continua válida."),
         ("evidence_ids", ["sha256:v1:" + "f" * 64]),
@@ -2677,6 +2713,7 @@ def test_planner_rejects_noncanonical_raw_proposal_wire(
     monkeypatch,
     malformation,
 ):
+    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
     arguments = {
         "criticality": "critical",
         "justification": "O impacto operacional exige prioridade máxima.",
@@ -2766,13 +2803,24 @@ def test_planner_rejects_noncanonical_raw_proposal_wire(
             async with open_checkpointer(
                 tmp_path / f"noncanonical-{malformation}.sqlite3"
             ) as saver:
-                graph = _build_planner_graph(saver, model)
-                await graph.ainvoke(
-                    state.model_dump(mode="json"),
-                    config,
-                    context=runtime,
-                    durability="sync",
-                )
+                graph = _build_planner_graph(saver, model, telemetry=telemetry)
+                with telemetry.start_execution(
+                    ExecutionCorrelations(
+                        request_id=state.request_id,
+                        thread_id=state.thread_id,
+                        execution_id=state.execution_id,
+                        case_id=state.request.case_id,
+                        company_id=state.identity.company_id,
+                        user_id=state.identity.user_id,
+                        planner_enabled=True,
+                    )
+                ).activate():
+                    await graph.ainvoke(
+                        state.model_dump(mode="json"),
+                        config,
+                        context=runtime,
+                        durability="sync",
+                    )
                 return AgentState.model_validate(
                     (await graph.aget_state(config)).values
                 )
@@ -2785,6 +2833,9 @@ def test_planner_rejects_noncanonical_raw_proposal_wire(
     assert state.planner_failure is not None
     assert state.planner_failure.stage == "planner_tool"
     assert state.planner_failure.code == "invalid_tool_result"
+    tool_span = next(span for span in telemetry.spans if span.name is SpanName.TOOL)
+    assert dict(tool_span.attributes)["outcome"] == "error"
+    assert dict(tool_span.attributes)["error_code"] == "tool_error"
 
 
 @pytest.mark.parametrize(
@@ -3113,7 +3164,8 @@ def test_planner_generated_proposal_uses_policy_and_executes_once(tmp_path):
         ),
     ],
 )
-def test_all_write_flows_use_public_planner_writer_gate_and_replay_once(
+@pytest.mark.parametrize("telemetry_kind", ["null", "recording"])
+def test_all_write_flows_pair_null_and_recording_without_business_drift(
     tmp_path,
     slug,
     proposal,
@@ -3123,8 +3175,14 @@ def test_all_write_flows_use_public_planner_writer_gate_and_replay_once(
     write_path,
     decision,
     requires_preflight,
+    telemetry_kind,
 ):
     requests: list[httpx.Request] = []
+    telemetry = (
+        NullTelemetry()
+        if telemetry_kind == "null"
+        else RecordingTelemetry(pseudonym_key=b"p" * 32)
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -3171,6 +3229,7 @@ def test_all_write_flows_use_public_planner_writer_gate_and_replay_once(
                     saver,
                     planner=Planner(planner_model),
                     writer=Writer(writer_model),
+                    telemetry=telemetry,
                 )
                 uninterrupted_ainvoke = graph.ainvoke
 
@@ -3198,6 +3257,7 @@ def test_all_write_flows_use_public_planner_writer_gate_and_replay_once(
                     saver,
                     planner=Planner(planner_model),
                     writer=Writer(writer_model),
+                    telemetry=telemetry,
                 )
                 completed = await invoke_agent(
                     resumed_graph,
@@ -3246,6 +3306,12 @@ def test_all_write_flows_use_public_planner_writer_gate_and_replay_once(
         assert write_request.headers["idempotency-key"] == (
             completed.intents[0].idempotency_key
         )
+    if isinstance(telemetry, RecordingTelemetry):
+        action_spans = [
+            span for span in telemetry.spans if span.name is SpanName.ACTION
+        ]
+        assert len(action_spans) == 1
+        assert dict(action_spans[0].attributes)["attempt"] == 1
 
 
 @pytest.mark.parametrize(
@@ -3712,9 +3778,16 @@ def test_writer_graph_projection_excludes_every_non_allowlisted_state_sentinel(
         assert forbidden not in current_writer_payload
 
 
-def test_writer_format_repair_survives_checkpoint_without_repeating_planner(
+@pytest.mark.parametrize("telemetry_kind", ["null", "recording"])
+def test_writer_repair_pairs_null_and_recording_without_business_drift(
     tmp_path,
+    telemetry_kind,
 ):
+    telemetry = (
+        NullTelemetry()
+        if telemetry_kind == "null"
+        else RecordingTelemetry(pseudonym_key=b"p" * 32)
+    )
     planner_model = _ScriptedPlannerModel(
         selector_responses=(AIMessage(content=""),),
         terminal_responses=(
@@ -3781,6 +3854,7 @@ def test_writer_format_repair_survives_checkpoint_without_repeating_planner(
                     saver,
                     planner=Planner(planner_model),
                     writer=writer,
+                    telemetry=telemetry,
                 )
                 await graph.ainvoke(
                     state.model_dump(mode="json"),
@@ -3796,6 +3870,7 @@ def test_writer_format_repair_survives_checkpoint_without_repeating_planner(
                         saver,
                         planner=Planner(planner_model),
                         writer=writer,
+                        telemetry=telemetry,
                     ),
                     request=request,
                     runtime=runtime,
@@ -4435,6 +4510,7 @@ def test_repeated_planner_call_terminates_safely_without_second_http(tmp_path):
 
 def test_read_transport_error_is_observed_and_never_retried(tmp_path):
     attempts = 0
+    telemetry = RecordingTelemetry(pseudonym_key=b"p" * 32)
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal attempts
@@ -4479,7 +4555,7 @@ def test_read_transport_error_is_observed_and_never_retried(tmp_path):
         try:
             async with open_checkpointer(tmp_path / "transport.sqlite3") as saver:
                 return await invoke_agent(
-                    _build_planner_graph(saver, model),
+                    _build_planner_graph(saver, model, telemetry=telemetry),
                     request=_request(),
                     runtime=runtime,
                     thread_id="thread_transport_error",
@@ -4502,6 +4578,9 @@ def test_read_transport_error_is_observed_and_never_retried(tmp_path):
     assert state.planner_failure is None
     assert state.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
     assert state.resume_anchor is ResumeAnchor.RELEASE_GATE
+    tool_span = next(span for span in telemetry.spans if span.name is SpanName.TOOL)
+    assert dict(tool_span.attributes)["outcome"] == "error"
+    assert dict(tool_span.attributes)["error_code"] == "tool_error"
 
 
 def test_degraded_read_is_persisted_and_reaches_structured_terminal(tmp_path):

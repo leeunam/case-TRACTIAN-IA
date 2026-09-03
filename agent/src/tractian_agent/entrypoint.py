@@ -41,13 +41,18 @@ from tractian_agent.observability import (
     ResponseSpanAttributes,
     SpanName,
     TraceId,
+    activate_trace_fail_open,
+    span_fail_open,
+    start_execution_fail_open,
 )
 from tractian_agent.state import (
     AgentDecision,
     AgentState,
+    ReleaseGateOutcome,
     ResumeAnchor,
     ReviewExpiry,
     ReviewRecord,
+    ReviewOperation,
     ReviewReply,
     ReviewStatus,
     ThreadScope,
@@ -1220,7 +1225,10 @@ def _safe_execution_trace(
     execution_id: str,
     review_resumed: bool,
 ):
-    telemetry = getattr(graph, "telemetry", None)
+    try:
+        telemetry = getattr(graph, "telemetry", None)
+    except BaseException:
+        telemetry = None
     if not isinstance(telemetry, AgentTelemetry):
         telemetry = NullTelemetry()
     try:
@@ -1234,21 +1242,59 @@ def _safe_execution_trace(
             planner_enabled=bool(getattr(graph, "planner_enabled", False)),
             review_resumed=review_resumed,
         )
-        return telemetry.start_execution(correlations)
-    except Exception:
+        return start_execution_fail_open(telemetry, correlations)
+    except BaseException:
         # Telemetria nunca amplia a validação da fronteira de negócio.
-        return NullTelemetry().start_execution(
-            ExecutionCorrelations(
-                request_id="unavailable",
-                thread_id="unavailable",
-                execution_id="unavailable",
-                case_id="unavailable",
-                company_id="unavailable",
-                user_id="unavailable",
-                planner_enabled=bool(getattr(graph, "planner_enabled", False)),
-                review_resumed=review_resumed,
-            )
+        fallback = ExecutionCorrelations(
+            request_id="unavailable",
+            thread_id="unavailable",
+            execution_id="unavailable",
+            case_id="unavailable",
+            company_id="unavailable",
+            user_id="unavailable",
+            planner_enabled=bool(getattr(graph, "planner_enabled", False)),
+            review_resumed=review_resumed,
         )
+        return start_execution_fail_open(NullTelemetry(), fallback)
+
+
+def _state_observability_status(
+    state: AgentState,
+    *,
+    replayed: bool,
+) -> tuple[Outcome, ErrorCode]:
+    """Classifica somente enums/contratos do estado, nunca mensagens."""
+
+    if replayed:
+        return Outcome.REPLAYED, ErrorCode.NONE
+    if state.final_result is None:
+        return Outcome.SUSPENDED, ErrorCode.NONE
+    if state.review_expiry is not None:
+        return Outcome.DENIED, ErrorCode.REVIEW
+    if (
+        state.review_audit is not None
+        and state.review_audit.operation is ReviewOperation.REJECT
+    ):
+        return Outcome.DENIED, ErrorCode.REVIEW
+    current_intents = tuple(
+        intent for intent in state.intents if intent.request_id == state.request_id
+    )
+    if current_intents:
+        status = current_intents[-1].status
+        if status is IntentStatus.DENIED:
+            return Outcome.DENIED, ErrorCode.POLICY
+        if status is IntentStatus.UNCERTAIN:
+            return Outcome.UNCERTAIN, ErrorCode.ACTION
+        if status is IntentStatus.FAILED:
+            return Outcome.ERROR, ErrorCode.ACTION
+    if state.release_gate is not None:
+        if state.release_gate.outcome is ReleaseGateOutcome.REQUEST_INFORMATION:
+            return Outcome.DENIED, ErrorCode.GATE
+        if state.release_gate.outcome is ReleaseGateOutcome.REQUEST_CONFIRMATION:
+            return Outcome.SUSPENDED, ErrorCode.GATE
+        if state.release_gate.outcome is ReleaseGateOutcome.REQUIRE_HUMAN_REVIEW:
+            return Outcome.DENIED, ErrorCode.GATE
+    return Outcome.OK, ErrorCode.NONE
 
 
 async def invoke_agent_observed(
@@ -1278,8 +1324,12 @@ async def invoke_agent_observed(
         review_resumed=review_reply is not None,
     )
     planner_enabled = bool(getattr(graph, "planner_enabled", False))
-    with trace.activate():
-        with trace.span(SpanName.REQUEST, trace.request_attributes) as request_span:
+    with activate_trace_fail_open(trace):
+        with span_fail_open(
+            trace,
+            SpanName.REQUEST,
+            trace.request_attributes,
+        ) as request_span:
             try:
                 state = await _invoke_agent_unobserved(
                     graph,
@@ -1296,22 +1346,20 @@ async def invoke_agent_observed(
                     reviewer=reviewer,
                 )
                 replayed = state.execution_id != execution_id
-                outcome = (
-                    Outcome.REPLAYED
-                    if replayed
-                    else Outcome.SUSPENDED
-                    if state.final_result is None
-                    else Outcome.OK
+                outcome, error_code = _state_observability_status(
+                    state,
+                    replayed=replayed,
                 )
-                with trace.span(
+                with span_fail_open(
+                    trace,
                     SpanName.RESPONSE,
                     ResponseSpanAttributes(
                         planner_enabled=planner_enabled,
                         replayed=replayed,
                     ),
                 ) as response_span:
-                    response_span.finish(outcome)
-                request_span.finish(outcome)
+                    response_span.finish(outcome, error_code)
+                request_span.finish(outcome, error_code)
                 return AgentInvocationResult(state=state, trace_id=trace.trace_id)
             except BaseException as error:
                 cancelled = isinstance(error, asyncio.CancelledError)
@@ -1322,7 +1370,8 @@ async def invoke_agent_observed(
                     if isinstance(error, AgentInvocationProtocolError)
                     else ErrorCode.RUNTIME
                 )
-                with trace.span(
+                with span_fail_open(
+                    trace,
                     SpanName.RESPONSE,
                     ResponseSpanAttributes(
                         planner_enabled=planner_enabled,

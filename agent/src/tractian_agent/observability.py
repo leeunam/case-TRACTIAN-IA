@@ -16,6 +16,7 @@ from enum import Enum
 import hashlib
 import hmac
 import importlib
+import os
 from time import perf_counter
 import secrets
 from typing import Any, Literal, Protocol
@@ -395,6 +396,9 @@ class _RecordingBackend:
 _CURRENT_TRACE: ContextVar[ExecutionTrace | None] = ContextVar(
     "tractian_agent_execution_trace", default=None
 )
+_CURRENT_ACTION_ATTEMPT: ContextVar[tuple[ActionName, int] | None] = ContextVar(
+    "tractian_agent_action_attempt", default=None
+)
 
 
 class _SpanScope:
@@ -417,9 +421,9 @@ class _SpanScope:
         try:
             self._handle = self._trace._backend.start_span(
                 self._name,
-                self._attributes.model_dump(mode="json"),
+                self._attributes.model_dump(mode="json", exclude_none=True),
             )
-        except Exception:
+        except BaseException:
             self._handle = None
         return self
 
@@ -448,23 +452,26 @@ class _SpanScope:
         if self._handle is not None:
             try:
                 self._handle.finish(self._outcome, self._error_code)
-            except Exception:
+            except BaseException:
                 pass
             try:
                 self._handle.close(duration)
-            except Exception:
+            except BaseException:
                 pass
-        self._trace._record_metrics(
-            self._name,
-            duration,
-            self._outcome,
-            self._error_code,
-            replayed=(
-                self._outcome is Outcome.REPLAYED or self._attributes.replayed
-                if isinstance(self._attributes, ResponseSpanAttributes)
-                else self._outcome is Outcome.REPLAYED
-            ),
-        )
+        try:
+            self._trace._record_metrics(
+                self._name,
+                duration,
+                self._outcome,
+                self._error_code,
+                replayed=(
+                    self._outcome is Outcome.REPLAYED or self._attributes.replayed
+                    if isinstance(self._attributes, ResponseSpanAttributes)
+                    else self._outcome is Outcome.REPLAYED
+                ),
+            )
+        except BaseException:
+            pass
         # Nunca suprime a exceção do negócio.
         return False
 
@@ -531,12 +538,108 @@ class ExecutionTrace:
         for metric_name, value in operations:
             try:
                 self._backend.record_metric(metric_name, value, labels)
-            except Exception:
+            except BaseException:
                 pass
 
 
 def current_execution_trace() -> ExecutionTrace | None:
     return _CURRENT_TRACE.get()
+
+
+class _FailOpenSpanHandle:
+    """Suprime somente falhas da fachada, nunca exceções do negócio."""
+
+    def __init__(self, handle: object | None) -> None:
+        self._handle = handle
+
+    def finish(
+        self,
+        outcome: Outcome,
+        error_code: ErrorCode = ErrorCode.NONE,
+    ) -> None:
+        if self._handle is None:
+            return
+        try:
+            finish = getattr(self._handle, "finish")
+            finish(outcome, error_code)
+        except BaseException:
+            pass
+
+
+@contextmanager
+def activate_trace_fail_open(trace: ExecutionTrace) -> Iterator[ExecutionTrace]:
+    """Ativa o contexto conhecido mesmo se a implementação injetada falhar."""
+
+    outer_token = _CURRENT_TRACE.set(trace)
+    activation = None
+    entered = False
+    try:
+        try:
+            activation = trace.activate()
+            activation.__enter__()
+            entered = True
+        except BaseException:
+            activation = None
+        active_token = _CURRENT_TRACE.set(trace)
+        try:
+            yield trace
+        finally:
+            _CURRENT_TRACE.reset(active_token)
+            if entered and activation is not None:
+                try:
+                    activation.__exit__(None, None, None)
+                except BaseException:
+                    pass
+    finally:
+        _CURRENT_TRACE.reset(outer_token)
+
+
+@contextmanager
+def span_fail_open(
+    trace: ExecutionTrace,
+    name: SpanName,
+    attributes: SpanAttributes,
+) -> Iterator[_FailOpenSpanHandle]:
+    """Executa todo o protocolo do span sem entregar exceções do negócio."""
+
+    context_manager = None
+    entered = False
+    handle = None
+    try:
+        try:
+            context_manager = trace.span(name, attributes)
+            handle = context_manager.__enter__()
+            entered = True
+        except BaseException:
+            context_manager = None
+        yield _FailOpenSpanHandle(handle)
+    finally:
+        if entered and context_manager is not None:
+            try:
+                context_manager.__exit__(None, None, None)
+            except BaseException:
+                pass
+
+
+@contextmanager
+def bind_action_attempt(action: ActionName, attempt: int) -> Iterator[None]:
+    """Propaga somente catálogo/ordinal até a fronteira HTTP modificadora."""
+
+    if (
+        not isinstance(action, ActionName)
+        or type(attempt) is not int
+        or not 1 <= attempt <= 2
+    ):
+        raise TypeError("tentativa de ação deve usar catálogo e ordinal válidos")
+    token = _CURRENT_ACTION_ATTEMPT.set((action, attempt))
+    try:
+        yield
+    finally:
+        _CURRENT_ACTION_ATTEMPT.reset(token)
+
+
+def current_action_attempt() -> tuple[ActionName, int] | None:
+    return _CURRENT_ACTION_ATTEMPT.get()
 
 
 class AgentTelemetry:
@@ -612,6 +715,21 @@ class NullTelemetry(AgentTelemetry):
 
     def __init__(self) -> None:
         super().__init__(pseudonym_key=secrets.token_bytes(32), backend=_NullBackend())
+
+
+def start_execution_fail_open(
+    telemetry: AgentTelemetry,
+    correlations: ExecutionCorrelations,
+) -> ExecutionTrace:
+    """Isola inclusive ``BaseException`` originada pela telemetria injetada."""
+
+    try:
+        trace = telemetry.start_execution(correlations)
+        if not isinstance(trace, ExecutionTrace):
+            raise TypeError("telemetria devolveu trace incompatível")
+        return trace
+    except BaseException:
+        return NullTelemetry().start_execution(correlations)
 
 
 class RecordingTelemetry(AgentTelemetry):
@@ -724,15 +842,28 @@ def build_agent_telemetry(
 ) -> AgentTelemetry:
     """Habilita exportação apenas após validar todo o opt-in local."""
 
-    source = {} if environ is None else environ
+    environment = os.environ if environ is None else environ
+    source: dict[str, str] = {}
+    try:
+        for name in (
+            "TRACTIAN_LOGFIRE_ENABLED",
+            "LOGFIRE_TOKEN",
+            "TRACTIAN_LOGFIRE_PSEUDONYM_KEY",
+        ):
+            try:
+                source[name] = environment[name]
+            except KeyError:
+                pass
+    except BaseException:
+        return NullTelemetry()
     if source.get("TRACTIAN_LOGFIRE_ENABLED") != "true":
         return NullTelemetry()
     if not _valid_token(source.get("LOGFIRE_TOKEN")):
         return NullTelemetry()
-    if _pseudonym_key(source) is None:
+    pseudonym_key = _pseudonym_key(source)
+    if pseudonym_key is None:
         return NullTelemetry()
     token = source["LOGFIRE_TOKEN"]
-    pseudonym_key = _pseudonym_key(source)
     assert isinstance(token, str) and pseudonym_key is not None
     try:
         sdk = (sdk_loader or _default_sdk_loader)()
@@ -752,6 +883,6 @@ def build_agent_telemetry(
                 resource_detectors=(),
             ),
         )
-    except Exception:
+    except BaseException:
         return NullTelemetry()
     return LogfireTelemetry(pseudonym_key=pseudonym_key, client=configured)
