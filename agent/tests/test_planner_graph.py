@@ -21,7 +21,11 @@ import tractian_agent.entrypoint as entrypoint_module
 from tractian_agent.checkpoint import open_checkpointer
 from tractian_agent.client import IndustrialApiClient
 from tractian_agent.contracts import Identity, ResponseMode, SupportRequest
-from tractian_agent.entrypoint import AgentInvocationProtocolError, invoke_agent
+from tractian_agent.entrypoint import (
+    AgentInvocationProtocolError,
+    invoke_agent,
+    invoke_agent_observed,
+)
 from tractian_agent.human_review import (
     ReviewApproveReply,
     ReviewEditReply,
@@ -600,7 +604,7 @@ def test_planner_read_pairs_null_and_recording_without_business_drift(
                     writer=writer,
                     telemetry=telemetry,
                 )
-                state = await invoke_agent(
+                observed = await invoke_agent_observed(
                     graph,
                     request=_request(),
                     runtime=runtime,
@@ -608,6 +612,7 @@ def test_planner_read_pairs_null_and_recording_without_business_drift(
                     request_id="req_planner_read",
                     execution_id="exec_planner_read",
                 )
+                state = observed.state
                 snapshot = await graph.aget_state(
                     {"configurable": {"thread_id": "thread_planner_read"}}
                 )
@@ -623,11 +628,11 @@ def test_planner_read_pairs_null_and_recording_without_business_drift(
                         )
                     ).values
                 )
-            return state, snapshot, reopened, telemetry
+            return state, snapshot, reopened, telemetry, observed.trace_id
         finally:
             await client.aclose()
 
-    state, snapshot, reopened, telemetry = asyncio.run(scenario())
+    state, snapshot, reopened, telemetry, trace_id = asyncio.run(scenario())
 
     assert len(requests) == 1
     assert requests[0].url.path == "/assets/asset_G501"
@@ -663,6 +668,7 @@ def test_planner_read_pairs_null_and_recording_without_business_drift(
     assert state.planner_failure is None
     assert snapshot.next == ()
     checkpoint_text = repr(snapshot.values)
+    assert trace_id.value not in checkpoint_text
     assert "AIMessage" not in checkpoint_text
     assert "ToolMessage" not in checkpoint_text
     assert "texto livre" not in checkpoint_text
@@ -686,6 +692,27 @@ def test_planner_read_pairs_null_and_recording_without_business_drift(
             SpanName.RESPONSE,
         } <= specialized
         assert SpanName.EVALUATION not in specialized
+        assert {
+            dict(span.attributes)["trace_id"] for span in telemetry.spans
+        } == {trace_id.value}
+        response_spans = [
+            span for span in telemetry.spans if span.name is SpanName.RESPONSE
+        ]
+        assert len(response_spans) == 1
+        assert dict(response_spans[0].attributes)["decision"] == "guide"
+        serialized = (
+            repr(telemetry.spans) + repr(telemetry.metrics)
+        ).casefold()
+        for prohibited in (
+            "consulte o ativo",
+            "asset_g501",
+            "usr_pedro",
+            "comp_mineracao_andes",
+            "req_planner_read",
+            "thread_planner_read",
+            "exec_planner_read",
+        ):
+            assert prohibited not in serialized
 
 
 @pytest.mark.parametrize("telemetry_kind", ["null", "recording"])

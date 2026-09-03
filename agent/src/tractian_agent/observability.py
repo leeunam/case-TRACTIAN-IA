@@ -85,6 +85,15 @@ class ErrorCode(str, Enum):
     CANCELLED = "cancelled"
 
 
+class ResponseDecision(str, Enum):
+    GUIDE = "guide"
+    ACT = "act"
+    ESCALATE = "escalate"
+    REQUEST_INFORMATION = "request_information"
+    REQUEST_CONFIRMATION = "request_confirmation"
+    REQUIRE_HUMAN_REVIEW = "require_human_review"
+
+
 class SpanName(str, Enum):
     REQUEST = "tractian.agent.request"
     NODE = "tractian.agent.node"
@@ -221,6 +230,7 @@ class ReviewSpanAttributes(_SpanAttributes):
 class ResponseSpanAttributes(_SpanAttributes):
     planner_enabled: StrictBool
     replayed: StrictBool
+    decision: ResponseDecision | None = None
 
 
 class EvaluationSpanAttributes(_SpanAttributes):
@@ -727,6 +737,13 @@ def start_execution_fail_open(
         trace = telemetry.start_execution(correlations)
         if not isinstance(trace, ExecutionTrace):
             raise TypeError("telemetria devolveu trace incompatível")
+        if (
+            type(trace.trace_id) is not TraceId
+            or type(trace.request_attributes) is not RequestSpanAttributes
+            or trace.request_attributes.trace_id != trace.trace_id.value
+            or type(trace.review_resumed) is not bool
+        ):
+            raise TypeError("telemetria devolveu metadados de trace incompatíveis")
         return trace
     except BaseException:
         return NullTelemetry().start_execution(correlations)
@@ -851,19 +868,23 @@ def build_agent_telemetry(
             "TRACTIAN_LOGFIRE_PSEUDONYM_KEY",
         ):
             try:
-                source[name] = environment[name]
+                value = environment[name]
             except KeyError:
                 pass
+            else:
+                if type(value) is not str:
+                    return NullTelemetry()
+                source[name] = value
+        if source.get("TRACTIAN_LOGFIRE_ENABLED") != "true":
+            return NullTelemetry()
+        if not _valid_token(source.get("LOGFIRE_TOKEN")):
+            return NullTelemetry()
+        pseudonym_key = _pseudonym_key(source)
+        if pseudonym_key is None:
+            return NullTelemetry()
+        token = source["LOGFIRE_TOKEN"]
     except BaseException:
         return NullTelemetry()
-    if source.get("TRACTIAN_LOGFIRE_ENABLED") != "true":
-        return NullTelemetry()
-    if not _valid_token(source.get("LOGFIRE_TOKEN")):
-        return NullTelemetry()
-    pseudonym_key = _pseudonym_key(source)
-    if pseudonym_key is None:
-        return NullTelemetry()
-    token = source["LOGFIRE_TOKEN"]
     assert isinstance(token, str) and pseudonym_key is not None
     try:
         sdk = (sdk_loader or _default_sdk_loader)()

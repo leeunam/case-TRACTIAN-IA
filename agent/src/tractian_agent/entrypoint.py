@@ -38,6 +38,7 @@ from tractian_agent.observability import (
     ExecutionCorrelations,
     NullTelemetry,
     Outcome,
+    ResponseDecision,
     ResponseSpanAttributes,
     SpanName,
     TraceId,
@@ -1323,12 +1324,14 @@ async def invoke_agent_observed(
         execution_id=execution_id,
         review_resumed=review_reply is not None,
     )
+    trace_id = trace.trace_id
+    request_attributes = trace.request_attributes
     planner_enabled = bool(getattr(graph, "planner_enabled", False))
     with activate_trace_fail_open(trace):
         with span_fail_open(
             trace,
             SpanName.REQUEST,
-            trace.request_attributes,
+            request_attributes,
         ) as request_span:
             try:
                 state = await _invoke_agent_unobserved(
@@ -1356,11 +1359,16 @@ async def invoke_agent_observed(
                     ResponseSpanAttributes(
                         planner_enabled=planner_enabled,
                         replayed=replayed,
+                        decision=(
+                            ResponseDecision(state.decision.value)
+                            if state.decision is not None
+                            else None
+                        ),
                     ),
                 ) as response_span:
                     response_span.finish(outcome, error_code)
                 request_span.finish(outcome, error_code)
-                return AgentInvocationResult(state=state, trace_id=trace.trace_id)
+                return AgentInvocationResult(state=state, trace_id=trace_id)
             except BaseException as error:
                 cancelled = isinstance(error, asyncio.CancelledError)
                 error_code = (

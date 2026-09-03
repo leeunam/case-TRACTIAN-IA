@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável, checkpointer SQLite de desenvolvimento e fachada manual Logfire opt-in. As Fases 1 a 9 estão concluídas; o aceite integrado da Fase 10 permanece na Task 19. O runner Pydantic Evals continua planejado em [`TASKS.md`](./TASKS.md), portanto o grafo ainda não é um agente de produção.
+> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável, checkpointer SQLite de desenvolvimento e fachada manual Logfire opt-in. As Fases 1 a 10 estão concluídas. O runner Pydantic Evals continua planejado em [`TASKS.md`](./TASKS.md), portanto o grafo ainda não é um agente de produção.
 
 ## Problema
 
@@ -132,6 +132,15 @@ operacionais externos da conta Logfire: devem ser configurados e monitorados
 fora deste runtime. O código limita token/chave, contratos e labels, mas não
 afirma controlar retenção do backend. Rotacionar a chave quebra deliberadamente
 a correlação histórica dos pseudônimos.
+
+O aceite integrado percorreu consulta completa, ledger, writer e gate; leituras
+parciais, conflitantes, obsoletas e com falha; revisão humana após reabertura do
+SQLite; cinco escritas, retry e replay; e exportação real em memória pelo SDK.
+Subprocessos limpos provaram que o caminho padrão não carrega o Logfire nem o
+plugin Pydantic. O span de resposta registra somente a decisão fechada e o
+resultado operacional. A matriz focada passou com 71 testes, os fluxos de
+escrita com 235 e `make test` com 99 testes da API e 1.759 do agente. O único
+warning é a depreciação pendente já conhecida de `python_multipart` no Starlette.
 
 ### Persistência e idempotência
 

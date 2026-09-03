@@ -38,6 +38,7 @@ from tractian_agent.observability import (
     Pseudonymizer,
     RecordingTelemetry,
     RequestSpanAttributes,
+    ResponseDecision,
     ResponseSpanAttributes,
     SpanName,
     TraceId,
@@ -167,6 +168,19 @@ def test_recording_telemetry_accepts_only_typed_spans_and_safe_metric_labels():
 
     with pytest.raises(TypeError):
         trace.span(SpanName.NODE, trace.request_attributes)
+
+    with pytest.raises(ValidationError):
+        ResponseSpanAttributes(
+            planner_enabled=True,
+            replayed=False,
+            decision="texto livre",
+        )
+
+    assert ResponseSpanAttributes(
+        planner_enabled=True,
+        replayed=False,
+        decision=ResponseDecision.GUIDE,
+    ).decision is ResponseDecision.GUIDE
 
 
 def test_complete_opt_in_configures_only_the_manual_logfire_instance():
@@ -307,6 +321,41 @@ def test_environment_snapshot_failure_is_null_and_inert():
             raise _TelemetryBaseError
 
     assert isinstance(build_agent_telemetry(BrokenEnvironment()), NullTelemetry)
+
+
+@pytest.mark.parametrize("broken_field", ["token", "pseudonym_key"])
+def test_environment_value_failure_is_null_and_never_loads_sdk(broken_field):
+    class BrokenToken(str):
+        def strip(self, *args, **kwargs):
+            raise _TelemetryBaseError
+
+    class BrokenPseudonymKey(str):
+        def encode(self, *args, **kwargs):
+            raise _TelemetryBaseError
+
+    loads = 0
+
+    def loader():
+        nonlocal loads
+        loads += 1
+        raise AssertionError("the loader must not be called")
+
+    environment = {
+        "TRACTIAN_LOGFIRE_ENABLED": "true",
+        "LOGFIRE_TOKEN": (
+            BrokenToken("token") if broken_field == "token" else "token"
+        ),
+        "TRACTIAN_LOGFIRE_PSEUDONYM_KEY": (
+            BrokenPseudonymKey("p" * 32)
+            if broken_field == "pseudonym_key"
+            else "p" * 32
+        ),
+    }
+
+    telemetry = build_agent_telemetry(environment, sdk_loader=loader)
+
+    assert isinstance(telemetry, NullTelemetry)
+    assert loads == 0
 
 
 def test_build_telemetry_without_argument_reads_real_environment_snapshot(
@@ -872,6 +921,74 @@ def test_public_invocation_is_fail_open_for_every_telemetry_operation(
                 execution_id="execution_fault_matrix",
             )
         return baseline, observed
+
+    baseline, observed = asyncio.run(scenario())
+
+    assert observed.state.model_dump_json() == baseline.model_dump_json()
+    assert re.fullmatch(r"trc_[0-9a-f]{32}", observed.trace_id.value)
+
+
+@pytest.mark.parametrize("corruption_stage", ["start", "activate"])
+def test_public_invocation_uses_a_safe_trace_snapshot(corruption_stage):
+    class CorruptingTelemetry(RecordingTelemetry):
+        def start_execution(self, correlations):
+            trace = super().start_execution(correlations)
+            if corruption_stage == "start":
+                trace.trace_id = "invalid-trace-id"
+                return trace
+
+            original_activate = trace.activate
+
+            class MutatingActivation:
+                def __enter__(self):
+                    entered = original_activate()
+                    entered.__enter__()
+                    self.entered = entered
+                    trace.trace_id = "invalid-trace-id"
+                    return trace
+
+                def __exit__(self, *args):
+                    return self.entered.__exit__(*args)
+
+            trace.activate = MutatingActivation
+            return trace
+
+    async def scenario():
+        request = SupportRequest(
+            case_id="case_tkt_inv_04",
+            ticket_id="TKT-INV-04",
+            asset_id="asset_G501",
+            message="Mensagem não exportável.",
+            identity=Identity(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+            ),
+        )
+        async with IndustrialApiClient("https://industrial.invalid") as client:
+            runtime = ReadToolRuntime.create(
+                user_id="usr_pedro",
+                company_id="comp_mineracao_andes",
+                permissions=frozenset({"read"}),
+                central_asset_id="asset_G501",
+                client=client,
+            )
+            baseline = await invoke_agent(
+                _MinimalGraph(NullTelemetry()),
+                request=request,
+                runtime=runtime,
+                thread_id="thread_corrupt_trace",
+                request_id="request_corrupt_trace",
+                execution_id="execution_corrupt_trace",
+            )
+            observed = await invoke_agent_observed(
+                _MinimalGraph(CorruptingTelemetry(pseudonym_key=b"p" * 32)),
+                request=request,
+                runtime=runtime,
+                thread_id="thread_corrupt_trace",
+                request_id="request_corrupt_trace",
+                execution_id="execution_corrupt_trace",
+            )
+            return baseline, observed
 
     baseline, observed = asyncio.run(scenario())
 

@@ -472,12 +472,36 @@ julgamento ou posterior à auditoria, até o segundo gate.
 
 **Decidir:** atributos permitidos, pseudonimização, retenção e limites do plano.
 
-- [ ] Instrumentar requisição, nós, LLMs, tools, decisão e resultado.
-- [ ] Correlacionar `request_id`, `trace_id`, `experiment_id` e `case_id` quando aplicável.
-- [ ] Remover tokens, credenciais e payloads sensíveis.
-- [ ] Testar a sanitização antes de enviar dados.
+- [x] Instrumentar requisição, nós, LLMs, tools, decisão e resultado.
+- [x] Correlacionar `request_id`, `trace_id`, `experiment_id` e `case_id` quando aplicável.
+- [x] Remover tokens, credenciais e payloads sensíveis.
+- [x] Testar a sanitização antes de enviar dados.
 
 **Aceite:** um funcionário autorizado localiza a execução pelo ID sem expor segredo ou golden set.
+
+**Aceite verificado (03/09/2026):** o runtime usa uma fachada nula por padrão,
+recorder in-memory e adapter Logfire carregado somente após o opt-in triplo. Em
+subprocessos limpos, importar contratos, estado e entrypoint não carregou módulo
+`logfire*` nem o plugin Pydantic, inclusive sob configuração automática
+adversarial. O exporter real em memória foi percorrido recursivamente e não
+conteve sentinelas de token, autorização, mensagem, artifact, evidência,
+provider ou golden set; referências opcionais ausentes não viraram a string
+`null`. Request, nós, planner, writer, tool, policy, POST/PATCH de ação, gate,
+revisão e resposta compartilham o `trace_id` técnico da execução, enquanto IDs
+de domínio são HMAC por tipo. A resposta registra somente decisão fechada e
+resultado operacional; o trace não entra no `AgentState`, resultado ou SQLite.
+O runtime continua emitindo zero spans de avaliação.
+
+A equivalência Null/Recording cobriu fallback, consulta completa, os cinco
+fluxos de escrita, preflight, retry, recovery, repair, revisão com SQLite
+reaberto, replay, concorrência, cancelamento e erros. A auditoria final adicionou
+RED/GREEN para valores de configuração que falham durante validação e para uma
+fachada injetada que adultera seus próprios metadados; ambos agora degradam sem
+alterar o negócio. Passaram 71 testes focados integrados, 235 testes de escrita e
+`make test` com 99 testes da API + 1.759 do agente = 1.858. Ruff passou, e os
+locks offline resolveram 64 pacotes do agente e 55 da API. Permaneceu somente o
+warning conhecido de `python_multipart`. Retenção de 30 dias e limites de volume
+continuam controles externos da conta, não propriedades do ledger ou do código.
 
 ## Fase 11 — runner e checks programáticos
 
@@ -1208,7 +1232,7 @@ de checkpoint/fluxos; atualizar a Fase 9 somente após o aceite.
 **Objetivo:** reconstruir uma execução por `trace_id` usando spans e métricas de
 baixa cardinalidade, sem exportar conteúdo de atendimento ou segredo.
 
-**Estado implementado, pendente do aceite integrado da Task 19:** fachada nula,
+**Estado implementado e aceito na Task 19:** fachada nula,
 recorder seguro e adapter Logfire manual; opt-in triplo validado antes do import;
 correlações HMAC por domínio; envelope público sem persistência do `trace_id`;
 spans de request, nós, planner, writer, tool, política, tentativas de ação, gate,
@@ -1285,3 +1309,9 @@ foi realmente executado, sem antecipar Pydantic Evals ou juízes.
   mantêm Pydantic Evals, juízes e calibração como ausentes.
 - Fazer self-review, commit próprio e revisão final independente de toda a faixa
   antes da integração na `main`.
+
+**Concluída em 03/09/2026:** os cenários integrados e as regressões acima
+comprovaram as quatro fases juntas. README e AGENTS refletem somente os
+componentes executados; Pydantic Evals, juízes, calibração e a Fase 11 permanecem
+ausentes. Não foi criado comando novo no Makefile porque a observabilidade é uma
+dependência injetável do runtime, não um processo independente.
