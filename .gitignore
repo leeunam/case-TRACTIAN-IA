@@ -8,6 +8,10 @@ __pycache__/
 htmlcov/
 build/
 dist/
+node_modules/
+playwright-report/
+test-results/
+*.tsbuildinfo
 *.egg-info/
 
 # Environments and secrets
