@@ -11,7 +11,9 @@ Este é o documento operacional do projeto. O [`LEARNING-GUIDE.md`](./LEARNING-G
 5. Execute os testes e marque itens somente com evidência do critério de aceite.
 6. Registre decisões novas na própria etapa; altere a arquitetura do README apenas se a decisão for global.
 
-Não antecipe frontend, banco vetorial, RAG, multiagentes, fine-tuning, `promptfoo` ou `Ragas`. Eles só entram mediante necessidade demonstrada.
+Não antecipe banco vetorial, RAG, multiagentes, fine-tuning, `promptfoo` ou
+`Ragas`. Frontend e integração Slack foram autorizados somente no escopo das
+Fases 16–19 abaixo; qualquer ampliação continua exigindo decisão explícita.
 
 ## Mapa de estudos
 
@@ -34,6 +36,10 @@ Antes de iniciar uma fase, estude estas etapas do `LEARNING-GUIDE.md`:
 | 13 — calibração | 14 |
 | 14 — providers | 7 e 15 |
 | 15 — entrega | 15 |
+| 16 — backend da demonstração | 1, 2, 5, 8 e 10 |
+| 17 — central de casos | 1, 2 e 10 |
+| 18 — decisões e Slack MCP | 5, 10 e 11 |
+| 19 — fallback e entrega integrada | 7, 10 e 15 |
 
 ## Fase 0 — material-base
 
@@ -634,6 +640,279 @@ exit code zero do runner como qualidade aprovada.
 - [x] Tornar pacing e retries do live explícitos, limitados e reproduzíveis.
 - [ ] Reexecutar `tractian-eval-v5` com cota suficiente e exigir zero `model_failure`.
 - [ ] Exigir writer bem-sucedido em todo path LLM aplicável antes de declarar os tópicos 1–3 concluídos.
+
+## Especificação aprovada — central de casos, filas e Slack MCP
+
+**Estado em 04/09/2026:** desenho aprovado; implementação ainda não iniciada.
+Nenhum item das Fases 16–19 pode ser marcado apenas com mockup ou teste
+isolado. Esta seção é vinculante para a implementação test-first.
+
+### Objetivo e limites
+
+Construir uma demonstração local na qual uma pessoa cria ou duplica um caso,
+acompanha o agente ao vivo, troca entre personas simuladas, inspeciona
+evidências e timeline e responde pedidos humanos. Notificações reais são
+enviadas pelo MCP oficial do Slack a dois canais; o link sempre leva ao
+frontend, único lugar onde uma decisão pode ser submetida.
+
+- A primeira entrega é local e usa `PUBLIC_APP_URL` configurável, inicialmente
+  apontando para `http://localhost`. Publicação e autenticação real ficam fora
+  do escopo.
+- Não existe modo de agente roteirizado no produto. Groq é o provider principal
+  inicial e NVIDIA NIM é o fallback ao vivo; a ordem é configuração e poderá ser
+  invertida após nova comparação offline.
+- As personas e permissões são didáticas. A interface deve exibir de forma
+  permanente que não se trata de autenticação nem produto oficial de produção.
+- O frontend nunca recebe golden set, rubricas, notas de juiz, trace completo,
+  raciocínio interno ou credenciais. O backend não importa o pacote de
+  avaliação; consome `AgentState` somente de forma transitória para produzir
+  projeções allowlisted e entrega as credenciais de ambiente apenas aos
+  adapters, sem persistir ou expor seus valores.
+- Juízes e avaliações continuam offline e nunca participam do atendimento.
+- Não criar RAG, banco vetorial, multiagente, fine-tuning, Redis, RabbitMQ,
+  Kafka ou outro serviço operacional sem nova necessidade demonstrada.
+
+### Componentes e fronteiras
+
+- `frontend/`: SPA React + TypeScript + Vite. Consome somente a fachada do
+  backend da demonstração por REST e SSE.
+- `demo/`: novo serviço FastAPI e novo ambiente Python. Orquestra casos,
+  execuções, personas, decisões, filas, SSE e Slack MCP; depende do pacote
+  `tractian-agent`, mas não duplica planner, writer, policy ou tools.
+- `agent/`: mantém LangGraph, providers, checkpointer, ledger, gate e operações.
+- `api/`: continua sendo somente o sistema industrial simulado acessado pelo
+  cliente do agente; não recebe rotas de interface ou Slack.
+- `.run/demo.sqlite3`: persiste a experiência da demonstração. Continua
+  separado de `.run/agent-checkpoints.sqlite3` e
+  `.run/idempotency.sqlite3`.
+
+O frontend não chama diretamente o agente nem a API industrial. O backend não
+repassa `AgentState` bruto: projeta contratos públicos mínimos e fechados.
+
+### Experiência aprovada
+
+- Cabeçalho persistente com caso atual, status, modo ao vivo, provider usado e
+  seletor de persona.
+- Uma sessão permite alternar entre solicitante, equipe TRACTIAN e autoridade
+  da empresa. A troca muda a visualização e as capacidades, nunca a autoria
+  histórica do caso.
+- Menu fixo à direita: Chat, Casos, Contexto, Evidências, Timeline, Decisões e
+  Simulação. A área ampla à esquerda muda sem perder o caso selecionado.
+- Recursos sem permissão permanecem visíveis com cadeado e explicação; o backend
+  reaplica a autorização independentemente do estado visual.
+- Chat é o fluxo principal. Status de planner, tools, writer, gate, fallback,
+  fila, Slack e retomada aparecem como eventos sanitizados, sem chain of thought.
+- Casos públicos são imutáveis. `Duplicar e editar` cria outro `case_id`; o
+  formulário personalizado aceita apenas empresa, pessoa solicitante, ativo e
+  mensagem. Permissões vêm da persona resolvida pelo backend.
+- A área avançada expõe somente os comportamentos já seguros do simulador:
+  padrão determinístico, dados completos, degradados ou seed explícita válida.
+  Nunca mostra expectativa, resposta correta ou trajetória de referência.
+
+### Contratos públicos iniciais
+
+Os nomes finais podem receber ajustes localizados durante TDD, mas as
+responsabilidades e as negações abaixo não podem ser relaxadas.
+
+- `GET /v1/demo/config`: saúde dos componentes e providers configurados, sem
+  segredos.
+- `GET /v1/personas`: identidades simuladas e permissões públicas.
+- `GET /v1/cases` e `GET /v1/cases/{case_id}`: catálogo e projeção do caso.
+- `POST /v1/cases`: cria caso personalizado ou cópia de caso público.
+- `POST /v1/cases/{case_id}/messages`: persiste a mensagem e enfileira uma
+  execução atômica.
+- `GET /v1/cases/{case_id}/events`: SSE retomável por `Last-Event-ID`.
+- `GET /v1/decisions`: caixa filtrada pela persona resolvida.
+- `POST /v1/decisions/{decision_id}/resolve`: aprova ou rejeita uma única vez.
+- `POST /v1/notifications/{notification_id}/retry`: reenvio manual permitido
+  somente para entrega `failed` ou `uncertain`.
+
+A persona chega por um identificador de demonstração, nunca por uma lista de
+permissões fornecida pelo navegador. O backend resolve empresa e permissões a
+partir dos fixtures confiáveis. ID inexistente, escopo divergente, decisão
+vencida, operação não oferecida ou persona inadequada falham fechados.
+
+### Persistência e filas
+
+`demo.sqlite3` mantém pelo menos `cases`, `case_messages`, `executions`,
+`decision_requests`, `decision_events`, `outbox_events` e
+`delivery_attempts`. Migrações são versionadas e cobertas por abertura,
+fechamento e reabertura reais do SQLite.
+
+`decision_requests` registra trabalho humano da interface e não duplica nem
+substitui `WriteIntent`: intenção industrial continua exclusivamente no estado
+persistido do LangGraph, conforme as invariantes das Fases 4 e 5.
+
+- A criação de mensagem, execução e job ocorre na mesma transação antes de o
+  backend responder sucesso.
+- Workers reclamam jobs com lease limitada e transição atômica. Apenas lease
+  vencida e ausência de efeito ambíguo permitem nova reclamação.
+- Eventos são append-only e recebem ordinal crescente por caso. SSE recupera
+  eventos posteriores ao último ID reconhecido.
+- Execução usa `queued`, `running`, `waiting_human`, `completed` ou `failed`.
+- Decisão usa `pending`, `approved`, `rejected`, `expired` ou `cancelled`.
+- Entrega Slack usa `pending`, `delivering`, `delivered`, `failed` ou
+  `uncertain`.
+- A primeira resposta concorrente válida vence. Repetição byte a byte é replay;
+  resposta incompatível ou posterior recebe `409` e não retoma o grafo.
+- Falha ou reinício nunca repete silenciosamente ação industrial com resultado
+  incerto.
+
+### Personas e decisões humanas
+
+Existem dois contratos distintos:
+
+1. revisão técnica avalia evidências, limitações ou redação e nunca concede
+   permissão para uma escrita;
+2. autorização de ação registra pessoa aprovadora, empresa, permissões, horário,
+   `decision_id` e digest do escopo exato. É consumível uma única vez.
+
+O solicitante original permanece dono do thread. Uma autorização delegada não
+substitui `ThreadScope` nem a identidade de runtime: entra como atestado
+confiável separado e a policy revalida empresa, permissão requerida, ação,
+alvo, parâmetros materiais, justificativa, validade e consumo.
+
+| Situação | Público | Resultado permitido |
+|---|---|---|
+| informação ausente | solicitante | responder no chat, sem efeito |
+| confirmação de ação já permitida | solicitante | aprovar ou negar escopo exato |
+| análise especializada | equipe TRACTIAN | aceitar encaminhamento ou rejeitar |
+| possível retreinamento | equipe TRACTIAN | solicitar avaliação ou rejeitar |
+| revisão bloqueada pelo gate | equipe TRACTIAN | revisar resposta, nunca autorizar escrita |
+| escalonamento do atendimento remoto | equipe TRACTIAN | aceitar fila humana ou rejeitar |
+| atualização de criticidade | autoridade da empresa | aprovar ou negar ativo e valor exatos |
+| reprocesso sem permissão do solicitante | autoridade da empresa | aprovar ou negar análise e justificativa exatas |
+
+Quando revisão técnica e autorização operacional forem necessárias, criar dois
+pedidos encadeados. Aprovação TRACTIAN nunca vira autorização da empresa e o
+inverso também não ocorre.
+
+### Providers ao vivo
+
+- Configuração declara `primary` e `fallback` por papel. Inicialmente ambos os
+  papéis usam Groq como principal e NVIDIA NIM como fallback.
+- Fallback automático aceita somente timeout, `429`, falha de rede ou `5xx`.
+  Parsing inválido, violação de schema, falha de protocolo, negação da policy ou
+  reprovação do gate não acionam outro modelo.
+- Cada chamada registra provider/modelo usados, motivo fechado do fallback,
+  latência e contagem segura. A UI e a timeline tornam a troca explícita.
+- Se ambos falharem, a execução termina com erro sanitizado e novo retry cria
+  outro `execution_id`; não há loop ilimitado nem fallback silencioso.
+- A inversão NIM → Groq exige apenas configuração versionada e evidência do
+  benchmark; não altera contratos ou regras de segurança.
+
+### Slack MCP
+
+- A demonstração usa uma Slack App interna instalada em workspace administrado
+  pelo autor e o MCP oficial do Slack. OAuth, client secret e tokens ficam fora
+  do Git, do SQLite, do frontend e do Logfire.
+- Dois canais configuráveis: equipe TRACTIAN e autoridades da empresa.
+- Slack recebe somente categoria fechada, resumo sanitizado, IDs opacos e link
+  do frontend. Não recebe evidências sensíveis, prompts, outputs brutos,
+  permissões completas, golden set ou trace.
+- Slack somente notifica. Nenhum botão, comando, mensagem ou reação no Slack
+  aprova, rejeita, retoma grafo ou executa operação.
+- O ID externo retornado é persistido após sucesso. Falha inequívoca pode seguir
+  política limitada do worker; resultado ambíguo vira `uncertain` e exige
+  reenvio manual para evitar duplicação silenciosa.
+- O adaptador local existe apenas como test double. Não haverá tela de “Slack
+  fake” nem alegação de integração real quando o smoke opt-in não tiver passado.
+
+### Erros e exposição segura
+
+- Falha do Slack não remove a decisão do frontend nem impede sua resolução.
+- Reconexão do navegador recupera eventos persistidos pelo último ID.
+- Erros de provider, MCP e workers são mapeados para códigos fechados. Cliente
+  recebe mensagem curta e `trace_id`, nunca exceção, credencial ou resposta
+  bruta.
+- Ações ficam desabilitadas enquanto execução ou decisão incompatível estiver
+  ativa. Duplo clique, refresh e duas abas são cobertos por idempotência e
+  concorrência no backend.
+- CORS local usa allowlist explícita; nenhum wildcard acompanha credenciais.
+- A interface inclui aviso persistente “demonstração com dados e identidades
+  simulados”.
+
+### Estratégia de testes e comandos
+
+- Backend: pytest para contratos, migrações, filas, leases, replay SSE,
+  concorrência, roteamento, autorização delegada, retomada e sanitização.
+- Frontend: Vitest + Testing Library para componentes, rotas, persona, estados,
+  cadeados e erros; Playwright para casos ponta a ponta e refresh.
+- Providers e MCP usam doubles estritos em `make test`. A suíte automática não
+  lê credenciais, não toca rede e não consome cota.
+- Smokes reais são opt-in e separados: Groq planner/writer, NIM isolado,
+  fallback Groq → NIM e uma notificação em cada canal Slack. Cada comando
+  registra apenas evidência agregada segura.
+- `make setup` prepara os três ambientes Python e as dependências do frontend;
+  `make demo` inicia API, demo backend, worker e frontend; `make stop` encerra
+  todos; `make test` inclui as novas suítes. Os nomes finais devem aparecer no
+  `Makefile` e no README.
+
+### Limpeza e aceite global
+
+Remover somente código morto comprovado, dependências sem uso, comandos
+substituídos, protótipos temporários e afirmações como “não há frontend”. Não
+apagar dados, contratos, testes, histórico do `TASKS.md`, golden set ou
+artefatos necessários à avaliação. Não migrar ou renomear `api/` e `agent/`
+apenas por estética.
+
+A entrega só termina quando:
+
+- [ ] `make demo` sobe os quatro processos localmente e `make stop` os encerra.
+- [ ] Casos públicos e personalizados percorrem o chat ao vivo e sobrevivem a
+      refresh e reinício do backend.
+- [ ] Um pedido TRACTIAN e uma autorização da empresa percorrem frontend → fila
+      → Slack real → link → decisão → retomada, sem segunda ação.
+- [ ] Groq principal e fallback NIM são comprovados em smokes separados e no
+      roteamento permitido; falhas de qualidade nunca acionam fallback.
+- [ ] Toda a suíte anterior e nova passa individualmente, integrada e em
+      concorrência; lint, build, locks e verificações de segurança passam.
+- [ ] README, `TASKS.md`, `LEARNING-GUIDE.md`, `CONTEXT.md`, `AGENTS.md`,
+      `.env.example` e `Makefile` refletem somente o estado comprovado.
+- [ ] Código e documentação estão commitados na `main`, sem segredos, arquivos
+      temporários, mudanças não relacionadas ou itens obsoletos conhecidos.
+
+## Fase 16 — backend da demonstração e filas
+
+**Estado:** não iniciada. Implementar contratos, `demo.sqlite3`, migrações,
+casos, mensagens, jobs, projeções públicas e SSE retomável por TDD.
+
+- [ ] Criar o serviço `demo/` sem alterar a responsabilidade de `api/`.
+- [ ] Persistir mensagem e job atomicamente; provar lease, recovery e replay.
+- [ ] Integrar o agente pelo entrypoint público e projetar eventos sanitizados.
+- [ ] Cobrir abertura/reabertura do SQLite, concorrência e falhas.
+
+## Fase 17 — central de casos React
+
+**Estado:** não iniciada. Implementar `frontend/`, contratos TypeScript, central
+com menu à direita, seletor de persona, criação/duplicação de casos, Chat,
+Contexto, Evidências, Timeline, Decisões e estados acessíveis.
+
+- [ ] Consumir somente REST/SSE do backend e recuperar reconexões.
+- [ ] Mostrar provider, fallback, estado e aviso de demonstração.
+- [ ] Exibir capacidades bloqueadas com motivo sem confiar no bloqueio visual.
+- [ ] Cobrir componentes e fluxos com Vitest, Testing Library e Playwright.
+
+## Fase 18 — decisões delegadas e Slack MCP
+
+**Estado:** não iniciada. Implementar revisão técnica e autorização de ação como
+contratos distintos, dois canais Slack reais e links para decisão no frontend.
+
+- [ ] Preservar solicitante/`ThreadScope` e validar o atestado do decisor.
+- [ ] Provar a matriz de roteamento e pedidos encadeados.
+- [ ] Implementar outbox, worker, sanitização e reenvio manual seguro.
+- [ ] Comprovar um smoke opt-in por canal sem persistir segredos.
+
+## Fase 19 — fallback, integração e entrega
+
+**Estado:** não iniciada. Implementar o roteador Groq/NIM, executar os cenários
+integrados, revisar segurança, remover apenas itens comprovadamente obsoletos e
+entregar código e documentação na `main`.
+
+- [ ] Aplicar fallback somente aos códigos de disponibilidade aprovados.
+- [ ] Provar Groq → NIM e deixar a ordem inteiramente configurável.
+- [ ] Rodar suítes individuais, cascata, concorrência e smokes reais opt-in.
+- [ ] Atualizar toda documentação somente após cada evidência de aceite.
 
 ## Registro histórico do plano SDD — Fases 5 e 4
 
