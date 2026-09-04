@@ -962,6 +962,89 @@ vindos das threads do `TestClient` e do `aiosqlite`. Os testes passaram a usar
 `uvloop` explicitamente em Unix; o runtime de produção não foi alterado. A
 execução canônica de `make test` terminou com código zero e as contagens acima.
 
+### Especificação vinculante do fechamento técnico
+
+**Estado:** desenho aprovado em conversa; implementação começa somente após a
+revisão desta versão escrita. “Entregue” significa código, documentação e
+evidências técnicas reproduzíveis completos na `main`. Não significa “pronto
+para produção”: a calibração por especialistas da TRACTIAN e a aprovação do
+benchmark de qualidade continuam gates externos obrigatórios.
+
+#### Smoke integrado Slack e decisão
+
+- Criar `make smoke-slack-e2e`, opt-in, que use um SQLite temporário e nunca
+  altere a base normal da demonstração.
+- Produzir pelo fluxo público da aplicação uma revisão técnica para a audiência
+  `tractian` e uma autorização empresarial para `authority`; cada pedido deve
+  criar atomicamente sua decisão e seu evento de outbox.
+- Consumir a outbox com o `SlackDeliveryWorker` e o cliente MCP oficial já
+  usados pelo runtime. Validar canal correto, status `delivered`, comprovante
+  externo não vazio e link opaco no formato
+  `PUBLIC_APP_URL/?decision=<decision_id>`; mensagem não pode conter prompt,
+  trace, segredo, golden set ou parâmetros materiais da ação.
+- Resolver cada decisão pelo endpoint REST usado pelo frontend, com uma persona
+  simulada autorizada para aquela audiência. A persona incorreta deve receber
+  `403`; repetição ou resolução conflitante deve receber `409`.
+- Retomar a execução uma única vez e verificar o resultado correspondente à
+  aprovação/rejeição. Para escrita, o ledger/idempotência deve provar que não
+  ocorreu segunda ação industrial. O teste do link na SPA continua coberto por
+  Playwright; o smoke não tenta automatizar a interface do Slack nem aprovar
+  dentro dele.
+- Falha ou resposta ambígua do MCP encerra o comando com código não zero e
+  preserva o estado `failed`/`uncertain`; não há reenvio automático inseguro.
+  A saída e o relatório contêm somente IDs opacos, estados e comprovantes
+  externos permitidos.
+
+#### Smoke do fallback Groq para NVIDIA NIM
+
+- Criar `make smoke-fallback`, opt-in, com três etapas explícitas: uma chamada
+  mínima real à Groq, uma chamada mínima real à NIM e uma invocação pelo
+  roteador de produção em que a fronteira primária recebe uma falha controlada
+  de disponibilidade.
+- A falha injetada é exclusiva do comando de smoke, não configurável no runtime
+  normal, e representa um `timeout`, erro de rede, `429` ou `5xx`. O resultado
+  deve vir da NIM e registrar provider final e motivo fechado do fallback.
+- Erro de contrato, parsing, conteúdo ou baixa qualidade deve atravessar como
+  falha e nunca chamar a NIM. Esses negativos ficam na suíte automática com
+  doubles, sem consumo de rede.
+- O comando não afirma ter observado uma indisponibilidade espontânea da Groq:
+  ele comprova separadamente a conectividade real dos dois providers e o
+  comportamento do roteador sob uma falha permitida e determinística.
+
+#### Aceite reproduzível, documentação e limpeza
+
+- `make accept` executa o aceite sem credenciais: locks, `make test`, avaliação
+  offline e verificações de segurança existentes. `make accept-live`, opt-in,
+  acrescenta os smokes reais Groq, NIM, fallback e Slack ponta a ponta sem rodar
+  o lote caro de 34 casos ao vivo.
+- Cada smoke grava um relatório JSON sanitizado sob `.run/`, já ignorado pelo
+  Git, e termina com código não zero em `failed` ou `skipped`. Ausência de
+  credencial não pode parecer sucesso.
+- Testes RED devem anteceder cada implementação: contrato do relatório,
+  isolamento do SQLite, duas audiências, autorização, unicidade da retomada,
+  allowlist da mensagem e matriz positiva/negativa de fallback.
+- Atualizar `README.md`, `Makefile`, `.env.example`, `TASKS.md` e a etapa
+  relevante do `LEARNING-GUIDE.md` com comandos, limites e evidências realmente
+  observadas. Remover somente código, dependência ou texto provadamente
+  substituído; preservar histórico, dados, contratos e golden set.
+- O fechamento exige `make accept` verde, `make accept-live` verde com as
+  credenciais locais, revisão do diff, árvore limpa e commit convencional na
+  `main`, com corpo descrevendo implementação, testes e gates externos.
+
+#### Gates externos posteriores à entrega técnica
+
+- A Fase 13 permanece `skipped` até 20–30 rótulos cegos serem produzidos por
+  especialistas da TRACTIAN. O template e o comando de calibração fazem parte
+  da entrega; os rótulos, limiares aprovados e decisão humana não podem ser
+  inventados pela equipe técnica.
+- O agente permanece **não pronto para produção** enquanto o benchmark ao vivo
+  não atingir os critérios aprovados sem `model_failure`. O relatório atual é
+  mantido como evidência de limitação, não convertido em aprovação.
+- LangSmith e Phoenix não entram neste fechamento: Logfire e os relatórios
+  locais já cobrem a necessidade atual. Uma plataforma adicional de avaliação
+  ou traces exige decisão arquitetural futura e não substitui calibração
+  humana.
+
 ## Registro histórico do plano SDD — Fases 5 e 4
 
 Esta seção preserva o plano executado e suas evidências. Afirmações sobre o
