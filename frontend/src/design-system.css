@@ -29,28 +29,28 @@
 
   --white: #ffffff;
   --black: #000000;
-  --success: #22c55e;
-  --success-soft: #86efac;
-  --success-surface: #052e16;
-  --warning: #f59e0b;
-  --warning-soft: #fcd34d;
-  --warning-surface: #451a03;
-  --danger: #ef4444;
-  --danger-soft: #fca5a5;
-  --danger-surface: #450a0a;
+  --success: #16a34a;
+  --success-soft: #166534;
+  --success-surface: #f0fdf4;
+  --warning: #d97706;
+  --warning-soft: #92400e;
+  --warning-surface: #fffbeb;
+  --danger: #dc2626;
+  --danger-soft: #991b1b;
+  --danger-surface: #fef2f2;
 
-  --color-background: var(--slate-950);
-  --color-surface: var(--slate-900);
-  --color-surface-raised: var(--slate-800);
-  --color-surface-active: var(--blue-950);
-  --color-border: var(--slate-700);
-  --color-border-soft: var(--slate-800);
-  --color-text: var(--slate-50);
-  --color-text-muted: var(--slate-400);
-  --color-text-subtle: var(--slate-300);
+  --color-background: var(--slate-50);
+  --color-surface: var(--white);
+  --color-surface-raised: var(--slate-100);
+  --color-surface-active: var(--blue-50);
+  --color-border: var(--slate-300);
+  --color-border-soft: var(--slate-200);
+  --color-text: var(--slate-900);
+  --color-text-muted: var(--slate-600);
+  --color-text-subtle: var(--slate-700);
   --color-action: var(--blue-600);
-  --color-action-hover: var(--blue-500);
-  --color-focus: var(--blue-400);
+  --color-action-hover: var(--blue-700);
+  --color-focus: var(--blue-500);
 
   --space-1: 4px;
   --space-2: 8px;
