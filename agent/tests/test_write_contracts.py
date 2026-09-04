@@ -54,11 +54,14 @@ def _policy_result(
     decision: PolicyDecision = PolicyDecision.ALLOW,
     reason: PolicyReason | None = None,
 ) -> WritePolicyResult:
-    resolved_reason = reason or {
-        PolicyDecision.ALLOW: PolicyReason.AUTHORIZED,
-        PolicyDecision.REQUIRE_CONFIRMATION: PolicyReason.EXPLICIT_APPROVAL_REQUIRED,
-        PolicyDecision.DENY: PolicyReason.MISSING_PERMISSION,
-    }[decision]
+    resolved_reason = (
+        reason
+        or {
+            PolicyDecision.ALLOW: PolicyReason.AUTHORIZED,
+            PolicyDecision.REQUIRE_CONFIRMATION: PolicyReason.EXPLICIT_APPROVAL_REQUIRED,
+            PolicyDecision.DENY: PolicyReason.MISSING_PERMISSION,
+        }[decision]
+    )
     return WritePolicyResult(decision=decision, reason=resolved_reason)
 
 
@@ -466,11 +469,7 @@ _VALID_REASONS = {
 
 @pytest.mark.parametrize(
     ("decision", "reason"),
-    [
-        (decision, reason)
-        for decision in PolicyDecision
-        for reason in PolicyReason
-    ],
+    [(decision, reason) for decision in PolicyDecision for reason in PolicyReason],
 )
 def test_write_intent_enforces_reason_for_each_policy_decision(decision, reason):
     status = {
@@ -749,11 +748,14 @@ def test_non_idempotent_prepared_requires_execution_and_forbids_key_or_expiry(
 ):
     scope = scope_type(**scope_data)
 
-    assert _intent(
-        scope=scope,
-        idempotency_key=None,
-        expires_at=None,
-    ).prepared_execution_id == "exec_02"
+    assert (
+        _intent(
+            scope=scope,
+            idempotency_key=None,
+            expires_at=None,
+        ).prepared_execution_id
+        == "exec_02"
+    )
     with pytest.raises(ValidationError, match="execução"):
         _intent(
             scope=scope,

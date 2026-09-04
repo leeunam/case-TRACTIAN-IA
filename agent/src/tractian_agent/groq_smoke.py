@@ -119,7 +119,9 @@ async def _run_model(provider: ModelProvider, model_id: str) -> _SmokeResult:
     successful_calls = 0
     portuguese = tool_selected = arguments_valid = terminal_valid = False
     try:
-        model = provider.create_chat_model(ModelConfig(model_id=model_id, **_SMOKE_CONFIG))
+        model = provider.create_chat_model(
+            ModelConfig(model_id=model_id, **_SMOKE_CONFIG)
+        )
         selection = await model.bind_tools((_PORTUGUESE_TOOL,)).ainvoke(
             [
                 SystemMessage(
@@ -160,8 +162,7 @@ async def _run_model(provider: ModelProvider, model_id: str) -> _SmokeResult:
         validated_terminal = PlannerTerminalDecision.model_validate(terminal)
         terminal_valid = (
             validated_terminal.decision is PlannerDecisionKind.GUIDE
-            and validated_terminal.stop_reason
-            is PlannerStopReason.SUFFICIENT_EVIDENCE
+            and validated_terminal.stop_reason is PlannerStopReason.SUFFICIENT_EVIDENCE
             and validated_terminal.missing_information is None
         )
         passed = portuguese and tool_selected and arguments_valid and terminal_valid
@@ -258,8 +259,7 @@ def run_smoke(
     runs = _configured_runs(environment)
     if runs is None:
         lines = [
-            _aggregate_result(model_id, (), runs=0)
-            for model_id in SMOKE_MODEL_IDS
+            _aggregate_result(model_id, (), runs=0) for model_id in SMOKE_MODEL_IDS
         ]
         for line in lines:
             print(line, file=output)
@@ -268,8 +268,7 @@ def run_smoke(
         provider = provider_factory.from_env(environment)
     except Exception:
         lines = [
-            _aggregate_result(model_id, (), runs=runs)
-            for model_id in SMOKE_MODEL_IDS
+            _aggregate_result(model_id, (), runs=runs) for model_id in SMOKE_MODEL_IDS
         ]
         for line in lines:
             print(line, file=output)

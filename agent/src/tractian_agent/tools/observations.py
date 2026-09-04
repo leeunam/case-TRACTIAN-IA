@@ -1,4 +1,5 @@
 """Resultado estruturado compartilhado entre tools, trace e futuro ledger."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -98,8 +99,7 @@ def _partial_key_segments(key: str) -> frozenset[str]:
     separated_acronyms = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", key)
     separated_camel = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", separated_acronyms)
     return frozenset(
-        segment.casefold()
-        for segment in re.findall(r"[A-Za-z0-9]+", separated_camel)
+        segment.casefold() for segment in re.findall(r"[A-Za-z0-9]+", separated_camel)
     )
 
 
@@ -109,9 +109,7 @@ def _is_forbidden_partial_key(key: str) -> bool:
 
     if normalized_key in _GENERIC_FORBIDDEN_PARTIAL_KEYS:
         return True
-    if any(
-        fragment in normalized_key for fragment in _SENSITIVE_PARTIAL_KEY_FRAGMENTS
-    ):
+    if any(fragment in normalized_key for fragment in _SENSITIVE_PARTIAL_KEY_FRAGMENTS):
         return True
     if segments & _ALWAYS_SENSITIVE_KEY_SEGMENTS:
         return True

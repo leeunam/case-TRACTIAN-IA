@@ -4,6 +4,7 @@ O módulo recebe apenas ``ToolObservation`` persistida.  Em particular, ele não
 usa ``content``: esse campo serve ao próximo turno do planner e nunca é uma
 fonte de fatos para o ledger.
 """
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -44,23 +45,46 @@ _SOURCE_TIME_KEYS = (
 
 
 def _canonical_json(value: JsonValue) -> str:
-    return json.dumps(value, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def _evidence_id(
-    *, request_id: str, source_kind: EvidenceSourceKind, call_id: str | None = None,
-    intent_id: str | None = None, tool: str | None = None, action: str | None = None,
-    resource: str, fact_path: str,
-    value: JsonValue, mode: ResponseMode, source_at: datetime | None,
-    limitations: tuple[str, ...], quality: EvidenceQuality,
+    *,
+    request_id: str,
+    source_kind: EvidenceSourceKind,
+    call_id: str | None = None,
+    intent_id: str | None = None,
+    tool: str | None = None,
+    action: str | None = None,
+    resource: str,
+    fact_path: str,
+    value: JsonValue,
+    mode: ResponseMode,
+    source_at: datetime | None,
+    limitations: tuple[str, ...],
+    quality: EvidenceQuality,
     obsolescence: tuple[EvidenceObsolescenceReason, ...],
 ) -> str:
     payload: JsonValue = {
-        "request_id": request_id, "source_kind": source_kind.value,
-        "call_id": call_id, "intent_id": intent_id, "tool": tool, "action": action,
-        "resource": resource, "fact_path": fact_path, "value": value,
-        "mode": mode.value, "source_at": source_at.isoformat() if source_at else None,
-        "limitations": list(limitations), "quality": quality.value,
+        "request_id": request_id,
+        "source_kind": source_kind.value,
+        "call_id": call_id,
+        "intent_id": intent_id,
+        "tool": tool,
+        "action": action,
+        "resource": resource,
+        "fact_path": fact_path,
+        "value": value,
+        "mode": mode.value,
+        "source_at": source_at.isoformat() if source_at else None,
+        "limitations": list(limitations),
+        "quality": quality.value,
         "obsolescence": [reason.value for reason in obsolescence],
     }
     return "sha256:v1:" + hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
@@ -93,7 +117,9 @@ def _parse_source_time(value: object) -> datetime | None:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+    return (
+        parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+    )
 
 
 def _source_at(value: JsonValue) -> datetime | None:
@@ -114,18 +140,26 @@ def _source_at(value: JsonValue) -> datetime | None:
     return None
 
 
-def _limitations(value: Mapping[str, JsonValue], notes: object, *, truncated: bool) -> tuple[str, ...]:
+def _limitations(
+    value: Mapping[str, JsonValue], notes: object, *, truncated: bool
+) -> tuple[str, ...]:
     found: list[str] = []
+
     def visit(node: JsonValue) -> None:
         if isinstance(node, Mapping):
             limitations = node.get("limitations")
             if isinstance(limitations, list):
-                found.extend(item for item in limitations if isinstance(item, str) and item.strip())
+                found.extend(
+                    item
+                    for item in limitations
+                    if isinstance(item, str) and item.strip()
+                )
             for child in node.values():
                 visit(child)
         elif isinstance(node, list):
             for child in node:
                 visit(child)
+
     visit(value)
     if isinstance(notes, str) and notes.strip():
         found.append(notes)
@@ -134,7 +168,9 @@ def _limitations(value: Mapping[str, JsonValue], notes: object, *, truncated: bo
     return tuple(dict.fromkeys(found))
 
 
-def _obsolescence(value: Mapping[str, JsonValue], *, expired: bool) -> tuple[EvidenceObsolescenceReason, ...]:
+def _obsolescence(
+    value: Mapping[str, JsonValue], *, expired: bool
+) -> tuple[EvidenceObsolescenceReason, ...]:
     reasons: list[EvidenceObsolescenceReason] = []
     outcome = value.get("outcome")
     if not isinstance(outcome, Mapping):
@@ -145,12 +181,8 @@ def _obsolescence(value: Mapping[str, JsonValue], *, expired: bool) -> tuple[Evi
     data_quality = outcome.get("data_quality")
     if isinstance(analysis, Mapping) and analysis.get("status") == "stale":
         reasons.append(EvidenceObsolescenceReason.ANALYSIS_STALE)
-    if (
-        isinstance(analyses, list)
-        and any(
-            isinstance(item, Mapping) and item.get("status") == "stale"
-            for item in analyses
-        )
+    if isinstance(analyses, list) and any(
+        isinstance(item, Mapping) and item.get("status") == "stale" for item in analyses
     ):
         reasons.append(EvidenceObsolescenceReason.ANALYSIS_STALE)
     if isinstance(baseline, Mapping) and baseline.get("state") == "invalidated":
@@ -178,7 +210,9 @@ def _canonical_mapping_segments(value: Mapping[str, JsonValue]) -> dict[str, str
     for base in bases.values():
         counts[base] += 1
     return {
-        key: base if counts[base] == 1 else f"{base}__key_{hashlib.sha256(key.encode()).hexdigest()[:12]}"
+        key: base
+        if counts[base] == 1
+        else f"{base}__key_{hashlib.sha256(key.encode()).hexdigest()[:12]}"
         for key, base in bases.items()
     }
 
@@ -198,12 +232,23 @@ def _leaves(value: JsonValue, prefix: str = "") -> Iterable[tuple[str, JsonValue
         yield prefix, value
 
 
-def _gap(reason: EvidenceGapReason, observation: ToolObservation, fact_path: str | None = None) -> EvidenceGap:
-    return EvidenceGap(reason=reason, request_id=observation.request_id, call_id=observation.call_id, fact_path=fact_path)
+def _gap(
+    reason: EvidenceGapReason,
+    observation: ToolObservation,
+    fact_path: str | None = None,
+) -> EvidenceGap:
+    return EvidenceGap(
+        reason=reason,
+        request_id=observation.request_id,
+        call_id=observation.call_id,
+        fact_path=fact_path,
+    )
 
 
 def compile_observations(
-    observations: Sequence[ToolObservation], *, recorded_at: datetime,
+    observations: Sequence[ToolObservation],
+    *,
+    recorded_at: datetime,
     expired_call_ids: frozenset[str] = frozenset(),
 ) -> EvidenceLedger:
     """Compila somente artefatos reidratados e deduplica fatos idênticos."""
@@ -246,14 +291,20 @@ def compile_observations(
         if obsolete:
             gaps.append(_gap(EvidenceGapReason.OBSOLETE, observation))
         quality = (
-            EvidenceQuality.OBSOLETE if obsolete else
-            EvidenceQuality.CLAIMABLE if mode is ResponseMode.COMPLETE and not artifact.truncated else
-            EvidenceQuality.PARTIAL
+            EvidenceQuality.OBSOLETE
+            if obsolete
+            else EvidenceQuality.CLAIMABLE
+            if mode is ResponseMode.COMPLETE and not artifact.truncated
+            else EvidenceQuality.PARTIAL
         )
         source_at = _source_at(outcome)
-        limitations = _limitations(outcome, outcome.get("notes"), truncated=artifact.truncated)
+        limitations = _limitations(
+            outcome, outcome.get("notes"), truncated=artifact.truncated
+        )
         payloads: list[tuple[str, JsonValue]] = [
-            (key, value) for key, value in outcome.items() if key not in _OUTCOME_METADATA and value is not None
+            (key, value)
+            for key, value in outcome.items()
+            if key not in _OUTCOME_METADATA and value is not None
         ]
         partial_data = outcome.get("partial_data")
         if isinstance(partial_data, (dict, list)):
@@ -261,24 +312,38 @@ def compile_observations(
         for root, payload in payloads:
             for fact_path, value in _leaves(payload, root):
                 evidence_id = _evidence_id(
-                    request_id=observation.request_id, call_id=observation.call_id,
-                    source_kind=EvidenceSourceKind.TOOL, tool=artifact.tool_name,
+                    request_id=observation.request_id,
+                    call_id=observation.call_id,
+                    source_kind=EvidenceSourceKind.TOOL,
+                    tool=artifact.tool_name,
                     resource=artifact.source.resource,
-                    fact_path=fact_path, value=value, mode=mode, source_at=source_at,
-                    limitations=limitations, quality=quality, obsolescence=obsolete,
+                    fact_path=fact_path,
+                    value=value,
+                    mode=mode,
+                    source_at=source_at,
+                    limitations=limitations,
+                    quality=quality,
+                    obsolescence=obsolete,
                 )
-                items.append(EvidenceItem(
-                    evidence_id=evidence_id, request_id=observation.request_id,
-                    call_id=observation.call_id, tool=artifact.tool_name,
-                    resource=artifact.source.resource, fact_path=fact_path,
-                    value=JsonSnapshot.capture(value, forbidden_names=frozenset()),
-                    mode=mode, source_at=source_at, recorded_at=recorded_at,
-                    limitations=limitations, quality=quality, obsolescence=obsolete,
-                ))
+                items.append(
+                    EvidenceItem(
+                        evidence_id=evidence_id,
+                        request_id=observation.request_id,
+                        call_id=observation.call_id,
+                        tool=artifact.tool_name,
+                        resource=artifact.source.resource,
+                        fact_path=fact_path,
+                        value=JsonSnapshot.capture(value, forbidden_names=frozenset()),
+                        mode=mode,
+                        source_at=source_at,
+                        recorded_at=recorded_at,
+                        limitations=limitations,
+                        quality=quality,
+                        obsolescence=obsolete,
+                    )
+                )
     unique_items = tuple({item.evidence_id: item for item in items}.values())
-    unique_gaps = tuple(
-        {gap.model_dump_json(): gap for gap in gaps}.values()
-    )
+    unique_gaps = tuple({gap.model_dump_json(): gap for gap in gaps}.values())
     groups: dict[str, list[EvidenceItem]] = defaultdict(list)
     for item in unique_items:
         groups[item.canonical_key].append(item)
@@ -307,7 +372,9 @@ def compile_observations(
 
 
 def compile_action_intents(
-    intents: Sequence[WriteIntent], *, recorded_at: datetime,
+    intents: Sequence[WriteIntent],
+    *,
+    recorded_at: datetime,
 ) -> EvidenceLedger:
     """Projeta somente o efeito terminal tipado; proposal e mensagem são excluídos."""
     if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
@@ -400,9 +467,9 @@ def merge_ledgers(*ledgers: EvidenceLedger) -> EvidenceLedger:
         for key, group in sorted(groups.items())
         if len({_canonical_json(item.value.to_python()) for item in group}) > 1
     )
-    request_ids = {
-        item.request_id for item in items.values()
-    } | {gap.request_id for gap in gaps.values() if gap.request_id is not None}
+    request_ids = {item.request_id for item in items.values()} | {
+        gap.request_id for gap in gaps.values() if gap.request_id is not None
+    }
     return EvidenceLedger(
         request_id=next(iter(request_ids)) if len(request_ids) == 1 else None,
         items=tuple(items.values()),
@@ -419,7 +486,10 @@ def assess_evidence(ledger: EvidenceLedger) -> EvidenceAssessment:
     if not any(item.claimable for item in ledger.items):
         causes.add(EvidenceGapReason.NO_CLAIMABLE_FACT)
     if causes:
-        return EvidenceAssessment(status=EvidenceSufficiency.INSUFFICIENT, causes=tuple(sorted(causes, key=lambda cause: cause.value)))
+        return EvidenceAssessment(
+            status=EvidenceSufficiency.INSUFFICIENT,
+            causes=tuple(sorted(causes, key=lambda cause: cause.value)),
+        )
     return EvidenceAssessment(status=EvidenceSufficiency.SUFFICIENT)
 
 

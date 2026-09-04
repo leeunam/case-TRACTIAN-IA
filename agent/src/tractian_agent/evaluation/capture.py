@@ -59,8 +59,10 @@ def _action_step(state: AgentState, ordinal: int) -> ObservedStep | None:
     else:  # pragma: no cover - união discriminada torna o ramo inalcançável.
         raise ValueError(f"ação persistida desconhecida: {action}")
     succeeded = intent.status is IntentStatus.COMPLETED
-    error_code = None if succeeded else (
-        intent.error.code if intent.error is not None else "ACTION_NOT_COMPLETED"
+    error_code = (
+        None
+        if succeeded
+        else (intent.error.code if intent.error is not None else "ACTION_NOT_COMPLETED")
     )
     return ObservedStep(
         ordinal=ordinal,
@@ -92,11 +94,7 @@ def output_from_agent_state(
         if call.request_id != state.request_id:
             continue
         observation = observations.get(call.call_id)
-        error = (
-            observation.artifact.outcome.error
-            if observation is not None
-            else None
-        )
+        error = observation.artifact.outcome.error if observation is not None else None
         if error is not None:
             failure_codes.append(error.code)
         steps.append(

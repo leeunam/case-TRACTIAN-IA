@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { api } from "./api";
 import type { CaseDetail, CaseEvent, Decision, DemoCase, DemoConfig, Panel, Persona } from "./types";
 import "./styles.css";
@@ -22,12 +22,17 @@ export default function App() {
   const [cases, setCases] = useState<DemoCase[]>([]);
   const [caseId, setCaseId] = useState("");
   const [detail, setDetail] = useState<CaseDetail>();
-  const [panel, setPanel] = useState<Panel>("chat");
+  const [panel, setPanel] = useState<Panel>(() =>
+    new URLSearchParams(window.location.search).has("decision") ? "decisions" : "chat"
+  );
   const [events, setEvents] = useState<CaseEvent[]>([]);
   const [decisions, setDecisions] = useState<Decision[]>([]);
   const [error, setError] = useState("");
 
   const refreshCase = async (id: string) => setDetail(await api.case(id));
+  const refreshDecisions = async () => {
+    if (personaId) setDecisions(await api.decisions(personaId));
+  };
   useEffect(() => {
     Promise.all([api.config(), api.personas(), api.cases()])
       .then(([nextConfig, nextPersonas, nextCases]) => {
@@ -45,12 +50,14 @@ export default function App() {
       typeof EventSource === "undefined"
     ) return;
     const source = new EventSource(api.eventUrl(caseId));
-    source.onmessage = (message) => setEvents((old) => [...old, JSON.parse(message.data)]);
-    navigation.forEach((item) => source.addEventListener(item.id, source.onmessage!));
-    source.addEventListener("agent.completed", (message) => {
-      setEvents((old) => [...old, JSON.parse((message as MessageEvent).data)]);
-      void refreshCase(caseId);
-    });
+    const append = (message: Event) => {
+      const event = JSON.parse((message as MessageEvent).data) as CaseEvent;
+      setEvents((old) => old.some((item) => item.id === event.id) ? old : [...old, event]);
+      if (event.kind === "agent.completed" || event.kind.startsWith("decision.")) {
+        void refreshCase(caseId);
+      }
+    };
+    ["execution.queued", "execution.running", "planner.started", "tools.completed", "agent.completed", "agent.failed", "decision.requested", "decision.approved", "decision.rejected"].forEach((name) => source.addEventListener(name, append));
     return () => source.close();
   }, [caseId]);
 
@@ -90,7 +97,7 @@ export default function App() {
     <main className="workspace">
       <section className="content">
         {error && <div className="error" role="alert">{error}<button onClick={() => setError("")}>fechar</button></div>}
-        {detail && <PanelContent panel={panel} detail={detail} persona={persona} cases={cases} events={events} decisions={decisions} onSelect={selectCase} onDuplicate={duplicate} onRefresh={() => refreshCase(detail.case.id)} onError={setError} />}
+        {detail && <PanelContent panel={panel} detail={detail} persona={persona} personas={personas} cases={cases} events={events} decisions={decisions} onSelect={selectCase} onDuplicate={duplicate} onCreated={(created) => { setCases((old) => [created, ...old]); void selectCase(created.id); }} onRefresh={() => refreshCase(detail.case.id)} onDecisionsRefresh={refreshDecisions} onError={setError} />}
       </section>
       <nav className="right-rail" data-testid="right-menu" aria-label="Áreas da central">
         <div className="rail-caption">Navegação</div>
@@ -101,15 +108,29 @@ export default function App() {
   </div>;
 }
 
-function PanelContent(props: { panel: Panel; detail: CaseDetail; persona?: Persona; cases: DemoCase[]; events: CaseEvent[]; decisions: Decision[]; onSelect(id: string): void; onDuplicate(): void; onRefresh(): void; onError(message: string): void }) {
+function PanelContent(props: { panel: Panel; detail: CaseDetail; persona?: Persona; personas: Persona[]; cases: DemoCase[]; events: CaseEvent[]; decisions: Decision[]; onSelect(id: string): void; onDuplicate(): void; onCreated(value: DemoCase): void; onRefresh(): void; onDecisionsRefresh(): Promise<void>; onError(message: string): void }) {
   const { panel, detail, persona } = props;
   if (panel === "chat") return <Chat detail={detail} persona={persona} onDuplicate={props.onDuplicate} onRefresh={props.onRefresh} onError={props.onError} />;
-  if (panel === "cases") return <Page title="Central de casos" subtitle="Casos públicos são modelos somente leitura; duplique para conversar."><div className="case-grid">{props.cases.map((item) => <button className={`case-card ${item.id === detail.case.id ? "selected" : ""}`} key={item.id} onClick={() => props.onSelect(item.id)}><span>{item.immutable ? "Público" : "Minha simulação"}</span><b>{item.ticket_id}</b><p>{item.initial_message}</p><small>{item.asset_id}</small></button>)}</div></Page>;
+  if (panel === "cases") return <Page title="Central de casos" subtitle="Casos públicos são modelos somente leitura; duplique ou personalize uma cópia."><NewCaseForm key={detail.case.id} base={detail.case} personas={props.personas} onCreated={props.onCreated} onError={props.onError} /><div className="case-grid">{props.cases.map((item) => <button className={`case-card ${item.id === detail.case.id ? "selected" : ""}`} key={item.id} onClick={() => props.onSelect(item.id)}><span>{item.immutable ? "Público" : "Minha simulação"}</span><b>{item.ticket_id}</b><p>{item.initial_message}</p><small>{item.asset_id}</small></button>)}</div></Page>;
   if (panel === "context") return <Page title="Contexto do caso" subtitle="Escopo confiável usado pelo agente."><dl className="facts"><div><dt>Empresa</dt><dd>{detail.case.company_id}</dd></div><div><dt>Solicitante original</dt><dd>{detail.case.requester_id}</dd></div><div><dt>Ativo central</dt><dd>{detail.case.asset_id}</dd></div><div><dt>Thread</dt><dd>{detail.case.id}</dd></div></dl></Page>;
-  if (panel === "evidence") return <Page title="Evidências" subtitle="Resumo sanitizado; sem notas de juiz ou raciocínio interno."><Empty text="As evidências utilizadas aparecerão após a execução ao vivo." /></Page>;
+  if (panel === "evidence") {
+    const tools = [...props.events].reverse().find((item) => item.kind === "tools.completed")?.payload.tool_names as string[] | undefined;
+    const result = [...props.events].reverse().find((item) => item.kind === "agent.completed")?.payload;
+    return <Page title="Evidências" subtitle="Resumo sanitizado; sem notas de juiz ou raciocínio interno.">{tools || result ? <dl className="facts"><div><dt>Tools consultadas</dt><dd>{tools?.join(", ") || "nenhuma"}</dd></div><div><dt>Evidências citadas</dt><dd>{String(result?.evidence_count ?? 0)}</dd></div><div><dt>Limitações</dt><dd>{String(result?.limitation_count ?? 0)}</dd></div><div><dt>Trace público</dt><dd>{String(result?.trace_id ?? "aguardando")}</dd></div></dl> : <Empty text="As evidências utilizadas aparecerão após a execução ao vivo." />}</Page>;
+  }
   if (panel === "timeline") return <Page title="Timeline operacional" subtitle="Eventos persistidos e recuperáveis após reconexão.">{props.events.length ? <ol className="timeline">{props.events.map((event) => <li key={event.id}><b>{event.kind}</b><time>{new Date(event.created_at).toLocaleTimeString()}</time></li>)}</ol> : <Empty text="Nenhum evento novo nesta conexão." />}</Page>;
-  if (panel === "decisions") return <Decisions persona={persona} decisions={props.decisions} onError={props.onError} />;
-  return <Page title="Simulação" subtitle="Apenas comportamentos seguros do simulador industrial."><div className="simulation"><label><input type="radio" defaultChecked name="mode" /> Padrão determinístico</label><label><input type="radio" name="mode" /> Dados completos</label><label><input type="radio" name="mode" /> Dados degradados</label><label><input type="radio" name="mode" /> Seed explícita válida</label></div></Page>;
+  if (panel === "decisions") return <Decisions persona={persona} decisions={props.decisions} onResolved={props.onDecisionsRefresh} onError={props.onError} />;
+  return <Page title="Simulação" subtitle="O modo é definido ao criar a cópia e segue persistido no caso."><dl className="facts"><div><dt>Modo atual</dt><dd>{detail.case.simulation_mode ?? "standard"}</dd></div><div><dt>Seed</dt><dd>{detail.case.seed ?? "gerenciada pelo simulador"}</dd></div></dl></Page>;
+}
+
+function NewCaseForm({ base, personas, onCreated, onError }: { base: DemoCase; personas: Persona[]; onCreated(value: DemoCase): void; onError(message: string): void }) {
+  const [open, setOpen] = useState(false); const [busy, setBusy] = useState(false);
+  const [company, setCompany] = useState(base.company_id); const [requester, setRequester] = useState(base.requester_id);
+  const [asset, setAsset] = useState(base.asset_id); const [message, setMessage] = useState(base.initial_message);
+  const [mode, setMode] = useState("standard"); const [seed, setSeed] = useState("");
+  async function submit(event: FormEvent) { event.preventDefault(); setBusy(true); try { const created = await api.create({ source_case_id: base.immutable ? base.id : base.source_case_id ?? undefined, company_id: company, requester_id: requester, asset_id: asset, message, simulation_mode: mode, ...(mode === "custom_seed" ? { seed } : {}) }); onCreated(created); setOpen(false); } catch (reason) { onError((reason as Error).message); } finally { setBusy(false); } }
+  if (!open) return <button className="primary new-case" onClick={() => setOpen(true)}>Criar ou editar cópia</button>;
+  return <form className="case-form" onSubmit={submit}><label>Empresa<input value={company} onChange={(event) => setCompany(event.target.value)} required /></label><label>Pessoa solicitante<select value={requester} onChange={(event) => { const person = personas.find((item) => item.id === event.target.value); setRequester(event.target.value); if (person?.company_id) setCompany(person.company_id); }}>{personas.filter((item) => item.profile !== "tractian").map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Ativo<input value={asset} onChange={(event) => setAsset(event.target.value)} required /></label><label>Modo<select value={mode} onChange={(event) => setMode(event.target.value)}><option value="standard">Padrão determinístico</option><option value="complete">Dados completos</option><option value="degraded">Dados degradados</option><option value="custom_seed">Seed explícita</option></select></label>{mode === "custom_seed" && <label>Seed<input value={seed} onChange={(event) => setSeed(event.target.value)} required /></label>}<label className="wide">Mensagem<textarea value={message} onChange={(event) => setMessage(event.target.value)} required /></label><div className="wide"><button className="primary" disabled={busy}>{busy ? "Criando…" : "Criar caso"}</button> <button type="button" onClick={() => setOpen(false)}>Cancelar</button></div></form>;
 }
 
 function Chat({ detail, persona, onDuplicate, onRefresh, onError }: { detail: CaseDetail; persona?: Persona; onDuplicate(): void; onRefresh(): void; onError(message: string): void }) {
@@ -123,9 +144,9 @@ function Chat({ detail, persona, onDuplicate, onRefresh, onError }: { detail: Ca
   </Page>;
 }
 
-function Decisions({ persona, decisions, onError }: { persona?: Persona; decisions: Decision[]; onError(message: string): void }) {
+function Decisions({ persona, decisions, onResolved, onError }: { persona?: Persona; decisions: Decision[]; onResolved(): Promise<void>; onError(message: string): void }) {
   const label = persona ? profileLabel[persona.profile] : "Persona";
-  return <Page title="Decisões pendentes" subtitle={`${label}: a permissão é validada novamente no backend.`}>{decisions.length ? decisions.map((item) => <article className="decision" key={item.id}><span>{item.kind}</span><h3>{item.summary}</h3><p>Expira em {new Date(item.expires_at).toLocaleString()}</p><div>{item.allowed_operations.map((operation) => <button key={operation} onClick={() => api.resolve(item.id, persona!.id, operation as "approve" | "reject").catch((reason: Error) => onError(reason.message))}>{operation === "approve" ? "Aprovar" : "Rejeitar"}</button>)}</div></article>) : <div className="locked"><b>🔒 Sem decisões permitidas para esta persona</b><p>Solicitantes, equipe TRACTIAN e autoridade da empresa enxergam caixas diferentes.</p></div>}</Page>;
+  return <Page title="Decisões pendentes" subtitle={`${label}: a permissão é validada novamente no backend.`}>{decisions.length ? decisions.map((item) => <article className="decision" key={item.id}><span>{item.kind}</span><h3>{item.summary}</h3><p>Expira em {new Date(item.expires_at).toLocaleString()}</p><div>{item.allowed_operations.map((operation) => <button key={operation} onClick={() => api.resolve(item.id, persona!.id, operation as "approve" | "reject").then(onResolved).catch((reason: Error) => onError(reason.message))}>{operation === "approve" ? "Aprovar" : "Rejeitar"}</button>)}</div></article>) : <div className="locked"><b>🔒 Sem decisões permitidas para esta persona</b><p>Solicitantes, equipe TRACTIAN e autoridade da empresa enxergam caixas diferentes.</p></div>}</Page>;
 }
 
 function Page({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) { return <div className="page"><div className="page-title"><span className="eyebrow">Case workspace</span><h1>{title}</h1><p>{subtitle}</p></div>{children}</div>; }

@@ -72,7 +72,9 @@ def compare_evaluation_layers(
 
     def passed_at_threshold(run_id: str) -> bool:
         case = judges_by_run[run_id]
-        blind = next(item for item in case.blind_thresholds if item.threshold == threshold)
+        blind = next(
+            item for item in case.blind_thresholds if item.threshold == threshold
+        )
         trajectory = next(
             item for item in case.trajectory_thresholds if item.threshold == threshold
         )

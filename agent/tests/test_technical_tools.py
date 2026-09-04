@@ -35,7 +35,8 @@ def _runtime(
         permissions=permissions,
         central_asset_id="asset_M101",
         client=IndustrialApiClient(
-            "https://simulator.test", transport=httpx.MockTransport(handler)  # type: ignore[arg-type]
+            "https://simulator.test",
+            transport=httpx.MockTransport(handler),  # type: ignore[arg-type]
         ),
         seed="fixed-technical",
     )
@@ -64,7 +65,9 @@ def test_get_baseline_uses_fixed_endpoint_and_derives_only_rms_threshold():
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": _baseline_payload()})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": _baseline_payload()}
+        )
 
     async def invoke():
         runtime = _runtime(handler)
@@ -76,12 +79,26 @@ def test_get_baseline_uses_fixed_endpoint_and_derives_only_rms_threshold():
     result = asyncio.run(invoke())
 
     assert get_baseline.tool_call_schema.model_json_schema()["properties"] == {
-        "asset_id": {"pattern": r"^asset_[A-Za-z0-9_-]{1,64}$", "title": "Asset Id", "type": "string"},
-        "point_id": {"anyOf": [{"pattern": r"^pt_[A-Za-z0-9_-]{1,64}$", "type": "string"}, {"type": "null"}], "default": None, "title": "Point Id"},
+        "asset_id": {
+            "pattern": r"^asset_[A-Za-z0-9_-]{1,64}$",
+            "title": "Asset Id",
+            "type": "string",
+        },
+        "point_id": {
+            "anyOf": [
+                {"pattern": r"^pt_[A-Za-z0-9_-]{1,64}$", "type": "string"},
+                {"type": "null"},
+            ],
+            "default": None,
+            "title": "Point Id",
+        },
     }
     assert requests[0].method == "GET"
     assert requests[0].url.path == "/assets/asset_M101/baseline"
-    assert dict(requests[0].url.params) == {"point_id": "pt_M101_de", "seed": "fixed-technical"}
+    assert dict(requests[0].url.params) == {
+        "point_id": "pt_M101_de",
+        "seed": "fixed-technical",
+    }
     assert result.content.alarm_threshold == 2.9
     assert result.artifact.outcome.baseline.features[0].feature == "bpfo_amplitude"
 
@@ -129,7 +146,10 @@ def test_get_rms_series_normalizes_chronology_and_declares_two_projections():
 
     assert get_rms_series.name == "get_rms_series"
     assert requests[0].url.path == "/assets/asset_M101/rms"
-    assert dict(requests[0].url.params) == {"point_id": "pt_M101_de", "seed": "fixed-technical"}
+    assert dict(requests[0].url.params) == {
+        "point_id": "pt_M101_de",
+        "seed": "fixed-technical",
+    }
     assert result.content.total_samples == 1002
     assert result.content.omitted_samples == 902
     assert len(result.content.samples) == 100
@@ -225,7 +245,10 @@ def test_get_data_quality_preserves_all_quality_fields():
 
     assert get_data_quality.name == "get_data_quality"
     assert requests[0].url.path == "/assets/asset_M101/data-quality"
-    assert dict(requests[0].url.params) == {"point_id": "pt_M101_de", "seed": "fixed-technical"}
+    assert dict(requests[0].url.params) == {
+        "point_id": "pt_M101_de",
+        "seed": "fixed-technical",
+    }
     assert result.content.model_dump() == {
         "asset_id": "asset_M101",
         "point_id": "pt_M101_de",
@@ -245,7 +268,9 @@ TECHNICAL_TOOLS = [
 ]
 
 
-def _complete_payload(name: str, *, asset_id: str = "asset_M101", point_id: str = "pt_M101_de") -> dict[str, object]:
+def _complete_payload(
+    name: str, *, asset_id: str = "asset_M101", point_id: str = "pt_M101_de"
+) -> dict[str, object]:
     if name == "baseline":
         payload = _baseline_payload()
         payload["asset_id"] = asset_id
@@ -279,7 +304,9 @@ def _complete_payload(name: str, *, asset_id: str = "asset_M101", point_id: str 
     }
 
 
-async def _invoke_adapter(tool: object, runtime: ReadToolRuntime, arguments: dict[str, object]):
+async def _invoke_adapter(
+    tool: object, runtime: ReadToolRuntime, arguments: dict[str, object]
+):
     tool_runtime = ToolRuntime(
         state={},
         context=runtime,
@@ -295,7 +322,9 @@ async def _invoke_adapter(tool: object, runtime: ReadToolRuntime, arguments: dic
 
 
 @pytest.mark.parametrize("name,tool,_", TECHNICAL_TOOLS)
-def test_technical_tools_expose_only_strict_asset_and_optional_point_contract(name, tool, _):
+def test_technical_tools_expose_only_strict_asset_and_optional_point_contract(
+    name, tool, _
+):
     schema = tool.tool_call_schema.model_json_schema()
 
     expected_name = "get_rms_series" if name == "rms" else f"get_{name}"
@@ -303,9 +332,20 @@ def test_technical_tools_expose_only_strict_asset_and_optional_point_contract(na
     assert set(schema["properties"]) == {"asset_id", "point_id"}
     assert schema["required"] == ["asset_id"]
     assert schema["properties"]["asset_id"]["pattern"] == r"^asset_[A-Za-z0-9_-]{1,64}$"
-    assert schema["properties"]["point_id"]["anyOf"][0]["pattern"] == r"^pt_[A-Za-z0-9_-]{1,64}$"
+    assert (
+        schema["properties"]["point_id"]["anyOf"][0]["pattern"]
+        == r"^pt_[A-Za-z0-9_-]{1,64}$"
+    )
     serialized = str(schema).lower()
-    for hidden_name in ("runtime", "identity", "permissions", "client", "seed", "url", "method"):
+    for hidden_name in (
+        "runtime",
+        "identity",
+        "permissions",
+        "client",
+        "seed",
+        "url",
+        "method",
+    ):
         assert hidden_name not in serialized
 
 
@@ -319,9 +359,17 @@ def test_invalid_public_point_or_extra_argument_stops_before_http(_, tool, __):
         return httpx.Response(500)
 
     with pytest.raises(ValidationError):
-        asyncio.run(_invoke_adapter(tool, _runtime(handler), {"asset_id": "asset_M101", "point_id": "wrong"}))
+        asyncio.run(
+            _invoke_adapter(
+                tool, _runtime(handler), {"asset_id": "asset_M101", "point_id": "wrong"}
+            )
+        )
     with pytest.raises(ValidationError):
-        asyncio.run(_invoke_adapter(tool, _runtime(handler), {"asset_id": "asset_M101", "unexpected": True}))
+        asyncio.run(
+            _invoke_adapter(
+                tool, _runtime(handler), {"asset_id": "asset_M101", "unexpected": True}
+            )
+        )
     assert calls == 0
 
 
@@ -332,9 +380,18 @@ def test_technical_tools_run_through_the_langchain_adapter(name, tool, _):
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": _complete_payload(name)})
+        return httpx.Response(
+            200,
+            json={"mode": "complete", "notes": None, "data": _complete_payload(name)},
+        )
 
-    content = asyncio.run(_invoke_adapter(tool, _runtime(handler), {"asset_id": "asset_M101", "point_id": "pt_M101_de"}))
+    content = asyncio.run(
+        _invoke_adapter(
+            tool,
+            _runtime(handler),
+            {"asset_id": "asset_M101", "point_id": "pt_M101_de"},
+        )
+    )
 
     assert content["asset_id"] == "asset_M101"
     assert calls == 1
@@ -366,14 +423,18 @@ def test_permission_and_asset_scope_stop_before_http(_, __, execute):
 
 
 @pytest.mark.parametrize("name,_,execute", TECHNICAL_TOOLS)
-def test_complete_responses_reject_asset_or_requested_point_outside_scope(name, _, execute):
+def test_complete_responses_reject_asset_or_requested_point_outside_scope(
+    name, _, execute
+):
     payloads = [
         _complete_payload(name, asset_id="asset_OTHER"),
         _complete_payload(name, point_id="pt_OTHER"),
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payloads.pop(0)})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payloads.pop(0)}
+        )
 
     async def invoke():
         runtime = _runtime(handler)
@@ -389,11 +450,25 @@ def test_complete_responses_reject_asset_or_requested_point_outside_scope(name, 
 
 
 @pytest.mark.parametrize("_,__,execute", TECHNICAL_TOOLS)
-def test_degraded_observations_preserve_safe_data_and_reject_known_contradictions(_, __, execute):
+def test_degraded_observations_preserve_safe_data_and_reject_known_contradictions(
+    _, __, execute
+):
     responses = [
-        {"mode": "partial", "notes": "Campos ausentes.", "data": {"asset_id": "asset_M101", "point_id": "pt_M101_de"}},
-        {"mode": "partial", "notes": "Campos ausentes.", "data": {"asset_id": "asset_M101", "point_id": "pt_OTHER"}},
-        {"mode": "partial", "notes": "Campos ausentes.", "data": {"asset_id": "asset_M101", "client_secret": "blocked"}},
+        {
+            "mode": "partial",
+            "notes": "Campos ausentes.",
+            "data": {"asset_id": "asset_M101", "point_id": "pt_M101_de"},
+        },
+        {
+            "mode": "partial",
+            "notes": "Campos ausentes.",
+            "data": {"asset_id": "asset_M101", "point_id": "pt_OTHER"},
+        },
+        {
+            "mode": "partial",
+            "notes": "Campos ausentes.",
+            "data": {"asset_id": "asset_M101", "client_secret": "blocked"},
+        },
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -406,7 +481,10 @@ def test_degraded_observations_preserve_safe_data_and_reject_known_contradiction
             assert safe.content is None
             assert safe.artifact.outcome.mode.value == "partial"
             assert safe.artifact.outcome.notes == "Campos ausentes."
-            assert safe.artifact.outcome.partial_data == {"asset_id": "asset_M101", "point_id": "pt_M101_de"}
+            assert safe.artifact.outcome.partial_data == {
+                "asset_id": "asset_M101",
+                "point_id": "pt_M101_de",
+            }
             with pytest.raises(ValueError, match="ponto diferente"):
                 await execute("asset_M101", "pt_M101_de", runtime)
             with pytest.raises(ValueError, match="campo proibido"):
@@ -427,7 +505,9 @@ def test_tools_preserve_exact_api_error(_, __, execute):
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={"code": "NOT_FOUND", "message": "Recurso não encontrado."})
+        return httpx.Response(
+            404, json={"code": "NOT_FOUND", "message": "Recurso não encontrado."}
+        )
 
     async def invoke():
         runtime = _runtime(handler)
@@ -447,7 +527,9 @@ def test_complete_wire_models_reject_extra_fields(name, _, execute):
     payload["unexpected"] = True
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payload}
+        )
 
     async def invoke():
         runtime = _runtime(handler)
@@ -467,10 +549,14 @@ def test_complete_wire_models_reject_extra_fields(name, _, execute):
 
 def test_baseline_keeps_threshold_none_without_the_exact_rms_feature():
     payload = _baseline_payload()
-    payload["features"] = [{"feature": "overall_rms", "reference": 2.5, "tolerance": 0.4}]
+    payload["features"] = [
+        {"feature": "overall_rms", "reference": 2.5, "tolerance": 0.4}
+    ]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payload}
+        )
 
     async def invoke():
         runtime = _runtime(handler)
@@ -509,9 +595,20 @@ def test_execute_rejects_invalid_point_before_http(_, __, execute, invalid_point
 @pytest.mark.parametrize("_,__,execute", TECHNICAL_TOOLS)
 def test_degraded_scope_checks_nested_exact_asset_and_point_keys(_, __, execute):
     responses = [
-        {"mode": "partial", "notes": None, "data": {"parent_asset_id": "asset_OTHER", "nested": {"asset_id": "asset_OTHER"}}},
+        {
+            "mode": "partial",
+            "notes": None,
+            "data": {
+                "parent_asset_id": "asset_OTHER",
+                "nested": {"asset_id": "asset_OTHER"},
+            },
+        },
         {"mode": "partial", "notes": None, "data": {"items": [{"point_id": None}]}},
-        {"mode": "partial", "notes": None, "data": {"items": [{"point_id": "pt_OTHER"}]}},
+        {
+            "mode": "partial",
+            "notes": None,
+            "data": {"items": [{"point_id": "pt_OTHER"}]},
+        },
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -537,7 +634,9 @@ def test_complete_payloads_require_a_verifiable_point(name, _, execute):
     payload = _complete_payload(name, point_id=None)  # type: ignore[arg-type]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payload}
+        )
 
     async def invoke():
         runtime = _runtime(handler)
@@ -553,18 +652,30 @@ def test_complete_payloads_require_a_verifiable_point(name, _, execute):
 @pytest.mark.parametrize(
     "name,mutate",
     [
-        ("baseline", lambda payload: payload.__setitem__("established_at", "2026-01-01")),
-        ("rms", lambda payload: payload["samples"][0].__setitem__("ts", "2026-01-01T00:00:00")),
+        (
+            "baseline",
+            lambda payload: payload.__setitem__("established_at", "2026-01-01"),
+        ),
+        (
+            "rms",
+            lambda payload: payload["samples"][0].__setitem__(
+                "ts", "2026-01-01T00:00:00"
+            ),
+        ),
         ("spectrum", lambda payload: payload.__setitem__("collected_at", "2026-01-01")),
     ],
 )
 def test_complete_timestamps_require_time_and_timezone(name, mutate):
     payload = _complete_payload(name)
     mutate(payload)
-    execute = next(execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name)
+    execute = next(
+        execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payload}
+        )
 
     async def invoke():
         runtime = _runtime(handler)
@@ -584,7 +695,9 @@ def test_spectrum_requires_bands_missing_and_rejects_the_removed_resolution_fiel
     responses = [missing_bands, removed_field]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": responses.pop(0)})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": responses.pop(0)}
+        )
 
     async def invoke():
         runtime = _runtime(handler)
@@ -603,21 +716,33 @@ def test_spectrum_requires_bands_missing_and_rejects_the_removed_resolution_fiel
 @pytest.mark.parametrize(
     "name,mutate",
     [
-        ("baseline", lambda payload: payload["features"][0].__setitem__("reference", math.nan)),
+        (
+            "baseline",
+            lambda payload: payload["features"][0].__setitem__("reference", math.nan),
+        ),
         ("rms", lambda payload: payload["samples"][0].__setitem__("value", math.inf)),
-        ("spectrum", lambda payload: payload["peaks"][0].__setitem__("freq_hz", -math.inf)),
+        (
+            "spectrum",
+            lambda payload: payload["peaks"][0].__setitem__("freq_hz", -math.inf),
+        ),
         ("data_quality", lambda payload: payload.__setitem__("snr_db", math.nan)),
     ],
 )
-def test_complete_nonfinite_numbers_are_invalid_and_artifacts_remain_strict_json(name, mutate):
+def test_complete_nonfinite_numbers_are_invalid_and_artifacts_remain_strict_json(
+    name, mutate
+):
     invalid_payload = _complete_payload(name)
     mutate(invalid_payload)
     valid_payload = _complete_payload(name)
-    execute = next(execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name)
+    execute = next(
+        execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name
+    )
     responses = [invalid_payload, valid_payload]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": responses.pop(0)})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": responses.pop(0)}
+        )
 
     async def invoke():
         runtime = _runtime(handler)
@@ -634,7 +759,9 @@ def test_complete_nonfinite_numbers_are_invalid_and_artifacts_remain_strict_json
 
 
 @pytest.mark.parametrize("nonfinite", [math.nan, math.inf, -math.inf])
-def test_assert_safe_partial_json_rejects_nonfinite_values_without_rejecting_json_numbers(nonfinite):
+def test_assert_safe_partial_json_rejects_nonfinite_values_without_rejecting_json_numbers(
+    nonfinite,
+):
     safe = {"measurements": [0, 1.25, {"count": 2}], "complete": True}
 
     assert_safe_partial_json(safe)
@@ -644,10 +771,20 @@ def test_assert_safe_partial_json_rejects_nonfinite_values_without_rejecting_jso
 
 
 @pytest.mark.parametrize("_,__,execute", TECHNICAL_TOOLS)
-def test_degraded_technical_observation_rejects_nonfinite_json_before_artifact(_, __, execute):
+def test_degraded_technical_observation_rejects_nonfinite_json_before_artifact(
+    _, __, execute
+):
     responses = [
-        {"mode": "partial", "notes": None, "data": {"asset_id": "asset_M101", "values": [1.0, 2]}},
-        {"mode": "partial", "notes": None, "data": {"asset_id": "asset_M101", "values": [math.nan]}},
+        {
+            "mode": "partial",
+            "notes": None,
+            "data": {"asset_id": "asset_M101", "values": [1.0, 2]},
+        },
+        {
+            "mode": "partial",
+            "notes": None,
+            "data": {"asset_id": "asset_M101", "values": [math.nan]},
+        },
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -679,10 +816,14 @@ def test_degraded_technical_observation_rejects_nonfinite_json_before_artifact(_
 def test_complete_nullable_fields_are_required_on_the_wire(name, field):
     payload = _complete_payload(name)
     payload.pop(field)
-    execute = next(execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name)
+    execute = next(
+        execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payload}
+        )
 
     async def invoke():
         runtime = _runtime(handler)
@@ -707,10 +848,14 @@ def test_complete_nullable_fields_are_required_on_the_wire(name, field):
 def test_complete_nullable_fields_accept_explicit_null(name, field):
     payload = _complete_payload(name)
     payload[field] = None
-    execute = next(execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name)
+    execute = next(
+        execute for tool_name, _, execute in TECHNICAL_TOOLS if tool_name == name
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payload}
+        )
 
     async def invoke():
         runtime = _runtime(handler)

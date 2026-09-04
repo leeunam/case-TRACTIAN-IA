@@ -858,61 +858,82 @@ apenas por estética.
 
 A entrega só termina quando:
 
-- [ ] `make demo` sobe os quatro processos localmente e `make stop` os encerra.
-- [ ] Casos públicos e personalizados percorrem o chat ao vivo e sobrevivem a
+- [x] `make demo` sobe os quatro processos localmente e `make stop` os encerra.
+- [x] Casos públicos e personalizados percorrem o chat ao vivo e sobrevivem a
       refresh e reinício do backend.
 - [ ] Um pedido TRACTIAN e uma autorização da empresa percorrem frontend → fila
       → Slack real → link → decisão → retomada, sem segunda ação.
 - [ ] Groq principal e fallback NIM são comprovados em smokes separados e no
       roteamento permitido; falhas de qualidade nunca acionam fallback.
-- [ ] Toda a suíte anterior e nova passa individualmente, integrada e em
+- [x] Toda a suíte anterior e nova passa individualmente, integrada e em
       concorrência; lint, build, locks e verificações de segurança passam.
-- [ ] README, `TASKS.md`, `LEARNING-GUIDE.md`, `CONTEXT.md`, `AGENTS.md`,
+- [x] README, `TASKS.md`, `LEARNING-GUIDE.md`, `CONTEXT.md`, `AGENTS.md`,
       `.env.example` e `Makefile` refletem somente o estado comprovado.
-- [ ] Código e documentação estão commitados na `main`, sem segredos, arquivos
+- [x] Código e documentação estão commitados na `main`, sem segredos, arquivos
       temporários, mudanças não relacionadas ou itens obsoletos conhecidos.
 
 ## Fase 16 — backend da demonstração e filas
 
-**Estado:** não iniciada. Implementar contratos, `demo.sqlite3`, migrações,
-casos, mensagens, jobs, projeções públicas e SSE retomável por TDD.
+**Estado:** concluída localmente. `demo/` mantém migração v2, casos, mensagens,
+execuções, decisões, outbox e eventos em SQLite; o worker usa o entrypoint
+público do agente e só grava projeções allowlisted.
 
-- [ ] Criar o serviço `demo/` sem alterar a responsabilidade de `api/`.
-- [ ] Persistir mensagem e job atomicamente; provar lease, recovery e replay.
-- [ ] Integrar o agente pelo entrypoint público e projetar eventos sanitizados.
-- [ ] Cobrir abertura/reabertura do SQLite, concorrência e falhas.
+- [x] Criar o serviço `demo/` sem alterar a responsabilidade de `api/`.
+- [x] Persistir mensagem e job atomicamente; provar lease, recovery e replay.
+- [x] Integrar o agente pelo entrypoint público e projetar eventos sanitizados.
+- [x] Cobrir abertura/reabertura do SQLite, concorrência e falhas.
 
 ## Fase 17 — central de casos React
 
-**Estado:** não iniciada. Implementar `frontend/`, contratos TypeScript, central
-com menu à direita, seletor de persona, criação/duplicação de casos, Chat,
-Contexto, Evidências, Timeline, Decisões e estados acessíveis.
+**Estado:** concluída localmente. A SPA React/TypeScript possui menu fixo à
+direita, área dinâmica, chat, cópia/edição de casos, modo de simulação,
+persona, decisões e projeções sanitizadas de eventos e evidências.
 
-- [ ] Consumir somente REST/SSE do backend e recuperar reconexões.
-- [ ] Mostrar provider, fallback, estado e aviso de demonstração.
-- [ ] Exibir capacidades bloqueadas com motivo sem confiar no bloqueio visual.
-- [ ] Cobrir componentes e fluxos com Vitest, Testing Library e Playwright.
+- [x] Consumir somente REST/SSE do backend e recuperar reconexões.
+- [x] Mostrar provider, fallback, estado e aviso de demonstração.
+- [x] Exibir capacidades bloqueadas com motivo sem confiar no bloqueio visual.
+- [x] Cobrir componentes e fluxos com Vitest, Testing Library e Playwright.
 
 ## Fase 18 — decisões delegadas e Slack MCP
 
-**Estado:** não iniciada. Implementar revisão técnica e autorização de ação como
-contratos distintos, dois canais Slack reais e links para decisão no frontend.
+**Estado:** implementação e testes locais concluídos; smoke externo pendente de
+OAuth/canais. Revisão técnica e autorização delegada permanecem contratos
+distintos. O adapter usa o MCP oficial por Streamable HTTP, descobre a tool de
+envio e nunca persiste o token.
 
-- [ ] Preservar solicitante/`ThreadScope` e validar o atestado do decisor.
-- [ ] Provar a matriz de roteamento e pedidos encadeados.
-- [ ] Implementar outbox, worker, sanitização e reenvio manual seguro.
+- [x] Preservar solicitante/`ThreadScope` e validar o atestado do decisor.
+- [x] Provar a matriz de roteamento e pedidos separados por público.
+- [x] Implementar outbox, worker, sanitização e reenvio manual seguro.
 - [ ] Comprovar um smoke opt-in por canal sem persistir segredos.
 
 ## Fase 19 — fallback, integração e entrega
 
-**Estado:** não iniciada. Implementar o roteador Groq/NIM, executar os cenários
-integrados, revisar segurança, remover apenas itens comprovadamente obsoletos e
-entregar código e documentação na `main`.
+**Estado:** implementação local concluída; smokes externos restantes continuam
+opt-in. A ordem vem de configuração e o roteador opera dentro das interfaces do
+planner/writer, registrando provider e motivo fechado na execução.
 
-- [ ] Aplicar fallback somente aos códigos de disponibilidade aprovados.
-- [ ] Provar Groq → NIM e deixar a ordem inteiramente configurável.
-- [ ] Rodar suítes individuais, cascata, concorrência e smokes reais opt-in.
-- [ ] Atualizar toda documentação somente após cada evidência de aceite.
+- [x] Aplicar fallback somente aos códigos de disponibilidade aprovados.
+- [x] Provar por testes Groq → NIM e deixar a ordem inteiramente configurável.
+- [x] Rodar suítes individuais, cascata e concorrência locais.
+- [ ] Rodar os smokes externos opt-in de Slack e NVIDIA NIM.
+- [x] Atualizar toda documentação somente após cada evidência de aceite.
+
+**Evidência local final (04/09/2026):** `make test` passou com **99 testes da
+API + 1.813 do agente + 25 do backend demo + 4 do frontend**, seguido do build
+Vite e de **2 fluxos Playwright** no Chrome. O smoke de inicialização confirmou
+HTTP 200 na API, fachada e SPA com os quatro processos de `make demo`; `make
+stop` encerrou todos. `make eval` reproduziu 17 casos × 2. Como esperado no
+perfil `deterministic-fallback`, 0/34 runs passaram o conjunto integral porque
+não houve trajetória LLM/tool real; os checks de segurança, argumentos,
+formato, IDs, justificativa, permissões, erros e limite de passos passaram em
+34/34. Isso é evidência de reprodutibilidade, não de qualidade aprovada.
+
+O caminho ao vivo Groq já foi exercitado pela central e persistiu provider,
+trace e resposta conservadora. Não há credenciais/canais Slack configurados
+neste checkout e não foi provocado erro real da Groq durante esta rodada;
+portanto, entrega Slack real e fallback NIM real permanecem corretamente
+pendentes. A calibração da Fase 13 continua `skipped` até especialistas da
+TRACTIAN produzirem rótulos cegos.
 
 ## Registro histórico do plano SDD — Fases 5 e 4
 

@@ -267,12 +267,18 @@ def _aggregate_role(
     else:
         stability = "unstable"
     input_tokens = (
-        sum(sample.input_tokens for sample in samples if sample.input_tokens is not None)
+        sum(
+            sample.input_tokens for sample in samples if sample.input_tokens is not None
+        )
         if all(sample.input_tokens is not None for sample in samples)
         else None
     )
     output_tokens = (
-        sum(sample.output_tokens for sample in samples if sample.output_tokens is not None)
+        sum(
+            sample.output_tokens
+            for sample in samples
+            if sample.output_tokens is not None
+        )
         if all(sample.output_tokens is not None for sample in samples)
         else None
     )
@@ -375,9 +381,7 @@ def compare_provider_reports(
     eligible = tuple(
         report
         for report in reports
-        if all(
-            role.passed and role.stability != "unstable" for role in report.roles
-        )
+        if all(role.passed and role.stability != "unstable" for role in report.roles)
     )
     if len(eligible) == 1:
         selected = eligible[0]
@@ -413,9 +417,7 @@ def compare_provider_reports(
             ),
         )
     costs = {
-        report.provider: sum(
-            role.estimated_cost_usd for role in report.roles
-        )
+        report.provider: sum(role.estimated_cost_usd for role in report.roles)
         for report in eligible
         if all(role.estimated_cost_usd is not None for role in report.roles)
     }

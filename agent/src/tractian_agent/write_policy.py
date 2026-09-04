@@ -5,6 +5,7 @@ from __future__ import annotations
 from enum import Enum
 import hashlib
 import json
+from datetime import datetime, timedelta
 from typing import Annotated, Literal
 
 from pydantic import ConfigDict, Field, TypeAdapter, model_validator
@@ -27,6 +28,7 @@ AssetCriticality = Literal["low", "medium", "high", "critical"]
 class ApprovalSource(str, Enum):
     ORIGINAL_REQUEST = "original_request"
     CONFIRMATION = "confirmation"
+    DELEGATED = "delegated"
 
 
 class PolicyDecision(str, Enum):
@@ -55,9 +57,7 @@ class ReprocessProposal(StrictModel):
 class RequestSpecialistAnalysisProposal(StrictModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    action: Literal["request_specialist_analysis"] = (
-        "request_specialist_analysis"
-    )
+    action: Literal["request_specialist_analysis"] = "request_specialist_analysis"
     analysis_id: AnalysisId
     justification: str
 
@@ -112,6 +112,43 @@ class TrustedWriteContext(StrictModel):
     configured_model_id: ModelId
 
 
+def delegated_subject_digest(value: object) -> str:
+    """Digest canônico do escopo exato autorizado fora do thread original."""
+    encoded = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:v1:{hashlib.sha256(encoded).hexdigest()}"
+
+
+class DelegatedApprovalAttestation(StrictModel):
+    """Atestado confiável, temporal e consumível pela fronteira chamadora."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    decision_id: str = Field(min_length=1, pattern=r"^\S+$")
+    approver_id: str = Field(min_length=1, pattern=r"^\S+$")
+    company_id: str = Field(min_length=1, pattern=r"^\S+$")
+    permission: Literal["action_low", "action_high", "escalate"]
+    subject_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    approved_at: datetime
+    expires_at: datetime
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "DelegatedApprovalAttestation":
+        for value in (self.approved_at, self.expires_at):
+            if value.tzinfo is None or value.utcoffset() != timedelta(0):
+                raise ValueError("instantes delegados exigem UTC aware")
+        if self.expires_at <= self.approved_at:
+            raise ValueError("atestado delegado deve expirar após a aprovação")
+        if self.expires_at - self.approved_at > timedelta(hours=24):
+            raise ValueError("atestado delegado não pode durar mais de 24 horas")
+        return self
+
+
 class TrustedActionApproval(StrictModel):
     """Aprovação criada pela fronteira confiável, nunca pelo modelo."""
 
@@ -123,6 +160,7 @@ class TrustedActionApproval(StrictModel):
         default_factory=WriteMaterialParameters
     )
     source: ApprovalSource
+    delegation: DelegatedApprovalAttestation | None = None
 
     @model_validator(mode="after")
     def _validate_material_parameters(self) -> TrustedActionApproval:
@@ -139,6 +177,22 @@ class TrustedActionApproval(StrictModel):
             TypeAdapter(ModelId).validate_python(self.target_id)
         else:
             TypeAdapter(CaseId).validate_python(self.target_id)
+        delegated = self.source is ApprovalSource.DELEGATED
+        if delegated != (self.delegation is not None):
+            raise ValueError("proveniência delegada exige atestado exclusivo")
+        if self.delegation is not None:
+            expected = delegated_subject_digest(
+                {
+                    "action": self.action,
+                    "target_id": self.target_id,
+                    "material_parameters": self.material_parameters.model_dump(
+                        mode="json"
+                    ),
+                    "company_id": self.delegation.company_id,
+                }
+            )
+            if self.delegation.subject_digest != expected:
+                raise ValueError("digest delegado diverge do escopo aprovado")
         return self
 
 
@@ -240,7 +294,16 @@ def evaluate_write_policy(
 ) -> WritePolicyResult:
     """Avalia uma proposta contra permissão, justificativa e escopo aprovado."""
 
-    if _REQUIRED_PERMISSION[proposal.action] not in permissions:
+    required_permission = _REQUIRED_PERMISSION[proposal.action]
+    delegated_permission = (
+        approval.delegation.permission
+        if approval is not None and approval.delegation is not None
+        else None
+    )
+    if (
+        required_permission not in permissions
+        and delegated_permission != required_permission
+    ):
         return _result(PolicyDecision.DENY, PolicyReason.MISSING_PERMISSION)
     if len(proposal.justification.strip()) < 20:
         return _result(PolicyDecision.DENY, PolicyReason.INVALID_JUSTIFICATION)

@@ -1,4 +1,5 @@
 """Tools de leitura para listar e detalhar análises de um ativo."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -20,7 +21,12 @@ from pydantic import (
 from tractian_agent.contracts import ApiError, ResponseMode, StrictModel
 
 from .identifiers import AnalysisId, AssetId, PointId
-from .observations import ToolArtifact, ToolOutcome, ToolSource, assert_safe_partial_json
+from .observations import (
+    ToolArtifact,
+    ToolOutcome,
+    ToolSource,
+    assert_safe_partial_json,
+)
 from .runtime import ReadToolRuntime
 from .timestamps import parse_aware_iso_timestamp as _parse_timestamp
 
@@ -208,7 +214,9 @@ class _GetAnalysisToolArguments(StrictModel):
 
 def _assert_read_permission(runtime: ReadToolRuntime) -> None:
     if "read" not in runtime.permissions:
-        raise PermissionError("A permissão 'read' é necessária para consultar análises.")
+        raise PermissionError(
+            "A permissão 'read' é necessária para consultar análises."
+        )
 
 
 def _assert_list_scope(asset_id: AssetId, runtime: ReadToolRuntime) -> None:
@@ -219,9 +227,7 @@ def _assert_list_scope(asset_id: AssetId, runtime: ReadToolRuntime) -> None:
 
 def _assert_analysis_asset(asset_id: AssetId, runtime: ReadToolRuntime) -> None:
     if asset_id != runtime.central_asset_id:
-        raise AnalysisScopeValidationError(
-            "A API retornou um ativo fora do escopo."
-        )
+        raise AnalysisScopeValidationError("A API retornou um ativo fora do escopo.")
 
 
 def _normalize_analysis(analysis: _AnalysisWire) -> AnalysisArtifact:
@@ -275,7 +281,9 @@ def _summary(analysis: AnalysisArtifact) -> AnalysisSummary:
     )
 
 
-def _list_params(status: AnalysisStatus | None, runtime: ReadToolRuntime) -> dict[str, str] | None:
+def _list_params(
+    status: AnalysisStatus | None, runtime: ReadToolRuntime
+) -> dict[str, str] | None:
     params: dict[str, str] = {}
     if status is not None:
         params["status"] = status
@@ -284,7 +292,9 @@ def _list_params(status: AnalysisStatus | None, runtime: ReadToolRuntime) -> dic
     return params or None
 
 
-def _list_common(asset_id: AssetId, status: AnalysisStatus | None, path: str) -> dict[str, object]:
+def _list_common(
+    asset_id: AssetId, status: AnalysisStatus | None, path: str
+) -> dict[str, object]:
     arguments: dict[str, JsonValue] = {"asset_id": asset_id}
     if status is not None:
         arguments["status"] = status
@@ -347,7 +357,9 @@ def _assert_degraded_detail_id(data: JsonValue, requested_analysis_id: str) -> N
             )
 
 
-def _validate_degraded_summary_item(item: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+def _validate_degraded_summary_item(
+    item: Mapping[str, JsonValue],
+) -> dict[str, JsonValue]:
     """Projeta somente os campos seguros que estiverem presentes em uma linha parcial."""
     projected: dict[str, JsonValue] = {}
     try:
@@ -356,13 +368,19 @@ def _validate_degraded_summary_item(item: Mapping[str, JsonValue]) -> dict[str, 
         if "asset_id" in item:
             projected["asset_id"] = _validate_asset_id(item["asset_id"])
         if "point_id" in item:
-            projected["point_id"] = _POINT_ID.validate_python(item["point_id"], strict=True)
+            projected["point_id"] = _POINT_ID.validate_python(
+                item["point_id"], strict=True
+            )
         if "type" in item:
             projected["type"] = _TYPE.validate_python(item["type"], strict=True)
         if "severity" in item:
-            projected["severity"] = _SEVERITY.validate_python(item["severity"], strict=True)
+            projected["severity"] = _SEVERITY.validate_python(
+                item["severity"], strict=True
+            )
         if "confidence" in item:
-            confidence = TypeAdapter(float).validate_python(item["confidence"], strict=True)
+            confidence = TypeAdapter(float).validate_python(
+                item["confidence"], strict=True
+            )
             if not math.isfinite(confidence) or not 0 <= confidence <= 1:
                 raise ValueError("A resposta degradada contém confiança inválida.")
             projected["confidence"] = confidence
@@ -372,7 +390,9 @@ def _validate_degraded_summary_item(item: Mapping[str, JsonValue]) -> dict[str, 
                     item["status"], strict=True
                 )
             except ValidationError as exc:
-                raise ValueError("A resposta degradada contém status inválido.") from exc
+                raise ValueError(
+                    "A resposta degradada contém status inválido."
+                ) from exc
         if "created_at" in item:
             created_at = item["created_at"]
             if not isinstance(created_at, str):
@@ -387,7 +407,9 @@ def _validate_degraded_summary_item(item: Mapping[str, JsonValue]) -> dict[str, 
                 raise ValueError("A resposta degradada contém limitações inválidas.")
             projected["limitations"] = limitations
     except ValidationError as exc:
-        raise ValueError("A resposta degradada contém campo de resumo inválido.") from exc
+        raise ValueError(
+            "A resposta degradada contém campo de resumo inválido."
+        ) from exc
     return projected
 
 
@@ -404,7 +426,9 @@ def _ordered_degraded_summaries(
             undated.append(summary)
     return [
         summary
-        for _, _, summary in sorted(dated, key=lambda item: (item[1], -item[0]), reverse=True)
+        for _, _, summary in sorted(
+            dated, key=lambda item: (item[1], -item[0]), reverse=True
+        )
     ] + undated
 
 
@@ -433,13 +457,19 @@ def _normalize_degraded_list(
         if "id" in summary:
             analysis_id = summary["id"]
             if analysis_id in seen_ids:
-                raise ValueError("A resposta degradada contém um identificador de análise duplicado.")
+                raise ValueError(
+                    "A resposta degradada contém um identificador de análise duplicado."
+                )
             seen_ids.add(analysis_id)
         if status is not None:
             if "status" not in summary:
-                raise ValueError("A resposta degradada não informa o status solicitado.")
+                raise ValueError(
+                    "A resposta degradada não informa o status solicitado."
+                )
             if summary["status"] != status:
-                raise ValueError("A resposta degradada contém uma análise que não respeita o filtro de status.")
+                raise ValueError(
+                    "A resposta degradada contém uma análise que não respeita o filtro de status."
+                )
         summaries.append(summary)
     flags: dict[str, JsonValue] = {}
     for key in _DEGRADED_LIST_FLAGS:
@@ -533,7 +563,9 @@ async def execute_list_asset_analyses(
         if analysis.id in seen_ids:
             raise ValueError("A API retornou um identificador de análise duplicado.")
         if status is not None and analysis.status != status:
-            raise ValueError("A API retornou uma análise que não respeita o filtro de status.")
+            raise ValueError(
+                "A API retornou uma análise que não respeita o filtro de status."
+            )
         seen_ids.add(analysis.id)
         normalized.append(_normalize_analysis(analysis))
     total = len(normalized)

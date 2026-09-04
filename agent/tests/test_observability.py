@@ -176,11 +176,14 @@ def test_recording_telemetry_accepts_only_typed_spans_and_safe_metric_labels():
             decision="texto livre",
         )
 
-    assert ResponseSpanAttributes(
-        planner_enabled=True,
-        replayed=False,
-        decision=ResponseDecision.GUIDE,
-    ).decision is ResponseDecision.GUIDE
+    assert (
+        ResponseSpanAttributes(
+            planner_enabled=True,
+            replayed=False,
+            decision=ResponseDecision.GUIDE,
+        ).decision
+        is ResponseDecision.GUIDE
+    )
 
 
 def test_complete_opt_in_configures_only_the_manual_logfire_instance():
@@ -342,9 +345,7 @@ def test_environment_value_failure_is_null_and_never_loads_sdk(broken_field):
 
     environment = {
         "TRACTIAN_LOGFIRE_ENABLED": "true",
-        "LOGFIRE_TOKEN": (
-            BrokenToken("token") if broken_field == "token" else "token"
-        ),
+        "LOGFIRE_TOKEN": (BrokenToken("token") if broken_field == "token" else "token"),
         "TRACTIAN_LOGFIRE_PSEUDONYM_KEY": (
             BrokenPseudonymKey("p" * 32)
             if broken_field == "pseudonym_key"

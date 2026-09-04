@@ -1,4 +1,5 @@
 """Tool de leitura do cadastro técnico de um ativo."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -227,7 +228,9 @@ def validate_degraded_asset_scope(
                     raise ValueError("A resposta degradada contém um ponto inválido.")
                 if "asset_id" in point:
                     if point["asset_id"] is None or point["asset_id"] != asset_id:
-                        raise ValueError("A resposta degradada contém um ponto de outro ativo.")
+                        raise ValueError(
+                            "A resposta degradada contém um ponto de outro ativo."
+                        )
 
     pending: list[JsonValue] = [data]
     while pending:
@@ -297,7 +300,9 @@ async def execute_get_asset(
         )
     if result.mode is ResponseMode.COMPLETE:
         asset = result.data
-        if not isinstance(asset, _AssetWire):  # Defensive narrowing for the generic API client.
+        if not isinstance(
+            asset, _AssetWire
+        ):  # Defensive narrowing for the generic API client.
             raise TypeError("A resposta completa do ativo não foi validada.")
         _assert_returned_scope(
             asset_id=asset.id,

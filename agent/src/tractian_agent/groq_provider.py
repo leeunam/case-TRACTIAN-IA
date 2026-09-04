@@ -141,9 +141,7 @@ class GroqModelProvider:
         output_parse_retries: int = 0,
     ) -> None:
         raw_api_key = (
-            api_key.get_secret_value()
-            if isinstance(api_key, SecretStr)
-            else api_key
+            api_key.get_secret_value() if isinstance(api_key, SecretStr) else api_key
         )
         if not isinstance(raw_api_key, str) or not raw_api_key.strip():
             raise ValueError("GROQ_API_KEY must be set and non-empty")
@@ -151,9 +149,8 @@ class GroqModelProvider:
             raise TypeError("max_retries must be an integer")
         if not 0 <= max_retries <= 5:
             raise ValueError("max_retries must be between zero and five")
-        if (
-            not isinstance(output_parse_retries, int)
-            or isinstance(output_parse_retries, bool)
+        if not isinstance(output_parse_retries, int) or isinstance(
+            output_parse_retries, bool
         ):
             raise TypeError("output_parse_retries must be an integer")
         if not 0 <= output_parse_retries <= 3:

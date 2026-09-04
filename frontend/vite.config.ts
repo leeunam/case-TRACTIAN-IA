@@ -6,6 +6,7 @@ export default defineConfig({
   server: { port: 5173 },
   test: {
     environment: "jsdom",
+    include: ["tests/**/*.test.{ts,tsx}"],
     environmentOptions: { jsdom: { url: "http://localhost:5173/" } },
     setupFiles: [],
   },

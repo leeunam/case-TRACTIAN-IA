@@ -234,9 +234,7 @@ def test_groq_smoke_requires_the_expected_real_planner_decision():
     assert exit_code == 1
     assert len(lines) == 2
     assert all(
-        "status=failed" in line
-        and "pydantic=false" in line
-        and "calls=2" in line
+        "status=failed" in line and "pydantic=false" in line and "calls=2" in line
         for line in lines
     )
     assert "Informe o ponto de medição" not in output.getvalue()

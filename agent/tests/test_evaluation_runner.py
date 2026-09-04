@@ -167,9 +167,7 @@ def test_agent_case_executor_accepts_async_runtime_factory(
     )
     monkeypatch.setattr(
         "tractian_agent.evaluation.runner.output_from_agent_state",
-        lambda state, *, duration_ms: EvaluationOutput(
-            case_id="case_tkt_ctx_02"
-        ),
+        lambda state, *, duration_ms: EvaluationOutput(case_id="case_tkt_ctx_02"),
     )
     executor = AgentCaseExecutor(
         graph=object(),

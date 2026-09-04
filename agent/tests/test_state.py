@@ -330,9 +330,7 @@ def test_conservative_non_idempotent_terminal_rejects_each_tampered_field(
     elif tamper == "evidence_ids":
         wire["final_result"]["evidence_ids"] = ["sha256:v1:" + "a" * 64]
     elif tamper == "limitation_refs":
-        wire["final_result"]["limitation_refs"] = [
-            "limitation:v1:" + "b" * 64
-        ]
+        wire["final_result"]["limitation_refs"] = ["limitation:v1:" + "b" * 64]
     elif tamper == "next_step":
         wire["final_result"]["next_step"] = WriterNextStep.VERIFY_ACTION.value
     elif tamper == "error_code":
@@ -578,7 +576,9 @@ def test_ledger_rejects_removed_field_when_typed_source_remains():
         (observation,),
         recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
     )
-    wire = _state(tool_observations=(observation,), ledger=ledger).model_dump(mode="json")
+    wire = _state(tool_observations=(observation,), ledger=ledger).model_dump(
+        mode="json"
+    )
     del wire["ledger"]
 
     with pytest.raises(ValidationError, match="ledger"):
@@ -746,9 +746,7 @@ def test_ledger_rejects_removed_conflicting_source():
     assert ledger.conflicts
     wire = ledger.model_dump(mode="json")
     wire["items"] = [
-        item
-        for item in wire["items"]
-        if item["call_id"] != divergent.call_id
+        item for item in wire["items"] if item["call_id"] != divergent.call_id
     ]
     wire["conflicts"] = []
 
@@ -837,9 +835,7 @@ def test_empty_current_ledger_cannot_reuse_historical_request_id():
         (observation,),
         recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
     )
-    continued = _state(
-        tool_observations=(observation,), ledger=ledger
-    ).continue_with(
+    continued = _state(tool_observations=(observation,), ledger=ledger).continue_with(
         request=_request().model_copy(update={"message": "Nova solicitação."}),
         identity=_identity(),
         permissions=frozenset({"read"}),
@@ -883,9 +879,7 @@ def test_ledger_history_rejects_duplicate_request_id():
         (observation,),
         recorded_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
     )
-    continued = _state(
-        tool_observations=(observation,), ledger=ledger
-    ).continue_with(
+    continued = _state(tool_observations=(observation,), ledger=ledger).continue_with(
         request=_request().model_copy(update={"message": "Nova solicitação."}),
         identity=_identity(),
         permissions=frozenset({"read"}),
@@ -1911,7 +1905,13 @@ def test_state_serializes_to_plain_json_without_runtime_or_restricted_data():
     assert isinstance(serialized, dict)
     assert all(
         forbidden not in encoded.casefold()
-        for forbidden in ("client", "transport", "token", "golden_set", "expected_paths")
+        for forbidden in (
+            "client",
+            "transport",
+            "token",
+            "golden_set",
+            "expected_paths",
+        )
     )
 
     with pytest.raises(ValidationError):
@@ -2057,76 +2057,76 @@ def test_tool_observation_round_trips_json_safe_next_turn_content():
 
 
 _READ_ARTIFACT_CASES = [
-        (
-            "get_asset",
-            AssetToolArtifact,
-            AssetToolOutcome,
-            {"asset_id": "asset_G501"},
-            "/assets/asset_G501",
-        ),
-        (
-            "list_asset_analyses",
-            AnalysisListToolArtifact,
-            AnalysisListToolOutcome,
-            {"asset_id": "asset_G501"},
-            "/assets/asset_G501/analyses",
-        ),
-        (
-            "get_analysis",
-            AnalysisDetailToolArtifact,
-            AnalysisDetailToolOutcome,
-            {"analysis_id": "an_9906"},
-            "/analyses/an_9906",
-        ),
-        (
-            "get_baseline",
-            BaselineToolArtifact,
-            BaselineToolOutcome,
-            {"asset_id": "asset_G501", "point_id": None},
-            "/assets/asset_G501/baseline",
-        ),
-        (
-            "get_rms_series",
-            RmsToolArtifact,
-            RmsToolOutcome,
-            {"asset_id": "asset_G501", "point_id": None},
-            "/assets/asset_G501/rms",
-        ),
-        (
-            "get_spectrum",
-            SpectrumToolArtifact,
-            SpectrumToolOutcome,
-            {"asset_id": "asset_G501", "point_id": None},
-            "/assets/asset_G501/spectrum",
-        ),
-        (
-            "get_data_quality",
-            DataQualityToolArtifact,
-            DataQualityToolOutcome,
-            {"asset_id": "asset_G501", "point_id": None},
-            "/assets/asset_G501/data-quality",
-        ),
-        (
-            "get_model",
-            ModelToolArtifact,
-            ModelToolOutcome,
-            {},
-            "/models/mdl_vib_v3",
-        ),
-        (
-            "search_knowledge",
-            KnowledgeSearchToolArtifact,
-            KnowledgeSearchToolOutcome,
-            {"query": "rolamento"},
-            "/knowledge/search",
-        ),
-        (
-            "get_knowledge_document",
-            KnowledgeDocumentToolArtifact,
-            KnowledgeDocumentToolOutcome,
-            {"document_id": "kb_bearing_guidance"},
-            "/knowledge/kb_bearing_guidance",
-        ),
+    (
+        "get_asset",
+        AssetToolArtifact,
+        AssetToolOutcome,
+        {"asset_id": "asset_G501"},
+        "/assets/asset_G501",
+    ),
+    (
+        "list_asset_analyses",
+        AnalysisListToolArtifact,
+        AnalysisListToolOutcome,
+        {"asset_id": "asset_G501"},
+        "/assets/asset_G501/analyses",
+    ),
+    (
+        "get_analysis",
+        AnalysisDetailToolArtifact,
+        AnalysisDetailToolOutcome,
+        {"analysis_id": "an_9906"},
+        "/analyses/an_9906",
+    ),
+    (
+        "get_baseline",
+        BaselineToolArtifact,
+        BaselineToolOutcome,
+        {"asset_id": "asset_G501", "point_id": None},
+        "/assets/asset_G501/baseline",
+    ),
+    (
+        "get_rms_series",
+        RmsToolArtifact,
+        RmsToolOutcome,
+        {"asset_id": "asset_G501", "point_id": None},
+        "/assets/asset_G501/rms",
+    ),
+    (
+        "get_spectrum",
+        SpectrumToolArtifact,
+        SpectrumToolOutcome,
+        {"asset_id": "asset_G501", "point_id": None},
+        "/assets/asset_G501/spectrum",
+    ),
+    (
+        "get_data_quality",
+        DataQualityToolArtifact,
+        DataQualityToolOutcome,
+        {"asset_id": "asset_G501", "point_id": None},
+        "/assets/asset_G501/data-quality",
+    ),
+    (
+        "get_model",
+        ModelToolArtifact,
+        ModelToolOutcome,
+        {},
+        "/models/mdl_vib_v3",
+    ),
+    (
+        "search_knowledge",
+        KnowledgeSearchToolArtifact,
+        KnowledgeSearchToolOutcome,
+        {"query": "rolamento"},
+        "/knowledge/search",
+    ),
+    (
+        "get_knowledge_document",
+        KnowledgeDocumentToolArtifact,
+        KnowledgeDocumentToolOutcome,
+        {"document_id": "kb_bearing_guidance"},
+        "/knowledge/kb_bearing_guidance",
+    ),
 ]
 
 
@@ -2164,9 +2164,7 @@ def test_tool_observation_rehydrates_exact_read_artifact_after_json_round_trip(
 
     assert type(restored_artifact) is artifact_type
     assert type(restored_artifact.outcome) is outcome_type
-    assert restored_artifact.model_dump(mode="json") == artifact.model_dump(
-        mode="json"
-    )
+    assert restored_artifact.model_dump(mode="json") == artifact.model_dump(mode="json")
 
 
 @pytest.mark.parametrize(

@@ -456,9 +456,7 @@ def test_entrypoint_requires_thread_configuration_and_sync_durability():
 
     graph, state = asyncio.run(scenario())
 
-    expected_config = {
-        "configurable": {"thread_id": "thread_case_tkt_inv_04"}
-    }
+    expected_config = {"configurable": {"thread_id": "thread_case_tkt_inv_04"}}
     assert graph.state_config == expected_config
     assert graph.invoke_config == expected_config
     assert graph.durability == "sync"
@@ -588,9 +586,7 @@ def test_terminal_read_replay_revalidates_current_runtime_before_return(
                     else frozenset({"action_high"})
                 ),
                 central_asset_id=(
-                    "asset_M101"
-                    if drift == "asset_without_read"
-                    else "asset_G501"
+                    "asset_M101" if drift == "asset_without_read" else "asset_G501"
                 ),
             )
             with pytest.raises(AgentInvocationProtocolError) as error:
@@ -898,9 +894,7 @@ def test_terminal_write_replay_rejects_persisted_model_drift_at_public_boundary(
 
 
 def test_partial_read_scope_mismatch_fails_before_checkpoint_update():
-    state = _initial_state().model_copy(
-        update={"resume_anchor": ResumeAnchor.INGEST}
-    )
+    state = _initial_state().model_copy(update={"resume_anchor": ResumeAnchor.INGEST})
     persisted_values = state.model_dump(mode="json")
     graph = _RecordingGraph(persisted_values, next_nodes=("route",))
 
@@ -1021,9 +1015,7 @@ def test_planner_resume_accepts_each_explicit_predecessor(
     anchor: ResumeAnchor,
     next_node: str,
 ):
-    state = _initial_state(step_limit=20).model_copy(
-        update={"resume_anchor": anchor}
-    )
+    state = _initial_state(step_limit=20).model_copy(update={"resume_anchor": anchor})
     graph = _RecordingGraph(
         state.model_dump(mode="json"),
         next_nodes=(next_node,),
@@ -1152,7 +1144,11 @@ def test_resume_anchor_fails_closed_before_checkpoint_update(
     [
         (None, AgentInvocationProtocolError, "MISSING_RESUME_ANCHOR"),
         ("invented_node", AgentInvocationProtocolError, "UNKNOWN_RESUME_ANCHOR"),
-        (ResumeAnchor.START.value, AgentInvocationProtocolError, "RESUME_ANCHOR_MISMATCH"),
+        (
+            ResumeAnchor.START.value,
+            AgentInvocationProtocolError,
+            "RESUME_ANCHOR_MISMATCH",
+        ),
         (ResumeAnchor.PLANNER_FINALIZE.value, ValidationError, None),
     ],
 )
@@ -1182,7 +1178,9 @@ def test_terminal_resume_anchor_is_required_and_semantically_coherent(
                     ),
                     runtime=_runtime(client),
                     thread_id=state.thread_id,
-                    request_id=("req_new_after_terminal" if new_request else state.request_id),
+                    request_id=(
+                        "req_new_after_terminal" if new_request else state.request_id
+                    ),
                     execution_id="exec_terminal_anchor_check",
                 )
         return error.value
@@ -1209,9 +1207,7 @@ def test_partial_resume_rejects_checkpoint_from_other_graph_topology(
     anchor: ResumeAnchor,
     next_node: str,
 ):
-    state = _initial_state(step_limit=20).model_copy(
-        update={"resume_anchor": anchor}
-    )
+    state = _initial_state(step_limit=20).model_copy(update={"resume_anchor": anchor})
     persisted_values = state.model_dump(mode="json")
     graph = _RecordingGraph(
         persisted_values,
@@ -1400,9 +1396,7 @@ def test_adulterated_terminal_checkpoint_fails_closed_before_return(
         elif tamper == "execution_with_wrong_approval":
             persisted_values["approval"]["target_id"] = "an_other"
         else:
-            persisted_values["intents"][0]["payload_hash"] = (
-                "sha256:v1:" + "b" * 64
-            )
+            persisted_values["intents"][0]["payload_hash"] = "sha256:v1:" + "b" * 64
     graph = _RecordingGraph(persisted_values, planner_enabled=True)
 
     async def scenario():
@@ -1623,17 +1617,15 @@ def test_ingest_node_requires_and_reads_trusted_runtime_context(tmp_path: Path):
                     match="contexto confiável do grafo é obrigatório",
                 ):
                     await graph.ainvoke(
-                        _initial_state(
-                            thread_id="thread_missing_context"
-                        ).model_dump(mode="json"),
+                        _initial_state(thread_id="thread_missing_context").model_dump(
+                            mode="json"
+                        ),
                         missing_context_config,
                         context=None,
                         durability="sync",
                     )
 
-                valid_config = {
-                    "configurable": {"thread_id": "thread_valid_context"}
-                }
+                valid_config = {"configurable": {"thread_id": "thread_valid_context"}}
                 result = await graph.ainvoke(
                     _initial_state(thread_id="thread_valid_context").model_dump(
                         mode="json"

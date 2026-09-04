@@ -692,17 +692,15 @@ def test_planner_read_pairs_null_and_recording_without_business_drift(
             SpanName.RESPONSE,
         } <= specialized
         assert SpanName.EVALUATION not in specialized
-        assert {
-            dict(span.attributes)["trace_id"] for span in telemetry.spans
-        } == {trace_id.value}
+        assert {dict(span.attributes)["trace_id"] for span in telemetry.spans} == {
+            trace_id.value
+        }
         response_spans = [
             span for span in telemetry.spans if span.name is SpanName.RESPONSE
         ]
         assert len(response_spans) == 1
         assert dict(response_spans[0].attributes)["decision"] == "guide"
-        serialized = (
-            repr(telemetry.spans) + repr(telemetry.metrics)
-        ).casefold()
+        serialized = (repr(telemetry.spans) + repr(telemetry.metrics)).casefold()
         for prohibited in (
             "consulte o ativo",
             "asset_g501",

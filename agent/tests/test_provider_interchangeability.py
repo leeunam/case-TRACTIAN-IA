@@ -248,7 +248,9 @@ def test_model_provider_swap_preserves_public_planner_contract_without_http(tmp_
         }
         assert len(state.intents) == 1
         assert state.intents[0].decision.decision is PolicyDecision.REQUIRE_CONFIRMATION
-        assert state.intents[0].decision.reason is PolicyReason.EXPLICIT_APPROVAL_REQUIRED
+        assert (
+            state.intents[0].decision.reason is PolicyReason.EXPLICIT_APPROVAL_REQUIRED
+        )
 
     assert first_state.tool_calls == second_state.tool_calls
     assert first_state.intents[0].decision == second_state.intents[0].decision
@@ -335,7 +337,9 @@ def test_provider_swap_preserves_read_catalog_and_pydantic_terminal_schema(tmp_p
     assert first_model._schemas == second_model._schemas
     assert first_model._catalogs[0][0] == "get_asset"
     assert first_model._terminal_schemas == second_model._terminal_schemas
-    assert first_model._terminal_schemas == [PlannerTerminalDecision.model_json_schema()]
+    assert first_model._terminal_schemas == [
+        PlannerTerminalDecision.model_json_schema()
+    ]
     assert first_state.decision is AgentDecision.GUIDE
     assert second_state.decision is AgentDecision.GUIDE
     assert first_state.tool_calls == second_state.tool_calls

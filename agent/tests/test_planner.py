@@ -19,7 +19,13 @@ from pydantic import PrivateAttr, ValidationError
 
 from tractian_agent.checkpoint import open_checkpointer
 from tractian_agent.client import IndustrialApiClient
-from tractian_agent.contracts import ApiError, ApiErrorCategory, Identity, ResponseMode, SupportRequest
+from tractian_agent.contracts import (
+    ApiError,
+    ApiErrorCategory,
+    Identity,
+    ResponseMode,
+    SupportRequest,
+)
 from tractian_agent.evidence import compile_observations
 from tractian_agent.planner import (
     PLANNER_SYSTEM_PROMPT,
@@ -353,8 +359,7 @@ def _analysis_list_observation(
     partial_data: object = None,
 ) -> ToolObservation:
     rows = [
-        {"id": analysis_id, "asset_id": "asset_G501"}
-        for analysis_id in analysis_ids
+        {"id": analysis_id, "asset_id": "asset_G501"} for analysis_id in analysis_ids
     ]
     flags = {} if partial_data is None else partial_data
     content = (
@@ -624,22 +629,16 @@ def _real_complete_observation(
             if tool_name == "get_asset":
                 return await execute_get_asset("asset_G501", runtime)
             if tool_name == "list_asset_analyses":
-                return await execute_list_asset_analyses(
-                    "asset_G501", None, runtime
-                )
+                return await execute_list_asset_analyses("asset_G501", None, runtime)
             if tool_name == "get_analysis":
                 return await execute_get_analysis("an_valid_output", runtime)
             if tool_name == "get_baseline":
-                return await execute_get_baseline(
-                    "asset_G501", "pt_G501_de", runtime
-                )
+                return await execute_get_baseline("asset_G501", "pt_G501_de", runtime)
             if tool_name == "get_data_quality":
                 return await execute_get_data_quality(
                     "asset_G501", "pt_G501_de", runtime
                 )
-            return await execute_get_knowledge_document(
-                "kb_valid_output", runtime
-            )
+            return await execute_get_knowledge_document("kb_valid_output", runtime)
         finally:
             await runtime.client.aclose()
 
@@ -676,9 +675,13 @@ def _real_complete_observation(
         content=result.content.model_dump(mode="json"),
         artifact=result.artifact,
     )
-    return call, observation, messages.get(
-        tool_name,
-        "Consulte os dados completos deste ativo.",
+    return (
+        call,
+        observation,
+        messages.get(
+            tool_name,
+            "Consulte os dados completos deste ativo.",
+        ),
     )
 
 
@@ -785,8 +788,9 @@ def _history_with_trusted_target_artifacts(
     )
 
 
-def _proposal_target_authority_history(
-) -> tuple[tuple[PersistedToolCall, ...], tuple[ToolObservation, ...]]:
+def _proposal_target_authority_history() -> tuple[
+    tuple[PersistedToolCall, ...], tuple[ToolObservation, ...]
+]:
     analysis_call = PersistedToolCall(
         request_id="req_planner_01",
         call_id="call_authority_proposal_analysis_list",
@@ -850,9 +854,7 @@ def _real_nullable_point_observation(
             if tool_name == "get_asset":
                 return await execute_get_asset("asset_G501", runtime)
             if tool_name == "list_asset_analyses":
-                return await execute_list_asset_analyses(
-                    "asset_G501", None, runtime
-                )
+                return await execute_list_asset_analyses("asset_G501", None, runtime)
             return await execute_get_analysis("an_nullable_point", runtime)
         finally:
             await runtime.client.aclose()
@@ -950,17 +952,13 @@ def _observation_with_timestamp(
             samples = list(artifact.outcome.rms.samples)
             samples[0] = samples[0].model_copy(update={"ts": timestamp})
             model_samples = list(artifact.model_content.samples)
-            model_samples[0] = model_samples[0].model_copy(
-                update={"ts": timestamp}
-            )
+            model_samples[0] = model_samples[0].model_copy(update={"ts": timestamp})
             model_content = artifact.model_content.model_copy(
                 update={"samples": model_samples}
             )
             outcome = artifact.outcome.model_copy(
                 update={
-                    "rms": artifact.outcome.rms.model_copy(
-                        update={"samples": samples}
-                    )
+                    "rms": artifact.outcome.rms.model_copy(update={"samples": samples})
                 }
             )
             offered_tool = get_rms_series
@@ -1033,11 +1031,16 @@ def test_select_planner_tools_reuses_read_catalog_only_with_read_permission():
     offered = select_planner_tools(_state(), _read_runtime())
 
     assert offered
-    assert all(any(selected is catalogued for catalogued in READ_TOOLS) for selected in offered)
-    assert select_planner_tools(
-        _state(permissions=frozenset()),
-        _read_runtime(permissions=frozenset()),
-    ) == ()
+    assert all(
+        any(selected is catalogued for catalogued in READ_TOOLS) for selected in offered
+    )
+    assert (
+        select_planner_tools(
+            _state(permissions=frozenset()),
+            _read_runtime(permissions=frozenset()),
+        )
+        == ()
+    )
 
 
 @pytest.mark.parametrize(
@@ -1358,9 +1361,7 @@ def test_select_planner_tools_rejects_success_content_attached_to_error_artifact
         ),
     )
     permissions = (
-        frozenset({"read", "action_high"})
-        if use_write_runtime
-        else frozenset({"read"})
+        frozenset({"read", "action_high"}) if use_write_runtime else frozenset({"read"})
     )
     restored_state = AgentState.model_validate_json(
         _state(
@@ -1488,9 +1489,7 @@ def test_select_planner_tools_accepts_generic_degraded_read_artifacts(
     arguments,
     resource,
 ):
-    request = _request().model_copy(
-        update={"message": "Consulte an_9906 neste ativo."}
-    )
+    request = _request().model_copy(update={"message": "Consulte an_9906 neste ativo."})
     call = PersistedToolCall(
         request_id="req_planner_01",
         call_id=f"call_degraded_{tool_name}",
@@ -1880,9 +1879,7 @@ def test_planner_rejects_forged_interior_at_artifact_cut_before_model(
         asyncio.run(
             Planner(model).ainvoke(
                 _request().model_copy(
-                    update={
-                        "message": "Consulte o ponto pt_G501_de deste ativo."
-                    }
+                    update={"message": "Consulte o ponto pt_G501_de deste ativo."}
                 ),
                 request_id="req_planner_01",
                 usage=usage,
@@ -2094,12 +2091,8 @@ def test_select_planner_tools_accepts_nullable_point_only_in_permitted_degraded_
     tool_name,
     offered_tool,
 ):
-    call, observation, request_message = _real_nullable_point_observation(
-        tool_name
-    )
-    observation = ToolObservation.model_validate_json(
-        observation.model_dump_json()
-    )
+    call, observation, request_message = _real_nullable_point_observation(tool_name)
+    observation = ToolObservation.model_validate_json(observation.model_dump_json())
     request = _request().model_copy(update={"message": request_message})
     tool_calls, tool_observations = _history_with_trusted_target_artifacts(
         (call,),
@@ -2563,9 +2556,7 @@ def test_select_planner_tools_rejects_complete_analysis_impossible_for_executor(
 
 
 def test_select_planner_tools_rejects_analysis_timestamp_with_space_separator():
-    call, observation, request_message = _real_complete_observation(
-        "get_analysis"
-    )
+    call, observation, request_message = _real_complete_observation("get_analysis")
     artifact = observation.artifact.validated_read_artifact()
     assert isinstance(artifact, AnalysisDetailToolArtifact)
     impossible_timestamp = "2026-01-02 03:04:05+00:00"
@@ -2683,9 +2674,7 @@ def test_select_planner_tools_rejects_impossible_analysis_inside_complete_list()
     assert isinstance(artifact, AnalysisListToolArtifact)
     impossible_analysis = AnalysisArtifact.model_validate(
         artifact.outcome.analyses[0]
-    ).model_copy(
-        update={"confidence": 2.0}
-    )
+    ).model_copy(update={"confidence": 2.0})
     impossible_artifact = artifact.model_copy(
         update={
             "outcome": artifact.outcome.model_copy(
@@ -2725,9 +2714,7 @@ def test_select_planner_tools_rejects_complete_baseline_impossible_for_executor(
         established_at="not-a-timestamp",
         invalidated_at=None,
         invalidation_reason=None,
-        features=[
-            {"feature": "rms_mm_s", "reference": -2.0, "tolerance": -1.0}
-        ],
+        features=[{"feature": "rms_mm_s", "reference": -2.0, "tolerance": -1.0}],
         alarm_threshold=-3.0,
     )
     call = PersistedToolCall(
@@ -2778,11 +2765,7 @@ def test_select_planner_tools_rejects_complete_rms_impossible_for_executor():
         update={"baseline_reference": -1.0}
     )
     impossible_artifact = artifact.model_copy(
-        update={
-            "outcome": artifact.outcome.model_copy(
-                update={"rms": impossible_rms}
-            )
-        }
+        update={"outcome": artifact.outcome.model_copy(update={"rms": impossible_rms})}
     )
     content = observation.content.to_python()
     content["baseline_reference"] = -1.0
@@ -2979,9 +2962,7 @@ def test_planner_rejects_analysis_id_not_authorized_by_typed_request():
 
     assert exc_info.value.code is PlannerErrorCode.INVALID_TOOL_ARGUMENTS
     assert exc_info.value.usage == usage.model_copy(update={"selection_count": 1})
-    assert str(exc_info.value) == (
-        "planner protocol error: invalid_tool_arguments"
-    )
+    assert str(exc_info.value) == ("planner protocol error: invalid_tool_arguments")
     assert exc_info.value.__cause__ is None
 
 
@@ -3054,11 +3035,7 @@ def test_planner_rejects_untrusted_or_hidden_tool_targets(
 def test_select_planner_tools_offers_proposals_only_with_write_runtime():
     permissions = frozenset({"read", "action_low", "action_high", "escalate"})
     request = _request().model_copy(
-        update={
-            "message": (
-                "Pedido com alvos tipados an_diag_2026 e mdl_vib_v3."
-            )
-        }
+        update={"message": ("Pedido com alvos tipados an_diag_2026 e mdl_vib_v3.")}
     )
     tool_calls, tool_observations = _proposal_target_authority_history()
     state = _state(
@@ -3081,7 +3058,10 @@ def test_select_planner_tools_offers_proposals_only_with_write_runtime():
     assert read_only_names.isdisjoint(tool.name for tool in WRITE_PROPOSAL_TOOLS)
     assert {tool.name for tool in WRITE_PROPOSAL_TOOLS} <= write_names
     assert all(
-        any(selected is catalogued for catalogued in (*READ_TOOLS, *WRITE_PROPOSAL_TOOLS))
+        any(
+            selected is catalogued
+            for catalogued in (*READ_TOOLS, *WRITE_PROPOSAL_TOOLS)
+        )
         for selected in write_tools
     )
 
@@ -3308,9 +3288,7 @@ def test_planner_uses_one_based_sequence_for_persisted_call_ids(prior_count):
 
     assert isinstance(result, PlannerToolTurn)
     expected_id = hashlib.sha256(
-        (
-            "planner-v2\0req_planner_01\0" + str(prior_count + 1)
-        ).encode("utf-8")
+        ("planner-v2\0req_planner_01\0" + str(prior_count + 1)).encode("utf-8")
     ).hexdigest()[:24]
     assert result.tool_call.call_id == f"call_planner_{expected_id}"
     assert result.tool_call.name == "get_asset"
@@ -3936,9 +3914,7 @@ def test_planner_rejects_unsafe_degraded_artifact_before_model():
     tampered_observation = observation.model_copy(
         update={
             "artifact": tampered_artifact,
-            "content": JsonSnapshot(
-                encoded=json.dumps(content_wire, sort_keys=True)
-            ),
+            "content": JsonSnapshot(encoded=json.dumps(content_wire, sort_keys=True)),
         }
     )
     model = _RecordingPlannerModel(
@@ -4229,9 +4205,7 @@ def test_planner_rejects_content_target_that_contradicts_typed_artifact(
         content=history_content,
         artifact=typed_artifact,
     )
-    offered_tool = next(
-        tool for tool in READ_TOOLS if tool.name == next_tool
-    )
+    offered_tool = next(tool for tool in READ_TOOLS if tool.name == next_tool)
     model = _RecordingPlannerModel(
         selector_response=AIMessage(
             content="",
@@ -4794,7 +4768,7 @@ def test_planner_never_compacts_away_the_latest_degraded_observation():
                     selection_count=1,
                 ),
                 offered_tools=(get_asset,),
-                    tool_calls=(call,),
+                tool_calls=(call,),
                 tool_observations=(degraded_observation,),
             )
         )
@@ -5237,8 +5211,7 @@ def test_planner_uses_only_persisted_next_turn_content_after_a_tool_call():
     assert isinstance(selection_tool_message, ToolMessage)
     assert selection_tool_message.tool_call_id == call.call_id
     assert selection_tool_message.content == (
-        '{"mode":"partial","notes":null,'
-        '"partial_data":{"sensor_status":"online"}}'
+        '{"mode":"partial","notes":null,"partial_data":{"sensor_status":"online"}}'
     )
     assert "industrial_api" not in str(model._selection_messages)
     assert model._terminal_messages == model._selection_messages
@@ -5474,9 +5447,7 @@ def test_bounded_technical_projections_survive_sqlite_reopen(
     tmp_path: Path,
 ):
     checkpoint_path = tmp_path / "planner-bounded-projections.sqlite3"
-    rms_call, rms_observation = _real_technical_observation(
-        "get_rms_series", 1_001
-    )
+    rms_call, rms_observation = _real_technical_observation("get_rms_series", 1_001)
     spectrum_call, spectrum_observation = _real_technical_observation(
         "get_spectrum", 201
     )

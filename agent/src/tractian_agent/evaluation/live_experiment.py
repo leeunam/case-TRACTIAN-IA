@@ -17,7 +17,10 @@ from tractian_agent.evaluation.artifacts import (
     build_programmatic_artifact,
     write_json_artifact,
 )
-from tractian_agent.evaluation.calibration import BlindCandidate, build_blind_review_packet
+from tractian_agent.evaluation.calibration import (
+    BlindCandidate,
+    build_blind_review_packet,
+)
 from tractian_agent.evaluation.checks import run_programmatic_checks
 from tractian_agent.evaluation.contracts import BenchmarkInput, EvaluationModel
 from tractian_agent.evaluation.dataset import load_public_dataset

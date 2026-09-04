@@ -31,7 +31,9 @@ def _validated_base_url(value: str) -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("NVIDIA_NIM_BASE_URL deve ser uma URL HTTP(S) sem credenciais ou query")
+        raise ValueError(
+            "NVIDIA_NIM_BASE_URL deve ser uma URL HTTP(S) sem credenciais ou query"
+        )
     if parsed.hostname not in _LOCAL_HOSTS and parsed.scheme != "https":
         raise ValueError("NVIDIA_NIM_BASE_URL remota deve usar HTTPS")
     return value.rstrip("/")
@@ -82,7 +84,9 @@ class _StrictJsonSchemaChatOpenAI(ChatOpenAI):
             raw = result.get("raw")
             parsing_error: ValidationError | TypeError | None = None
             if not isinstance(raw, BaseMessage) or not isinstance(raw.content, str):
-                parsing_error = TypeError("structured output raw content must be JSON text")
+                parsing_error = TypeError(
+                    "structured output raw content must be JSON text"
+                )
                 parsed = None
             else:
                 try:

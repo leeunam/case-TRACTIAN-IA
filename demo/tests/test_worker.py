@@ -31,19 +31,25 @@ class BrokenExecutor:
 def queued(repository: DemoRepository):
     case = repository.create_case(CreateCaseRequest(source_case_id="case_public_1"))
     _, execution = repository.enqueue_message(
-        case_id=case.id, persona_id="usr_1", content="analise",
+        case_id=case.id,
+        persona_id="usr_1",
+        content="analise",
         idempotency_key="worker-test",
     )
     return case, execution
 
 
 @pytest.mark.anyio
-async def test_worker_persists_sanitized_projection_and_completes(tmp_path: Path) -> None:
+async def test_worker_persists_sanitized_projection_and_completes(
+    tmp_path: Path,
+) -> None:
     repository = DemoRepository(tmp_path / "demo.sqlite3")
     repository.open(public_cases=[PUBLIC_CASE])
     case, execution = queued(repository)
 
-    worked = await DemoWorker(repository, SuccessfulExecutor(), worker_id="w1").run_once()
+    worked = await DemoWorker(
+        repository, SuccessfulExecutor(), worker_id="w1"
+    ).run_once()
 
     assert worked is True
     completed = repository.get_execution(execution.id)
@@ -59,7 +65,9 @@ async def test_worker_persists_sanitized_projection_and_completes(tmp_path: Path
 
 
 @pytest.mark.anyio
-async def test_worker_maps_exception_to_closed_error_without_leaking(tmp_path: Path) -> None:
+async def test_worker_maps_exception_to_closed_error_without_leaking(
+    tmp_path: Path,
+) -> None:
     repository = DemoRepository(tmp_path / "demo.sqlite3")
     repository.open(public_cases=[PUBLIC_CASE])
     case, execution = queued(repository)

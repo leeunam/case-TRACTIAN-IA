@@ -28,9 +28,7 @@ def test_nim_remote_endpoint_requires_api_key() -> None:
 
 
 def test_nim_defaults_to_hosted_endpoint_when_api_key_is_present() -> None:
-    provider = NvidiaNimModelProvider.from_env(
-        {"NVIDIA_API_KEY": "nvapi-secret-value"}
-    )
+    provider = NvidiaNimModelProvider.from_env({"NVIDIA_API_KEY": "nvapi-secret-value"})
 
     with patch(
         "tractian_agent.nvidia_nim_provider._StrictJsonSchemaChatOpenAI"

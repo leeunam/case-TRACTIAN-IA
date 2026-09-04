@@ -30,12 +30,17 @@ def client(tmp_path: Path):
     async def personas() -> tuple[Persona, ...]:
         return (
             Persona(
-                id="usr_1", name="Pessoa", profile="requester",
-                company_id="comp_1", permissions=frozenset({"read"}),
+                id="usr_1",
+                name="Pessoa",
+                profile="requester",
+                company_id="comp_1",
+                permissions=frozenset({"read"}),
             ),
             Persona(
-                id="tractian_reviewer", name="Equipe TRACTIAN",
-                profile="tractian", company_id=None,
+                id="tractian_reviewer",
+                name="Equipe TRACTIAN",
+                profile="tractian",
+                company_id=None,
                 permissions=frozenset({"technical_review"}),
             ),
         )
@@ -73,7 +78,10 @@ def test_public_case_is_immutable_and_cors_is_allowlisted(client: TestClient) ->
     )
     assert response.status_code == 409
     assert response.json() == {
-        "detail": {"code": "IMMUTABLE_PUBLIC_CASE", "message": "Duplique o caso público antes de conversar."}
+        "detail": {
+            "code": "IMMUTABLE_PUBLIC_CASE",
+            "message": "Duplique o caso público antes de conversar.",
+        }
     }
     assert "access-control-allow-origin" not in response.headers
 
@@ -84,5 +92,6 @@ def test_personas_and_config_never_expose_secrets(client: TestClient) -> None:
     assert config["warning"].startswith("Demonstração")
     assert "api_key" not in str(config).lower()
     assert [item["profile"] for item in client.get("/v1/personas").json()] == [
-        "requester", "tractian"
+        "requester",
+        "tractian",
     ]

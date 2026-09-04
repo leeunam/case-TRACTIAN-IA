@@ -171,9 +171,7 @@ def test_get_asset_calls_the_fixed_endpoint_and_normalizes_complete_asset():
         "machine_type": "motor_induction",
         "rotation_rpm": 1780,
         "sensor_status": "online",
-        "points": [
-            {"id": "pt_M101_de", "location": "DE", "sensor_status": "online"}
-        ],
+        "points": [{"id": "pt_M101_de", "location": "DE", "sensor_status": "online"}],
     }
     assert result.artifact.model_dump(mode="json") == {
         "tool_name": "get_asset",
@@ -240,9 +238,7 @@ def test_get_asset_adapter_returns_only_model_content_and_rejects_unknown_argume
         "machine_type": "motor_induction",
         "rotation_rpm": 1780.0,
         "sensor_status": "online",
-        "points": [
-            {"id": "pt_M101_de", "location": "DE", "sensor_status": "online"}
-        ],
+        "points": [{"id": "pt_M101_de", "location": "DE", "sensor_status": "online"}],
     }
     assert calls == 1
 
@@ -275,9 +271,10 @@ def test_get_asset_runs_through_tool_node_with_injected_langgraph_runtime():
     assert message.tool_call_id == "call_get_asset_1"
     assert json.loads(message.content)["id"] == "asset_M101"
     assert message.artifact["tool_name"] == "get_asset"
-    assert message.artifact["outcome"]["asset"]["technical_configuration"][
-        "machine_type"
-    ] == "motor_induction"
+    assert (
+        message.artifact["outcome"]["asset"]["technical_configuration"]["machine_type"]
+        == "motor_induction"
+    )
 
 
 def test_read_tool_runtime_does_not_allow_trusted_identity_mutation():
@@ -396,7 +393,11 @@ def test_get_asset_preserves_degraded_mode_notes_and_partial_json():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"mode": "partial", "notes": "Pontos indisponíveis.", "data": partial_data},
+            json={
+                "mode": "partial",
+                "notes": "Pontos indisponíveis.",
+                "data": partial_data,
+            },
         )
 
     result = _invoke(_runtime(handler, seed=None))
@@ -472,7 +473,11 @@ def test_get_asset_rejects_inconsistent_or_null_scope_fields_in_degraded_data(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"mode": "partial", "notes": "Resposta inconsistente.", "data": partial_data},
+            json={
+                "mode": "partial",
+                "notes": "Resposta inconsistente.",
+                "data": partial_data,
+            },
         )
 
     with pytest.raises(ValueError, match=match):
@@ -488,7 +493,11 @@ def test_get_asset_rejects_forbidden_nested_partial_context_before_exposure():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"mode": "partial", "notes": "Resposta degradada.", "data": partial_data},
+            json={
+                "mode": "partial",
+                "notes": "Resposta degradada.",
+                "data": partial_data,
+            },
         )
 
     with pytest.raises(ValueError, match="proibido"):
@@ -511,7 +520,11 @@ def test_get_asset_rejects_normalized_sensitive_partial_keys(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"mode": "partial", "notes": "Resposta degradada.", "data": partial_data},
+            json={
+                "mode": "partial",
+                "notes": "Resposta degradada.",
+                "data": partial_data,
+            },
         )
 
     with pytest.raises(ValueError, match="proibido"):
@@ -528,7 +541,11 @@ def test_get_asset_preserves_legitimate_partial_domain_and_status_fields():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"mode": "partial", "notes": "Resposta degradada.", "data": partial_data},
+            json={
+                "mode": "partial",
+                "notes": "Resposta degradada.",
+                "data": partial_data,
+            },
         )
 
     result = _invoke(_runtime(handler))
@@ -672,7 +689,11 @@ def test_get_asset_preserves_legitimate_compound_partial_keys(legitimate_key: st
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"mode": "partial", "notes": "Resposta degradada.", "data": partial_data},
+            json={
+                "mode": "partial",
+                "notes": "Resposta degradada.",
+                "data": partial_data,
+            },
         )
 
     result = _invoke(_runtime(handler))
@@ -709,7 +730,11 @@ def test_get_asset_preserves_legitimate_nested_domain_keys(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"mode": "partial", "notes": "Resposta degradada.", "data": partial_data},
+            json={
+                "mode": "partial",
+                "notes": "Resposta degradada.",
+                "data": partial_data,
+            },
         )
 
     result = _invoke(_runtime(handler))

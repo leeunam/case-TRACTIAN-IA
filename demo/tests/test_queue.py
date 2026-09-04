@@ -13,7 +13,9 @@ def test_only_one_worker_claims_a_queued_execution(tmp_path: Path) -> None:
     seed.open(public_cases=[PUBLIC_CASE])
     case = seed.create_case(CreateCaseRequest(source_case_id="case_public_1"))
     _, execution = seed.enqueue_message(
-        case_id=case.id, persona_id="usr_1", content="trabalhe",
+        case_id=case.id,
+        persona_id="usr_1",
+        content="trabalhe",
         idempotency_key="queue-1",
     )
     seed.close()

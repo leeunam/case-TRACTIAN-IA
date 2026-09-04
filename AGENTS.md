@@ -25,11 +25,11 @@ Só marque uma tarefa após executar seu critério de aceite. Registre decisões
 
 ## Estado atual
 
-Existem o simulador FastAPI, os dados, os contratos, os cenários, o cliente HTTP, dez tools LangChain de leitura, cinco proposal tools sem efeito, estado tipado, fronteira Python, checkpointer SQLite, adapters Groq e NVIDIA NIM, um grafo LangGraph com cinco fluxos de escrita, planner e writer LLM opt-in separados, ledger completo, gate determinístico de liberação, revisão humana retomável, uma fachada manual Logfire segura e opt-in e um pipeline Pydantic Evals com checks, juízes offline, comparação de providers e relatórios reproduzíveis. As Fases 1–12, 14 e 15 estão implementadas. A calibração humana da Fase 13 está adiada por ausência de especialista da TRACTIAN; não existe limiar calibrado. O benchmark atual falha em qualidade e estabilidade. Nunca descreva calibração pendente ou agente de produção como funcional.
+Existem o simulador FastAPI, o agente LangGraph completo, o pipeline Pydantic Evals, a fachada `demo/` com filas SQLite, a central React `frontend/`, decisões delegadas, outbox Slack MCP e fallback configurável Groq/NVIDIA NIM. As Fases 1–12 e 14–19 têm implementação local; a calibração humana da Fase 13 está adiada por ausência de especialista da TRACTIAN. O Slack real só está comprovado quando o smoke opt-in passar com OAuth e dois canais. O benchmark atual falha em qualidade e estabilidade. Nunca descreva calibração, integração externa não testada ou agente de produção como funcional.
 
 ## Invariantes
 
-- O escopo inicial é backend; não introduza frontend, RAG, banco vetorial, multiagentes ou fine-tuning sem decisão explícita.
+- Frontend e Slack estão autorizados somente na central de demonstração descrita nas Fases 16–19; não introduza RAG, banco vetorial, multiagentes ou fine-tuning sem decisão explícita.
 - Há um agente lógico com planner e writer separados; LangGraph controla o fluxo e o estado.
 - Pydantic valida contratos; Pydantic Evals organiza avaliações offline; Logfire recebe observabilidade.
 - SQLite é o checkpointer de desenvolvimento; PostgreSQL é evolução futura.

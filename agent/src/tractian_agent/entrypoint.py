@@ -399,14 +399,30 @@ def _validate_write_boundary(
             "ORIGINAL_APPROVAL_WITHOUT_PROPOSAL",
             "aprovação original exige proposta na mesma entrada",
         )
-    if (
-        original_approval is not None
-        and original_approval.source is not ApprovalSource.ORIGINAL_REQUEST
-    ):
+    if original_approval is not None and original_approval.source not in {
+        ApprovalSource.ORIGINAL_REQUEST,
+        ApprovalSource.DELEGATED,
+    }:
         raise AgentInvocationProtocolError(
             "INVALID_ORIGINAL_APPROVAL_SOURCE",
             "aprovação original exige proveniência da solicitação original",
         )
+    if (
+        original_approval is not None
+        and original_approval.source is ApprovalSource.DELEGATED
+    ):
+        delegation = original_approval.delegation
+        assert delegation is not None
+        if delegation.company_id != request.identity.company_id:
+            raise AgentInvocationProtocolError(
+                "DELEGATED_COMPANY_SCOPE_MISMATCH",
+                "a autorização delegada pertence a outra empresa",
+            )
+        if delegation.expires_at <= _utc_now():
+            raise AgentInvocationProtocolError(
+                "DELEGATED_APPROVAL_EXPIRED",
+                "a autorização delegada expirou",
+            )
     if runtime.current_case_id != request.case_id:
         raise AgentInvocationProtocolError(
             "WRITE_CASE_SCOPE_MISMATCH",

@@ -113,9 +113,7 @@ def _complete_payload_for_path(path: str) -> dict[str, object]:
             "established_at": "2026-01-01T00:00:00+00:00",
             "invalidated_at": None,
             "invalidation_reason": None,
-            "features": [
-                {"feature": "rms_mm_s", "reference": 2.5, "tolerance": 0.4}
-            ],
+            "features": [{"feature": "rms_mm_s", "reference": 2.5, "tolerance": 0.4}],
         },
         "/assets/asset_M101/rms": {
             "asset_id": "asset_M101",
@@ -124,9 +122,7 @@ def _complete_payload_for_path(path: str) -> dict[str, object]:
             "baseline_reference": 2.5,
             "baseline_state": "established",
             "alarm_threshold": 2.9,
-            "samples": [
-                {"ts": "2026-01-01T00:00:00+00:00", "value": 2.5}
-            ],
+            "samples": [{"ts": "2026-01-01T00:00:00+00:00", "value": 2.5}],
         },
         "/assets/asset_M101/spectrum": {
             "asset_id": "asset_M101",
@@ -605,8 +601,7 @@ def test_all_catalog_tools_return_complete_json_without_hidden_runtime_data():
     assert Counter(request.url.path for request in requests) == expected_paths
     assert all(request.method == "GET" for request in requests)
     assert all(
-        request.headers["x-user-id"] == "usr_success_secret"
-        for request in requests
+        request.headers["x-user-id"] == "usr_success_secret" for request in requests
     )
     assert all(
         dict(request.url.params)["seed"] == "seed_success_secret"
@@ -676,13 +671,10 @@ def test_all_catalog_error_outputs_exclude_trusted_context_and_transport_data():
     messages = result["messages"][-len(READ_TOOLS) :]
 
     assert len(requests) == len(messages) == 10
-    assert {message.name for message in messages} == {
-        tool.name for tool in READ_TOOLS
-    }
+    assert {message.name for message in messages} == {tool.name for tool in READ_TOOLS}
     assert all(request.method == "GET" for request in requests)
     assert all(
-        request.headers["x-user-id"] == "usr_runtime_secret"
-        for request in requests
+        request.headers["x-user-id"] == "usr_runtime_secret" for request in requests
     )
     for message in messages:
         assert isinstance(message, ToolMessage)

@@ -88,9 +88,7 @@ def test_checkpoint_namespace_has_only_one_active_local_owner(tmp_path: Path):
                     pass
 
         async with open_checkpointer(checkpoint_path) as reopened_saver:
-            await reopened_saver.aget(
-                {"configurable": {"thread_id": "owner_reopened"}}
-            )
+            await reopened_saver.aget({"configurable": {"thread_id": "owner_reopened"}})
 
     asyncio.run(scenario())
 

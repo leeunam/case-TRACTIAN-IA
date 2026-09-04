@@ -6,7 +6,13 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field, StringConstraints, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from tractian_agent.contracts import (
     ActionReceipt,
@@ -190,8 +196,7 @@ def proposal_matches_intent_scope(
     return (
         scope.case_id == trusted_context.current_case_id
         and canonical.target_id == intent_scope_target_id(scope)
-        and canonical.material_parameters
-        == intent_scope_material_parameters(scope)
+        and canonical.material_parameters == intent_scope_material_parameters(scope)
     )
 
 
@@ -358,9 +363,7 @@ class WriteIntent(StrictModel):
                 or self.error is not None
                 or self.attempts < 1
             ):
-                raise ValueError(
-                    "status failed é o único que aceita recibo rejeitado"
-                )
+                raise ValueError("status failed é o único que aceita recibo rejeitado")
             return self
 
         if self.error is None:
@@ -395,9 +398,7 @@ class WriteIntent(StrictModel):
                 self.error.code not in expected_codes
                 or self.error.category is not ApiErrorCategory.API
             ):
-                raise ValueError(
-                    "zero tentativa só aceita falha local pré-despacho"
-                )
+                raise ValueError("zero tentativa só aceita falha local pré-despacho")
         return self
 
 

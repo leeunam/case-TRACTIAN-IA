@@ -88,9 +88,7 @@ def _writer_fact(item: EvidenceItem) -> WriterFact:
     return WriterFact(
         evidence_id=item.evidence_id,
         kind=(
-            "technical_fact"
-            if item.source_kind.value == "tool"
-            else "action_accepted"
+            "technical_fact" if item.source_kind.value == "tool" else "action_accepted"
         ),
     )
 
@@ -196,10 +194,7 @@ def _canonical_limitations(
         ).encode("utf-8")
         append(
             kind="conflict",
-            source_ref=(
-                "conflict:"
-                f"{hashlib.sha256(encoded_sources).hexdigest()}"
-            ),
+            source_ref=(f"conflict:{hashlib.sha256(encoded_sources).hexdigest()}"),
             reason="conflict",
             detail=conflict.canonical_key,
         )
@@ -234,9 +229,7 @@ def build_writer_context(
         len(all_facts) + len(canonical_limitations) > MAX_WRITER_REFERENCES
     )
     reference_budget = (
-        MAX_WRITER_REFERENCES - 1
-        if projection_overflow
-        else MAX_WRITER_REFERENCES
+        MAX_WRITER_REFERENCES - 1 if projection_overflow else MAX_WRITER_REFERENCES
     )
     facts = all_facts[:reference_budget]
     limitation_budget = reference_budget - len(facts)

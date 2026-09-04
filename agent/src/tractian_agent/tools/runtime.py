@@ -1,4 +1,5 @@
 """Contexto confiável, validado e imutável para tools de leitura."""
+
 from __future__ import annotations
 
 from typing import Literal
@@ -33,7 +34,9 @@ class ReadToolRuntime(StrictModel):
 
     @field_validator("identity", mode="before")
     @classmethod
-    def _freeze_identity(cls, value: Identity | dict[str, str]) -> Identity | dict[str, str]:
+    def _freeze_identity(
+        cls, value: Identity | dict[str, str]
+    ) -> Identity | dict[str, str]:
         if isinstance(value, Identity):
             return value.model_dump()
         return value

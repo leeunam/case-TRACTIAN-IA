@@ -98,7 +98,9 @@ class ReleaseGateContext(StrictModel):
     @model_validator(mode="after")
     def _require_current_intents(self) -> ReleaseGateContext:
         if any(intent.request_id != self.request_id for intent in self.intents):
-            raise ValueError("contexto do gate aceita somente intenções da request atual")
+            raise ValueError(
+                "contexto do gate aceita somente intenções da request atual"
+            )
         return self
 
 
@@ -125,9 +127,7 @@ def _record(
         outcome=outcome,
         reason=reason,
         draft_digest=_digest(
-            context.draft.model_dump(mode="json")
-            if context.draft is not None
-            else None
+            context.draft.model_dump(mode="json") if context.draft is not None else None
         ),
         ledger_digest=_digest(context.ledger),
         context_digest=_digest(
@@ -176,9 +176,7 @@ def _record(
             else None
         ),
         review_audit_digest=(
-            _digest(context.review_audit)
-            if context.review_audit is not None
-            else None
+            _digest(context.review_audit) if context.review_audit is not None else None
         ),
     )
 
@@ -246,11 +244,16 @@ def _action_decision_is_canonical(
 ) -> ReleaseGateReason | None:
     intent = _current_intent(context)
     if intent is None:
-        if context.intents or context.proposal is not None or context.decision in {
-            AgentDecision.ACT,
-            AgentDecision.ESCALATE,
-            AgentDecision.REQUEST_CONFIRMATION,
-        }:
+        if (
+            context.intents
+            or context.proposal is not None
+            or context.decision
+            in {
+                AgentDecision.ACT,
+                AgentDecision.ESCALATE,
+                AgentDecision.REQUEST_CONFIRMATION,
+            }
+        ):
             return ReleaseGateReason.INTENT_MISSING
         return None
     if context.trusted_write_context is None:
@@ -325,26 +328,16 @@ def _ledger_integrity_reason(
     if any(gap.request_id != context.request_id for gap in context.ledger.gaps):
         return ReleaseGateReason.REQUEST_MISMATCH
     if any(
-        item.evidence_id != canonical_evidence_id(item)
-        for item in context.ledger.items
+        item.evidence_id != canonical_evidence_id(item) for item in context.ledger.items
     ):
         return ReleaseGateReason.INSUFFICIENT_EVIDENCE
     if any(
         (
             item.quality is EvidenceQuality.CLAIMABLE
-            and (
-                item.mode is not ResponseMode.COMPLETE
-                or bool(item.obsolescence)
-            )
+            and (item.mode is not ResponseMode.COMPLETE or bool(item.obsolescence))
         )
-        or (
-            item.quality is EvidenceQuality.OBSOLETE
-            and not item.obsolescence
-        )
-        or (
-            bool(item.obsolescence)
-            and item.quality is not EvidenceQuality.OBSOLETE
-        )
+        or (item.quality is EvidenceQuality.OBSOLETE and not item.obsolescence)
+        or (bool(item.obsolescence) and item.quality is not EvidenceQuality.OBSOLETE)
         for item in context.ledger.items
     ):
         return ReleaseGateReason.INSUFFICIENT_EVIDENCE
@@ -368,11 +361,7 @@ def _ledger_integrity_reason(
     )
     actual_action_gaps = tuple(
         sorted(
-            (
-                gap
-                for gap in context.ledger.gaps
-                if gap.intent_id is not None
-            ),
+            (gap for gap in context.ledger.gaps if gap.intent_id is not None),
             key=lambda gap: gap.model_dump_json(),
         )
     )
@@ -457,9 +446,7 @@ def evaluate_release(context: ReleaseGateContext) -> ReleaseGateRecord:
     if context.ledger.request_id not in {context.request_id, None} or (
         context.ledger.request_id is None
         and bool(
-            context.ledger.items
-            or context.ledger.gaps
-            or context.ledger.conflicts
+            context.ledger.items or context.ledger.gaps or context.ledger.conflicts
         )
     ):
         return _review(context, ReleaseGateReason.REQUEST_MISMATCH)
@@ -497,10 +484,7 @@ def evaluate_release(context: ReleaseGateContext) -> ReleaseGateRecord:
             ),
         }
     )
-    if (
-        not reviewed
-        and context.draft.evidence_ids != evidence_ids
-    ) or (
+    if (not reviewed and context.draft.evidence_ids != evidence_ids) or (
         reviewed
         and (
             (not context.draft.evidence_ids and not reviewed_empty_is_safe)
@@ -508,9 +492,7 @@ def evaluate_release(context: ReleaseGateContext) -> ReleaseGateRecord:
         )
     ):
         return _review(context, ReleaseGateReason.EVIDENCE_REFERENCE_MISMATCH)
-    evidence_by_id = {
-        item.evidence_id: item for item in context.ledger.items
-    }
+    evidence_by_id = {item.evidence_id: item for item in context.ledger.items}
     if "read" not in context.permissions and any(
         evidence_by_id[evidence_id].source_kind is EvidenceSourceKind.TOOL
         for evidence_id in context.draft.evidence_ids
@@ -528,13 +510,15 @@ def evaluate_release(context: ReleaseGateContext) -> ReleaseGateRecord:
     ):
         return _review(context, ReleaseGateReason.NEXT_STEP_MISMATCH)
     if any(
-        limitation.kind == "projection_overflow"
-        for limitation in expected.limitations
+        limitation.kind == "projection_overflow" for limitation in expected.limitations
     ):
         return _review(context, ReleaseGateReason.INSUFFICIENT_EVIDENCE)
 
     if context.decision is AgentDecision.REQUEST_INFORMATION:
-        if context.missing_information is None or not context.missing_information.strip():
+        if (
+            context.missing_information is None
+            or not context.missing_information.strip()
+        ):
             return _review(context, ReleaseGateReason.MISSING_INFORMATION_INVALID)
         return _record(
             context,

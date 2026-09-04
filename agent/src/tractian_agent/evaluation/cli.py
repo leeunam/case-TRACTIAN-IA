@@ -213,8 +213,7 @@ async def _run_judges(
     )
     scores_path.parent.mkdir(parents=True, exist_ok=True)
     scores_path.write_text(
-        TypeAdapter(tuple[JudgeScore, ...]).dump_json(scores, indent=2).decode()
-        + "\n",
+        TypeAdapter(tuple[JudgeScore, ...]).dump_json(scores, indent=2).decode() + "\n",
         encoding="utf-8",
     )
 
@@ -289,9 +288,7 @@ def main(
         root = args.root.resolve()
         if args.command == "live":
             required_key = (
-                "GROQ_API_KEY"
-                if args.provider == "groq"
-                else "NVIDIA_API_KEY"
+                "GROQ_API_KEY" if args.provider == "groq" else "NVIDIA_API_KEY"
             )
             local_nim = args.provider == "nvidia-nim" and environment.get(
                 "NVIDIA_NIM_BASE_URL", ""
@@ -386,7 +383,10 @@ def main(
                 file=output,
             )
             return 1
-        print(f"status={'completed' if exit_code == 0 else 'failed'} report={output_path}", file=output)
+        print(
+            f"status={'completed' if exit_code == 0 else 'failed'} report={output_path}",
+            file=output,
+        )
         return exit_code
 
     if args.command == "judges":
@@ -397,12 +397,8 @@ def main(
         report_path = args.programmatic_report or directory / "programmatic-report.json"
         output_path = args.output or directory / "judge-report.json"
         scores_path = args.scores_output or directory / "judge-scores.json"
-        comparison_path = (
-            args.comparison_output or directory / "evaluation-layers.json"
-        )
-        required_key = (
-            "GROQ_API_KEY" if args.provider == "groq" else "NVIDIA_API_KEY"
-        )
+        comparison_path = args.comparison_output or directory / "evaluation-layers.json"
+        required_key = "GROQ_API_KEY" if args.provider == "groq" else "NVIDIA_API_KEY"
         if not environment.get(required_key):
             print(
                 "status=skipped reason=missing_judge_configuration "
@@ -425,8 +421,7 @@ def main(
             )
         except Exception as error:
             print(
-                "status=failed stage=offline_judges "
-                f"error_type={type(error).__name__}",
+                f"status=failed stage=offline_judges error_type={type(error).__name__}",
                 file=output,
             )
             return 1

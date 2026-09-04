@@ -12,7 +12,9 @@ from tractian_agent.evaluation.dataset import load_public_dataset
 from tractian_agent.evaluation.runner import execute_before_loading_references
 
 
-def test_programmatic_artifact_reports_case_dimension_and_experiment(tmp_path: Path) -> None:
+def test_programmatic_artifact_reports_case_dimension_and_experiment(
+    tmp_path: Path,
+) -> None:
     public_path = tmp_path / "cases.json"
     public_path.write_text(
         """[{"id":"case_tkt_ctx_02","ticket_id":"TKT-CTX-02",\

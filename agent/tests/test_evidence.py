@@ -78,20 +78,28 @@ def _quality_observation(
         outcome = outcome.model_copy(
             update={
                 "data_quality": DataQualityArtifact(
-                    asset_id="asset_G501", point_id=None, completeness=completeness,
-                    freshness_minutes=2, snr_db=24.5, staleness_flag=stale,
+                    asset_id="asset_G501",
+                    point_id=None,
+                    completeness=completeness,
+                    freshness_minutes=2,
+                    snr_db=24.5,
+                    staleness_flag=stale,
                 )
             }
         )
     if error is None and mode is not ResponseMode.COMPLETE:
         outcome = outcome.model_copy(update={"partial_data": {"available": False}})
     return ToolObservation(
-        request_id="req_01", call_id=call_id,
+        request_id="req_01",
+        call_id=call_id,
         artifact=DataQualityToolArtifact(
             tool_name="get_data_quality",
             arguments={"asset_id": "asset_G501", "point_id": None},
-            source=ToolSource(kind="industrial_api", resource="/assets/asset_G501/data-quality"),
-            outcome=outcome, truncated=truncated,
+            source=ToolSource(
+                kind="industrial_api", resource="/assets/asset_G501/data-quality"
+            ),
+            outcome=outcome,
+            truncated=truncated,
         ),
     )
 
@@ -125,7 +133,9 @@ def test_complete_typed_observation_compiles_claimable_facts_with_provenance():
         recorded_at=RECORDED_AT,
     )
 
-    item = next(item for item in ledger.items if item.fact_path == "data_quality.completeness")
+    item = next(
+        item for item in ledger.items if item.fact_path == "data_quality.completeness"
+    )
     assert item.request_id == "req_01"
     assert item.call_id == "call_01"
     assert item.resource == "/assets/asset_G501/data-quality"
@@ -135,11 +145,18 @@ def test_complete_typed_observation_compiles_claimable_facts_with_provenance():
 
 
 def test_error_produces_only_a_sanitized_blocking_gap():
-    ledger = compile_observations((
-        _quality_observation(error=ApiError(
-            category=ApiErrorCategory.TIMEOUT, code="READ_TIMEOUT", message="segredo externo"
-        )),
-    ), recorded_at=RECORDED_AT)
+    ledger = compile_observations(
+        (
+            _quality_observation(
+                error=ApiError(
+                    category=ApiErrorCategory.TIMEOUT,
+                    code="READ_TIMEOUT",
+                    message="segredo externo",
+                )
+            ),
+        ),
+        recorded_at=RECORDED_AT,
+    )
 
     assert ledger.items == ()
     assert ledger.gaps[0].reason is EvidenceGapReason.ERROR
@@ -147,13 +164,17 @@ def test_error_produces_only_a_sanitized_blocking_gap():
 
 
 def test_partial_and_truncated_observations_are_preserved_but_not_claimable():
-    ledger = compile_observations((
-        _quality_observation(mode=ResponseMode.PARTIAL),
-        _quality_observation(call_id="call_02", truncated=True),
-    ), recorded_at=RECORDED_AT)
+    ledger = compile_observations(
+        (
+            _quality_observation(mode=ResponseMode.PARTIAL),
+            _quality_observation(call_id="call_02", truncated=True),
+        ),
+        recorded_at=RECORDED_AT,
+    )
 
     assert {gap.reason for gap in ledger.gaps} == {
-        EvidenceGapReason.PARTIAL, EvidenceGapReason.TRUNCATED
+        EvidenceGapReason.PARTIAL,
+        EvidenceGapReason.TRUNCATED,
     }
     assert ledger.items
     assert all(item.quality is EvidenceQuality.PARTIAL for item in ledger.items)
@@ -161,18 +182,29 @@ def test_partial_and_truncated_observations_are_preserved_but_not_claimable():
 
 
 def test_unavailable_inconclusive_and_conflict_modes_create_blocking_gaps():
-    ledger = compile_observations(tuple(
-        _quality_observation(call_id=f"call_{mode.value}", mode=mode)
-        for mode in (ResponseMode.UNAVAILABLE, ResponseMode.INCONCLUSIVE, ResponseMode.CONFLICT)
-    ), recorded_at=RECORDED_AT)
+    ledger = compile_observations(
+        tuple(
+            _quality_observation(call_id=f"call_{mode.value}", mode=mode)
+            for mode in (
+                ResponseMode.UNAVAILABLE,
+                ResponseMode.INCONCLUSIVE,
+                ResponseMode.CONFLICT,
+            )
+        ),
+        recorded_at=RECORDED_AT,
+    )
 
     assert {gap.reason for gap in ledger.gaps} == {
-        EvidenceGapReason.UNAVAILABLE, EvidenceGapReason.INCONCLUSIVE, EvidenceGapReason.CONFLICT,
+        EvidenceGapReason.UNAVAILABLE,
+        EvidenceGapReason.INCONCLUSIVE,
+        EvidenceGapReason.CONFLICT,
     }
 
 
 def test_data_quality_staleness_is_explicit_obsolescence_not_a_ttl():
-    ledger = compile_observations((_quality_observation(stale=True),), recorded_at=RECORDED_AT)
+    ledger = compile_observations(
+        (_quality_observation(stale=True),), recorded_at=RECORDED_AT
+    )
 
     assert {gap.reason for gap in ledger.gaps} == {EvidenceGapReason.OBSOLETE}
     assert ledger.items
@@ -194,35 +226,55 @@ def test_only_explicit_persisted_expiration_marks_a_fact_obsolete():
 
 def test_analysis_stale_and_invalidated_baseline_are_explicitly_obsolete():
     analysis = ToolObservation(
-        request_id="req_01", call_id="call_analysis",
+        request_id="req_01",
+        call_id="call_analysis",
         artifact=AnalysisDetailToolArtifact(
-            tool_name="get_analysis", arguments={"analysis_id": "an_9906"},
+            tool_name="get_analysis",
+            arguments={"analysis_id": "an_9906"},
             source=ToolSource(kind="industrial_api", resource="/analyses/an_9906"),
             outcome=AnalysisDetailToolOutcome(
                 mode=ResponseMode.COMPLETE,
                 analysis=AnalysisArtifact(
-                    id="an_9906", asset_id="asset_G501", point_id="pt_001",
-                    type="bearing_fault", detection_mode="symptom", severity="high",
-                    confidence=0.9, baseline_state_at_detection="established", evidence=[],
-                    limitations=[], model_version="v1", created_at="2026-09-01T10:00:00+00:00",
+                    id="an_9906",
+                    asset_id="asset_G501",
+                    point_id="pt_001",
+                    type="bearing_fault",
+                    detection_mode="symptom",
+                    severity="high",
+                    confidence=0.9,
+                    baseline_state_at_detection="established",
+                    evidence=[],
+                    limitations=[],
+                    model_version="v1",
+                    created_at="2026-09-01T10:00:00+00:00",
                     status="stale",
                 ),
             ),
         ),
     )
     baseline = ToolObservation(
-        request_id="req_01", call_id="call_baseline",
+        request_id="req_01",
+        call_id="call_baseline",
         artifact=BaselineToolArtifact(
-            tool_name="get_baseline", arguments={"asset_id": "asset_G501", "point_id": None},
-            source=ToolSource(kind="industrial_api", resource="/assets/asset_G501/baseline"),
+            tool_name="get_baseline",
+            arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(
+                kind="industrial_api", resource="/assets/asset_G501/baseline"
+            ),
             outcome=BaselineToolOutcome(
                 mode=ResponseMode.COMPLETE,
                 baseline=BaselineArtifact(
-                    id="base_001", asset_id="asset_G501", point_id="pt_001",
-                    state="invalidated", detection_mode="baseline", learnable=True,
+                    id="base_001",
+                    asset_id="asset_G501",
+                    point_id="pt_001",
+                    state="invalidated",
+                    detection_mode="baseline",
+                    learnable=True,
                     established_at="2026-08-01T10:00:00+00:00",
                     invalidated_at="2026-09-01T10:00:00+00:00",
-                    invalidation_reason="manutenção", features=[], alarm_threshold=None,
+                    invalidation_reason="manutenção",
+                    features=[],
+                    alarm_threshold=None,
                 ),
             ),
         ),
@@ -232,7 +284,12 @@ def test_analysis_stale_and_invalidated_baseline_are_explicitly_obsolete():
 
     assert {gap.reason for gap in ledger.gaps} == {EvidenceGapReason.OBSOLETE}
     assert all(item.quality is EvidenceQuality.OBSOLETE for item in ledger.items)
-    assert next(item for item in ledger.items if item.fact_path == "analysis.status").source_at is not None
+    assert (
+        next(
+            item for item in ledger.items if item.fact_path == "analysis.status"
+        ).source_at
+        is not None
+    )
 
 
 def test_divergent_sources_create_conflict_and_identical_repeat_is_deduplicated():
@@ -243,9 +300,13 @@ def test_divergent_sources_create_conflict_and_identical_repeat_is_deduplicated(
     repeated_ledger = compile_observations((first, first), recorded_at=RECORDED_AT)
 
     assert len(conflict_ledger.conflicts) == 1
-    assert conflict_ledger.conflicts[0].canonical_key.endswith("data_quality.completeness")
+    assert conflict_ledger.conflicts[0].canonical_key.endswith(
+        "data_quality.completeness"
+    )
     assert assess_evidence(conflict_ledger).causes == (EvidenceGapReason.CONFLICT,)
-    assert len(repeated_ledger.items) == len(compile_observations((first,), recorded_at=RECORDED_AT).items)
+    assert len(repeated_ledger.items) == len(
+        compile_observations((first,), recorded_at=RECORDED_AT).items
+    )
 
 
 def test_assessment_requires_claimable_fact_and_ledger_round_trips_as_frozen_json():
@@ -275,20 +336,36 @@ def test_legacy_observation_without_request_provenance_never_becomes_claimable()
 
 def test_stale_analysis_inside_list_is_obsolete_and_never_claimable():
     observation = ToolObservation(
-        request_id="req_01", call_id="call_list",
+        request_id="req_01",
+        call_id="call_list",
         artifact=AnalysisListToolArtifact(
-            tool_name="list_asset_analyses", arguments={"asset_id": "asset_G501"},
-            source=ToolSource(kind="industrial_api", resource="/assets/asset_G501/analyses"),
+            tool_name="list_asset_analyses",
+            arguments={"asset_id": "asset_G501"},
+            source=ToolSource(
+                kind="industrial_api", resource="/assets/asset_G501/analyses"
+            ),
             outcome=AnalysisListToolOutcome(
                 mode=ResponseMode.COMPLETE,
-                analyses=[AnalysisArtifact(
-                    id="an_9906", asset_id="asset_G501", point_id="pt_001",
-                    type="bearing_fault", detection_mode="symptom", severity="high",
-                    confidence=0.9, baseline_state_at_detection="established", evidence=[],
-                    limitations=[], model_version="v1", created_at="2026-09-01T10:00:00+00:00",
-                    status="stale",
-                )],
-                total_analyses=1, returned_analyses=1, omitted_analyses=0,
+                analyses=[
+                    AnalysisArtifact(
+                        id="an_9906",
+                        asset_id="asset_G501",
+                        point_id="pt_001",
+                        type="bearing_fault",
+                        detection_mode="symptom",
+                        severity="high",
+                        confidence=0.9,
+                        baseline_state_at_detection="established",
+                        evidence=[],
+                        limitations=[],
+                        model_version="v1",
+                        created_at="2026-09-01T10:00:00+00:00",
+                        status="stale",
+                    )
+                ],
+                total_analyses=1,
+                returned_analyses=1,
+                omitted_analyses=0,
             ),
         ),
     )
@@ -302,40 +379,77 @@ def test_stale_analysis_inside_list_is_obsolete_and_never_claimable():
 def test_rms_spectrum_and_model_keep_their_validated_source_timestamps():
     observations = (
         ToolObservation(
-            request_id="req_01", call_id="call_rms",
+            request_id="req_01",
+            call_id="call_rms",
             artifact=RmsToolArtifact(
-                tool_name="get_rms_series", arguments={"asset_id": "asset_G501", "point_id": None},
-                source=ToolSource(kind="industrial_api", resource="/assets/asset_G501/rms"),
-                outcome=RmsToolOutcome(mode=ResponseMode.COMPLETE, rms=RmsArtifact(
-                    asset_id="asset_G501", point_id=None, unit="mm/s", baseline_reference=None,
-                    baseline_state="established", alarm_threshold=None,
-                    samples=[RmsSample(ts="2026-09-01T10:00:00+00:00", value=1.1)], total_samples=1,
-                )),
+                tool_name="get_rms_series",
+                arguments={"asset_id": "asset_G501", "point_id": None},
+                source=ToolSource(
+                    kind="industrial_api", resource="/assets/asset_G501/rms"
+                ),
+                outcome=RmsToolOutcome(
+                    mode=ResponseMode.COMPLETE,
+                    rms=RmsArtifact(
+                        asset_id="asset_G501",
+                        point_id=None,
+                        unit="mm/s",
+                        baseline_reference=None,
+                        baseline_state="established",
+                        alarm_threshold=None,
+                        samples=[RmsSample(ts="2026-09-01T10:00:00+00:00", value=1.1)],
+                        total_samples=1,
+                    ),
+                ),
             ),
         ),
         ToolObservation(
-            request_id="req_01", call_id="call_spectrum",
+            request_id="req_01",
+            call_id="call_spectrum",
             artifact=SpectrumToolArtifact(
-                tool_name="get_spectrum", arguments={"asset_id": "asset_G501", "point_id": None},
-                source=ToolSource(kind="industrial_api", resource="/assets/asset_G501/spectrum"),
-                outcome=SpectrumToolOutcome(mode=ResponseMode.COMPLETE, spectrum=SpectrumArtifact(
-                    asset_id="asset_G501", point_id=None, peaks=[], bands_missing=[],
-                    collected_at="2026-09-01T11:00:00+00:00", total_peaks=0,
-                )),
+                tool_name="get_spectrum",
+                arguments={"asset_id": "asset_G501", "point_id": None},
+                source=ToolSource(
+                    kind="industrial_api", resource="/assets/asset_G501/spectrum"
+                ),
+                outcome=SpectrumToolOutcome(
+                    mode=ResponseMode.COMPLETE,
+                    spectrum=SpectrumArtifact(
+                        asset_id="asset_G501",
+                        point_id=None,
+                        peaks=[],
+                        bands_missing=[],
+                        collected_at="2026-09-01T11:00:00+00:00",
+                        total_peaks=0,
+                    ),
+                ),
             ),
         ),
         ToolObservation(
-            request_id="req_01", call_id="call_model",
+            request_id="req_01",
+            call_id="call_model",
             artifact=ModelToolArtifact(
-                tool_name="get_model", arguments={"model_id": "mdl_001"},
+                tool_name="get_model",
+                arguments={"model_id": "mdl_001"},
                 source=ToolSource(kind="industrial_api", resource="/models/mdl_001"),
-                outcome=ModelToolOutcome(mode=ResponseMode.COMPLETE, model=ModelArtifact(
-                    id="mdl_001", version="v1", coverage=[ModelCoverage(
-                        machine_type="pump", supported=True, can_learn_baseline=True
-                    )], requirements=ModelRequirements(
-                        min_completeness=0.9, min_snr_db=10, min_rotation_rpm=None
-                    ), processing_state="idle", last_run_at="2026-09-01T12:00:00+00:00",
-                )),
+                outcome=ModelToolOutcome(
+                    mode=ResponseMode.COMPLETE,
+                    model=ModelArtifact(
+                        id="mdl_001",
+                        version="v1",
+                        coverage=[
+                            ModelCoverage(
+                                machine_type="pump",
+                                supported=True,
+                                can_learn_baseline=True,
+                            )
+                        ],
+                        requirements=ModelRequirements(
+                            min_completeness=0.9, min_snr_db=10, min_rotation_rpm=None
+                        ),
+                        processing_state="idle",
+                        last_run_at="2026-09-01T12:00:00+00:00",
+                    ),
+                ),
             ),
         ),
     )
@@ -343,16 +457,22 @@ def test_rms_spectrum_and_model_keep_their_validated_source_timestamps():
     ledger = compile_observations(observations, recorded_at=RECORDED_AT)
 
     assert {item.source_at.isoformat() for item in ledger.items} == {
-        "2026-09-01T10:00:00+00:00", "2026-09-01T11:00:00+00:00", "2026-09-01T12:00:00+00:00"
+        "2026-09-01T10:00:00+00:00",
+        "2026-09-01T11:00:00+00:00",
+        "2026-09-01T12:00:00+00:00",
     }
 
 
 def test_partial_non_snake_keys_are_preserved_as_safe_distinct_canonical_paths():
     observation = ToolObservation(
-        request_id="req_01", call_id="call_partial",
+        request_id="req_01",
+        call_id="call_partial",
         artifact=DataQualityToolArtifact(
-            tool_name="get_data_quality", arguments={"asset_id": "asset_G501", "point_id": None},
-            source=ToolSource(kind="industrial_api", resource="/assets/asset_G501/data-quality"),
+            tool_name="get_data_quality",
+            arguments={"asset_id": "asset_G501", "point_id": None},
+            source=ToolSource(
+                kind="industrial_api", resource="/assets/asset_G501/data-quality"
+            ),
             outcome=DataQualityToolOutcome(
                 mode=ResponseMode.PARTIAL,
                 partial_data={"sensor-name": "A", "sensor_name": "B"},

@@ -471,9 +471,7 @@ def test_writer_projection_has_a_deterministic_reference_limit() -> None:
 
     assert len(context.facts) == 63
     assert len(context.facts) + len(context.limitations) == 64
-    assert {item.kind for item in context.limitations} == {
-        "projection_overflow"
-    }
+    assert {item.kind for item in context.limitations} == {"projection_overflow"}
 
 
 @pytest.mark.parametrize(

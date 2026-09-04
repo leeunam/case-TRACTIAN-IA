@@ -1,4 +1,5 @@
 """Validação compartilhada de timestamps ISO 8601 com timezone."""
+
 from __future__ import annotations
 
 from datetime import datetime

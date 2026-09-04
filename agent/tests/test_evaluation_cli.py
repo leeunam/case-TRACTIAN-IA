@@ -29,21 +29,27 @@ def test_offline_cli_runs_reproducible_experiment_without_credentials(
     )
 
     assert exit_code == 0
-    assert "status=completed profile=deterministic-fallback cases=17 runs=34" in output.getvalue()
+    assert (
+        "status=completed profile=deterministic-fallback cases=17 runs=34"
+        in output.getvalue()
+    )
 
     template_path = tmp_path / "human-labels.json"
     template_output = StringIO()
-    assert main(
-        [
-            "labels-template",
-            "--packet",
-            str(tmp_path / "experiment/blind-review-packet.json"),
-            "--output",
-            str(template_path),
-        ],
-        environment={},
-        output=template_output,
-    ) == 0
+    assert (
+        main(
+            [
+                "labels-template",
+                "--packet",
+                str(tmp_path / "experiment/blind-review-packet.json"),
+                "--output",
+                str(template_path),
+            ],
+            environment={},
+            output=template_output,
+        )
+        == 0
+    )
     template = json.loads(template_path.read_text(encoding="utf-8"))
     assert len(template["labels"]) == 24
     assert all(item["approved"] is None for item in template["labels"])
@@ -68,8 +74,7 @@ def test_provider_cli_skips_safely_when_credentials_are_absent(tmp_path: Path) -
 
     assert exit_code == 0
     assert output.getvalue().strip() == (
-        "status=skipped reason=missing_provider_configuration "
-        "providers=groq,nvidia-nim"
+        "status=skipped reason=missing_provider_configuration providers=groq,nvidia-nim"
     )
     assert not (tmp_path / "providers.json").exists()
 
@@ -145,9 +150,7 @@ def test_provider_cli_accepts_nvidia_hosted_configuration_without_base_url(
     )
 
     assert exit_code == 0
-    assert output.getvalue().strip() == (
-        f"status=completed report={report_path}"
-    )
+    assert output.getvalue().strip() == (f"status=completed report={report_path}")
 
 
 def test_calibration_cli_writes_metrics_from_human_labels_and_judge_scores(
@@ -202,6 +205,6 @@ def test_calibration_cli_writes_metrics_from_human_labels_and_judge_scores(
 
     assert exit_code == 0
     assert "status=completed chosen_threshold=0.7" in output.getvalue()
-    assert json.loads(report_path.read_text(encoding="utf-8"))[
-        "chosen_threshold"
-    ] == 0.7
+    assert (
+        json.loads(report_path.read_text(encoding="utf-8"))["chosen_threshold"] == 0.7
+    )

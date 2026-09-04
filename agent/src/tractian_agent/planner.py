@@ -132,6 +132,7 @@ def _persisted_call_id(*, request_id: str, ordinal: int) -> str:
     )
     return f"call_planner_{hashlib.sha256(material).hexdigest()[:24]}"
 
+
 _ANALYSIS_ID_ADAPTER: Final = TypeAdapter(AnalysisId)
 _COMPANY_ID_ADAPTER: Final = TypeAdapter(CompanyId)
 _KNOWLEDGE_ID_ADAPTER: Final = TypeAdapter(KnowledgeDocumentId)
@@ -277,19 +278,13 @@ def _edge_preserving_projection(
     """Replica a projeção pública usada pelas tools técnicas."""
     if len(items) <= limit:
         return list(items)
-    return [
-        items[(index * (len(items) - 1)) // (limit - 1)]
-        for index in range(limit)
-    ]
+    return [items[(index * (len(items) - 1)) // (limit - 1)] for index in range(limit)]
 
 
 def _edge_projection_source_indices(total: int, limit: int) -> list[int]:
     if total <= limit:
         return list(range(total))
-    return [
-        (index * (total - 1)) // (limit - 1)
-        for index in range(limit)
-    ]
+    return [(index * (total - 1)) // (limit - 1) for index in range(limit)]
 
 
 def _shared_projection_items_match(
@@ -341,8 +336,7 @@ def _asset_artifact_is_concrete(artifact: AssetToolArtifact) -> bool:
         and _finite_number(technical.rotation_rpm, minimum=0)
         and _nonblank(asset.sensor_status)
         and all(
-            value is None or _finite_number(value)
-            for value in optional_frequencies
+            value is None or _finite_number(value) for value in optional_frequencies
         )
         and all(
             _validated_id(point.id, _POINT_ID_ADAPTER) is not None
@@ -390,11 +384,7 @@ def _baseline_artifact_is_concrete(baseline: BaselineArtifact) -> bool:
     ):
         return False
     rms_feature = next(
-        (
-            feature
-            for feature in baseline.features
-            if feature.feature == "rms_mm_s"
-        ),
+        (feature for feature in baseline.features if feature.feature == "rms_mm_s"),
         None,
     )
     expected_threshold: float | None = None
@@ -461,8 +451,7 @@ def _spectrum_artifact_is_concrete(artifact: SpectrumToolArtifact) -> bool:
                 for peak in peaks
             )
             and all(
-                left.freq_hz <= right.freq_hz
-                for left, right in zip(peaks, peaks[1:])
+                left.freq_hz <= right.freq_hz for left, right in zip(peaks, peaks[1:])
             )
             for peaks in peak_groups
         )
@@ -520,9 +509,7 @@ def _complete_content_matches_artifact(
             truncated=total > 20,
         ).model_dump(mode="json")
         return _exact_model_wire(AnalysisListModelContent, content) == expected
-    if tool_name == "get_analysis" and isinstance(
-        artifact, AnalysisDetailToolArtifact
-    ):
+    if tool_name == "get_analysis" and isinstance(artifact, AnalysisDetailToolArtifact):
         analysis = artifact.outcome.analysis
         return (
             analysis is not None
@@ -533,9 +520,7 @@ def _complete_content_matches_artifact(
             )
             == analysis.model_dump(mode="json")
         )
-    if tool_name == "get_baseline" and isinstance(
-        artifact, BaselineToolArtifact
-    ):
+    if tool_name == "get_baseline" and isinstance(artifact, BaselineToolArtifact):
         baseline = artifact.outcome.baseline
         return (
             baseline is not None
@@ -607,16 +592,10 @@ def _complete_content_matches_artifact(
         if document_wire is None:
             return False
         document = KnowledgeDocumentContent.model_validate(document_wire)
-        total = (
-            document.returned_body_characters
-            + document.omitted_body_characters
-        )
+        total = document.returned_body_characters + document.omitted_body_characters
         if (
             not _nonblank(document.title)
-            or any(
-                not isinstance(tag, str) or not tag.strip()
-                for tag in document.tags
-            )
+            or any(not isinstance(tag, str) or not tag.strip() for tag in document.tags)
             or total < 1
             or document.returned_body_characters != len(document.body)
             or not 0 < document.returned_body_characters <= 32_000
@@ -662,21 +641,22 @@ def _complete_content_matches_artifact(
                 return False
         else:
             return False
-        return all(
-            wire[field] == getattr(rms, field)
-            for field in (
-                "asset_id",
-                "point_id",
-                "unit",
-                "baseline_reference",
-                "baseline_state",
-                "alarm_threshold",
-                "total_samples",
+        return (
+            all(
+                wire[field] == getattr(rms, field)
+                for field in (
+                    "asset_id",
+                    "point_id",
+                    "unit",
+                    "baseline_reference",
+                    "baseline_state",
+                    "alarm_threshold",
+                    "total_samples",
+                )
             )
-        ) and wire["omitted_samples"] == rms.total_samples - expected_content_count
-    if tool_name == "get_spectrum" and isinstance(
-        artifact, SpectrumToolArtifact
-    ):
+            and wire["omitted_samples"] == rms.total_samples - expected_content_count
+        )
+    if tool_name == "get_spectrum" and isinstance(artifact, SpectrumToolArtifact):
         spectrum = artifact.outcome.spectrum
         wire = _exact_model_wire(SpectrumModelContent, content)
         if (
@@ -708,16 +688,19 @@ def _complete_content_matches_artifact(
             for left, right in zip(wire["peaks"], wire["peaks"][1:])
         ):
             return False
-        return all(
-            wire[field] == getattr(spectrum, field)
-            for field in (
-                "asset_id",
-                "point_id",
-                "bands_missing",
-                "collected_at",
-                "total_peaks",
+        return (
+            all(
+                wire[field] == getattr(spectrum, field)
+                for field in (
+                    "asset_id",
+                    "point_id",
+                    "bands_missing",
+                    "collected_at",
+                    "total_peaks",
+                )
             )
-        ) and wire["omitted_peaks"] == spectrum.total_peaks - expected_content_count
+            and wire["omitted_peaks"] == spectrum.total_peaks - expected_content_count
+        )
     return False
 
 
@@ -901,8 +884,10 @@ def _degraded_model_is_concrete(model: object) -> bool:
         "failed",
     }:
         return False
-    if "last_run_at" in model and model["last_run_at"] is not None and not (
-        _is_canonical_timestamp(model["last_run_at"])
+    if (
+        "last_run_at" in model
+        and model["last_run_at"] is not None
+        and not (_is_canonical_timestamp(model["last_run_at"]))
     ):
         return False
     if "coverage" in model:
@@ -931,9 +916,7 @@ def _degraded_model_is_concrete(model: object) -> bool:
                 if flag in item and not isinstance(item[flag], bool):
                     return False
             note = item.get("note")
-            if note is not None and (
-                not isinstance(note, str) or not note.strip()
-            ):
+            if note is not None and (not isinstance(note, str) or not note.strip()):
                 return False
     if "requirements" in model:
         requirements = model["requirements"]
@@ -1014,10 +997,7 @@ def _degraded_document_is_concrete(document: object) -> bool:
     ):
         return False
     total = returned + omitted
-    return (
-        returned == len(body) == min(total, 32_000)
-        and truncated == (omitted > 0)
-    )
+    return returned == len(body) == min(total, 32_000) and truncated == (omitted > 0)
 
 
 def _artifact_scope_matches(
@@ -1074,18 +1054,20 @@ def _artifact_scope_matches(
                 or item_wire.get("asset_id", request.asset_id) != request.asset_id
             ):
                 return False
-            if "point_id" in item_wire and _validated_id(
-                item_wire["point_id"],
-                _POINT_ID_ADAPTER,
-            ) is None:
+            if (
+                "point_id" in item_wire
+                and _validated_id(
+                    item_wire["point_id"],
+                    _POINT_ID_ADAPTER,
+                )
+                is None
+            ):
                 return False
             status = arguments.get("status")
             if status is not None and item_wire.get("status") != status:
                 return False
         return requested_asset == request.asset_id
-    if call.name == "get_analysis" and isinstance(
-        artifact, AnalysisDetailToolArtifact
-    ):
+    if call.name == "get_analysis" and isinstance(artifact, AnalysisDetailToolArtifact):
         analysis = artifact.outcome.analysis
         return (
             analysis is not None
@@ -1166,10 +1148,10 @@ def _artifact_scope_matches(
             document_id = document.get("id")
         else:
             return False
-        return (
-            _degraded_document_is_concrete(document)
-            and document_id in {None, arguments.get("document_id")}
-        )
+        return _degraded_document_is_concrete(document) and document_id in {
+            None,
+            arguments.get("document_id"),
+        }
     return False
 
 
@@ -1211,12 +1193,16 @@ def _artifact_projection_metadata_matches(
         KnowledgeDocumentToolArtifact,
     ):
         document = artifact.outcome.document
-        return artifact.omitted_items == 0 and (
-            not isinstance(document, Mapping)
-            or artifact.truncated == bool(document.get("truncated", False))
-        ) and (
-            not isinstance(document, KnowledgeDocumentContent)
-            or artifact.truncated == document.truncated
+        return (
+            artifact.omitted_items == 0
+            and (
+                not isinstance(document, Mapping)
+                or artifact.truncated == bool(document.get("truncated", False))
+            )
+            and (
+                not isinstance(document, KnowledgeDocumentContent)
+                or artifact.truncated == document.truncated
+            )
         )
     if tool_name == "get_rms_series" and isinstance(artifact, RmsToolArtifact):
         rms = outcome.rms
@@ -1250,9 +1236,7 @@ def _artifact_projection_metadata_matches(
                 == _edge_preserving_projection(rms.samples, 100)
             )
         )
-    if tool_name == "get_spectrum" and isinstance(
-        artifact, SpectrumToolArtifact
-    ):
+    if tool_name == "get_spectrum" and isinstance(artifact, SpectrumToolArtifact):
         spectrum = outcome.spectrum
         if spectrum is None:
             return False
@@ -1296,10 +1280,13 @@ def _generic_degraded_content(artifact: ToolArtifact) -> dict[str, object]:
 
 
 def _bounded_model_content_is_empty(artifact: ToolArtifact) -> bool:
-    return not isinstance(
-        artifact,
-        (RmsToolArtifact, SpectrumToolArtifact),
-    ) or artifact.model_content is None
+    return (
+        not isinstance(
+            artifact,
+            (RmsToolArtifact, SpectrumToolArtifact),
+        )
+        or artifact.model_content is None
+    )
 
 
 def _degraded_content_matches_artifact(
@@ -1316,11 +1303,9 @@ def _degraded_content_matches_artifact(
         "get_spectrum",
         "get_data_quality",
     }:
-        return (
-            _specialized_outcome_is_empty(artifact)
-            and _canonical_json(content)
-            == _canonical_json(_generic_degraded_content(artifact))
-        )
+        return _specialized_outcome_is_empty(artifact) and _canonical_json(
+            content
+        ) == _canonical_json(_generic_degraded_content(artifact))
     if tool_name == "list_asset_analyses" and isinstance(
         artifact, AnalysisListToolArtifact
     ):
@@ -1347,9 +1332,8 @@ def _degraded_content_matches_artifact(
         return _exact_model_wire(DegradedAnalysisListModelContent, content) == expected
     if tool_name == "get_model" and isinstance(artifact, ModelToolArtifact):
         model = outcome.model
-        if (
-            not _degraded_model_is_concrete(model)
-            or not _degraded_flags_are_valid(outcome.partial_data)
+        if not _degraded_model_is_concrete(model) or not _degraded_flags_are_valid(
+            outcome.partial_data
         ):
             return False
         expected = DegradedModelContent(
@@ -1366,10 +1350,9 @@ def _degraded_content_matches_artifact(
         total = outcome.total_results
         if results is None or total is None:
             return False
-        if (
-            not _degraded_search_rows_are_concrete(results)
-            or not _degraded_flags_are_valid(outcome.partial_data)
-        ):
+        if not _degraded_search_rows_are_concrete(
+            results
+        ) or not _degraded_flags_are_valid(outcome.partial_data):
             return False
         expected = DegradedKnowledgeSearchModelContent(
             mode=outcome.mode,
@@ -1381,25 +1364,25 @@ def _degraded_content_matches_artifact(
             truncated=total > len(results),
             partial_data=outcome.partial_data,
         ).model_dump(mode="json")
-        return _exact_model_wire(
-            DegradedKnowledgeSearchModelContent,
-            content,
-        ) == expected
+        return (
+            _exact_model_wire(
+                DegradedKnowledgeSearchModelContent,
+                content,
+            )
+            == expected
+        )
     if tool_name == "get_knowledge_document" and isinstance(
         artifact, KnowledgeDocumentToolArtifact
     ):
         document = outcome.document
-        if (
-            not _degraded_document_is_concrete(document)
-            or not _degraded_flags_are_valid(outcome.partial_data)
-        ):
+        if not _degraded_document_is_concrete(
+            document
+        ) or not _degraded_flags_are_valid(outcome.partial_data):
             return False
         content_document = dict(document)
         body = content_document.get("body")
         if isinstance(body, str):
-            total = len(body) + int(
-                content_document.get("omitted_body_characters", 0)
-            )
+            total = len(body) + int(content_document.get("omitted_body_characters", 0))
             trimmed = body[:8_000]
             content_document.update(
                 body=trimmed,
@@ -1413,10 +1396,13 @@ def _degraded_content_matches_artifact(
             document=content_document,
             partial_data=outcome.partial_data,
         ).model_dump(mode="json")
-        return _exact_model_wire(
-            DegradedKnowledgeDocumentContent,
-            content,
-        ) == expected
+        return (
+            _exact_model_wire(
+                DegradedKnowledgeDocumentContent,
+                content,
+            )
+            == expected
+        )
     return False
 
 
@@ -1452,9 +1438,7 @@ def _read_observation_is_semantically_valid(
                 and not artifact.truncated
                 and artifact.omitted_items == 0
                 and _canonical_json(content)
-                == _canonical_json(
-                    {"error": outcome.error.model_dump(mode="json")}
-                )
+                == _canonical_json({"error": outcome.error.model_dump(mode="json")})
             )
         if outcome.mode is ResponseMode.COMPLETE:
             complete_partial_data_is_valid = outcome.partial_data is None
@@ -1528,10 +1512,14 @@ def _read_observation_is_semantically_valid(
                     allow_null_point=call.name in {"get_asset", "get_analysis"},
                 )
             )
-        if call.name == "list_asset_analyses" and isinstance(
-            artifact,
-            AnalysisListToolArtifact,
-        ) and artifact.outcome.analyses is None:
+        if (
+            call.name == "list_asset_analyses"
+            and isinstance(
+                artifact,
+                AnalysisListToolArtifact,
+            )
+            and artifact.outcome.analyses is None
+        ):
             return (
                 artifact.outcome.total_analyses is None
                 and artifact.outcome.returned_analyses is None
@@ -1603,9 +1591,7 @@ def _structured_observation_ids(
             point_ids=frozenset(),
         )
     content = (
-        observation.content.to_python()
-        if observation.content is not None
-        else None
+        observation.content.to_python() if observation.content is not None else None
     )
     if not isinstance(content, Mapping):
         return _PlannerAuthorizedTargets(
@@ -1620,9 +1606,7 @@ def _structured_observation_ids(
     model_ids: set[str] = set()
     point_ids: set[str] = set()
     if call.name == "get_asset":
-        point_ids.update(
-            _ids_from_rows(content.get("points"), "id", _POINT_ID_ADAPTER)
-        )
+        point_ids.update(_ids_from_rows(content.get("points"), "id", _POINT_ID_ADAPTER))
     elif call.name == "list_asset_analyses":
         analyses = content.get("analyses")
         analysis_ids.update(_ids_from_rows(analyses, "id", _ANALYSIS_ID_ADAPTER))
@@ -1708,10 +1692,7 @@ def _selected_targets_are_authorized(
         if arguments.get("document_id") not in authorized.knowledge_document_ids:
             return False
     if tool_name in _ASSET_ARGUMENT_TOOL_NAMES:
-        if (
-            request.asset_id is None
-            or arguments.get("asset_id") != request.asset_id
-        ):
+        if request.asset_id is None or arguments.get("asset_id") != request.asset_id:
             return False
     if tool_name in _POINT_ARGUMENT_TOOL_NAMES:
         point_id = arguments.get("point_id")
@@ -1845,8 +1826,7 @@ def select_planner_tools(
     )
     authorized = _authorized_targets(interactions)
     knowledge_search_completed = any(
-        call.name == "search_knowledge"
-        and observation.artifact.outcome.error is None
+        call.name == "search_knowledge" and observation.artifact.outcome.error is None
         for call, observation in interactions
     )
     has_scoped_asset = (
@@ -1896,8 +1876,7 @@ def select_planner_tools(
         tool
         for tool in WRITE_PROPOSAL_TOOLS
         if (
-            (requirement := proposal_requirements[tool.name])[0]
-            in state.permissions
+            (requirement := proposal_requirements[tool.name])[0] in state.permissions
             and requirement[0] in runtime.permissions
             and requirement[1]
         )
@@ -2058,9 +2037,7 @@ class PlannerTerminalDecision(StrictModel):
         }[self.decision]
         if self.stop_reason is not expected_reason:
             raise ValueError("stop_reason diverge da decisão terminal")
-        requires_information = (
-            self.decision is PlannerDecisionKind.REQUEST_INFORMATION
-        )
+        requires_information = self.decision is PlannerDecisionKind.REQUEST_INFORMATION
         if requires_information != (self.missing_information is not None):
             raise ValueError("missing_information diverge da decisão terminal")
         return self
@@ -2151,9 +2128,7 @@ class Planner:
             usage=active_usage,
         )
         calls = tuple(call for call, _ in validated_interactions)
-        observations = tuple(
-            observation for _, observation in validated_interactions
-        )
+        observations = tuple(observation for _, observation in validated_interactions)
         call_fingerprints = tuple(_tool_call_fingerprint(call) for call in calls)
         if len(call_fingerprints) != len(set(call_fingerprints)):
             raise PlannerProtocolError(
@@ -2171,9 +2146,7 @@ class Planner:
             tool_names = ()
             tools_by_name = {}
         interactions: list[tuple[AIMessage, ToolMessage, bool]] = []
-        authorized_interactions: list[
-            tuple[PersistedToolCall, ToolObservation]
-        ] = []
+        authorized_interactions: list[tuple[PersistedToolCall, ToolObservation]] = []
         for index, (call, observation) in enumerate(
             zip(calls, observations, strict=True)
         ):
@@ -2231,9 +2204,7 @@ class Planner:
                     )
                 ),
             ]
-            selection = await self._model.bind_tools(tools).ainvoke(
-                repair_messages
-            )
+            selection = await self._model.bind_tools(tools).ainvoke(repair_messages)
             selection_attempts += 1
         selection_usage = PlannerUsage(
             request_id=active_usage.request_id,

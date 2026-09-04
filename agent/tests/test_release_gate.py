@@ -251,9 +251,7 @@ def _completed_gate_action(action: str):
         permission = "escalate"
         decision = AgentDecision.ESCALATE
     material = (
-        {"criticality": "critical"}
-        if action == "update_asset_criticality"
-        else {}
+        {"criticality": "critical"} if action == "update_asset_criticality" else {}
     )
     approval = TrustedActionApproval(
         action=action,
@@ -310,8 +308,8 @@ def _completed_gate_action(action: str):
 def test_gate_releases_each_action_only_with_its_canonical_approval(
     action: str,
 ) -> None:
-    proposal, approval, intent, ledger, permission, decision = (
-        _completed_gate_action(action)
+    proposal, approval, intent, ledger, permission, decision = _completed_gate_action(
+        action
     )
     context = ReleaseGateContext(
         request_id="req_gate_matrix",
@@ -479,8 +477,10 @@ def test_gate_derives_act_from_the_completed_canonical_action() -> None:
 
 def test_action_with_cited_tool_evidence_requires_read_permission() -> None:
     proposal, approval, intent, action_ledger = _completed_update_action()
-    technical = _claimable_ledger().items[0].model_copy(
-        update={"request_id": "req_gate_action"}
+    technical = (
+        _claimable_ledger()
+        .items[0]
+        .model_copy(update={"request_id": "req_gate_action"})
     )
     technical = technical.model_copy(
         update={"evidence_id": canonical_evidence_id(technical)}
@@ -533,8 +533,10 @@ def test_receipt_only_action_does_not_require_read_permission() -> None:
 
 def test_reviewed_action_cannot_omit_the_current_accepted_receipt() -> None:
     proposal, approval, intent, action_ledger = _completed_update_action()
-    technical = _claimable_ledger().items[0].model_copy(
-        update={"request_id": "req_gate_action"}
+    technical = (
+        _claimable_ledger()
+        .items[0]
+        .model_copy(update={"request_id": "req_gate_action"})
     )
     technical = technical.model_copy(
         update={"evidence_id": canonical_evidence_id(technical)}
@@ -628,8 +630,10 @@ def _reviewed_action_after_writer_failure(
     selected_id = action_ledger.items[0].evidence_id
     permissions = frozenset({permission})
     if not include_receipt:
-        technical = _claimable_ledger().items[0].model_copy(
-            update={"request_id": "req_gate_matrix"}
+        technical = (
+            _claimable_ledger()
+            .items[0]
+            .model_copy(update={"request_id": "req_gate_matrix"})
         )
         technical = technical.model_copy(
             update={"evidence_id": canonical_evidence_id(technical)}
@@ -743,8 +747,10 @@ def test_reviewed_actions_require_and_release_with_the_current_receipt(action: s
 
 def test_read_permission_revoked_after_draft_blocks_cited_tool_evidence() -> None:
     proposal, approval, intent, action_ledger = _completed_update_action()
-    technical = _claimable_ledger().items[0].model_copy(
-        update={"request_id": "req_gate_action"}
+    technical = (
+        _claimable_ledger()
+        .items[0]
+        .model_copy(update={"request_id": "req_gate_action"})
     )
     technical = technical.model_copy(
         update={"evidence_id": canonical_evidence_id(technical)}
@@ -1180,7 +1186,9 @@ def test_projection_overflow_marker_blocks_release() -> None:
     assert result.reason is ReleaseGateReason.INSUFFICIENT_EVIDENCE
 
 
-def test_request_information_keeps_structured_provenance_without_technical_text() -> None:
+def test_request_information_keeps_structured_provenance_without_technical_text() -> (
+    None
+):
     ledger = _claimable_ledger()
     missing_information = "Informe o ponto de medição."
     draft = _draft_for(
@@ -1243,9 +1251,7 @@ def test_gate_blocks_draft_and_permission_mismatches(
             }
         )
     elif mutation == "unknown_id":
-        draft = draft.model_copy(
-            update={"evidence_ids": ("sha256:v1:" + "f" * 64,)}
-        )
+        draft = draft.model_copy(update={"evidence_ids": ("sha256:v1:" + "f" * 64,)})
     elif mutation == "omitted_limitation":
         draft = draft.model_copy(update={"limitation_refs": ()})
     else:
@@ -1283,17 +1289,13 @@ def test_gate_blocks_every_current_global_evidence_degradation(
             ),
         )
     elif degradation == "partial":
-        items = (
-            items[0].model_copy(update={"quality": EvidenceQuality.PARTIAL}),
-        )
+        items = (items[0].model_copy(update={"quality": EvidenceQuality.PARTIAL}),)
     elif degradation == "obsolete":
         items = (
             items[0].model_copy(
                 update={
                     "quality": EvidenceQuality.OBSOLETE,
-                    "obsolescence": (
-                        EvidenceObsolescenceReason.DATA_QUALITY_STALE,
-                    ),
+                    "obsolescence": (EvidenceObsolescenceReason.DATA_QUALITY_STALE,),
                 }
             ),
         )
@@ -1336,9 +1338,7 @@ def test_gate_blocks_every_current_global_evidence_degradation(
 
 def test_gate_rejects_a_historical_item_inserted_in_the_current_ledger() -> None:
     base = _claimable_ledger()
-    historical = base.items[0].model_copy(
-        update={"request_id": "req_gate_historical"}
-    )
+    historical = base.items[0].model_copy(update={"request_id": "req_gate_historical"})
     historical = historical.model_copy(
         update={"evidence_id": canonical_evidence_id(historical)}
     )
@@ -1392,9 +1392,7 @@ def test_gate_rejects_a_historical_gap_without_exposing_its_reference() -> None:
 
 def test_gate_rejects_partial_evidence_marked_as_claimable() -> None:
     base = _claimable_ledger()
-    incoherent = base.items[0].model_copy(
-        update={"mode": ResponseMode.PARTIAL}
-    )
+    incoherent = base.items[0].model_copy(update={"mode": ResponseMode.PARTIAL})
     incoherent = incoherent.model_copy(
         update={"evidence_id": canonical_evidence_id(incoherent)}
     )
@@ -1443,9 +1441,7 @@ def test_gate_recompiles_action_evidence_and_rejects_the_wrong_resource() -> Non
     forged = canonical.items[0].model_copy(
         update={"resource": "/actions/action_FORGED"}
     )
-    forged = forged.model_copy(
-        update={"evidence_id": canonical_evidence_id(forged)}
-    )
+    forged = forged.model_copy(update={"evidence_id": canonical_evidence_id(forged)})
     ledger = EvidenceLedger(request_id=canonical.request_id, items=(forged,))
     context = ReleaseGateContext(
         request_id="req_gate_action",
@@ -1478,7 +1474,9 @@ def test_gate_recomputes_conflicts_instead_of_trusting_the_conflict_list() -> No
     )
     ledger = EvidenceLedger(
         request_id=base.request_id,
-        items=tuple(sorted((*base.items, divergent), key=lambda item: item.evidence_id)),
+        items=tuple(
+            sorted((*base.items, divergent), key=lambda item: item.evidence_id)
+        ),
     )
     context = ReleaseGateContext(
         request_id="req_gate_01",
@@ -1650,9 +1648,7 @@ def test_checkpoint_binds_the_released_action_target_to_the_trusted_request() ->
     tampered = state.model_dump(mode="json")
     tampered["intents"] = [forged_intent.model_dump(mode="json")]
     tampered["approval"] = forged_approval.model_dump(mode="json")
-    tampered["trusted_write_context"] = forged_trusted_context.model_dump(
-        mode="json"
-    )
+    tampered["trusted_write_context"] = forged_trusted_context.model_dump(mode="json")
     tampered["ledger"] = forged_ledger.model_dump(mode="json")
     tampered["writer_draft"] = forged_draft.model_dump(mode="json")
     tampered["release_gate"] = forged_gate.model_dump(mode="json")
@@ -1671,7 +1667,9 @@ def test_checkpoint_cannot_delete_the_trusted_action_scope() -> None:
         AgentState.model_validate(tampered)
 
 
-def test_gate_attestation_binds_missing_information_even_if_message_is_recomputed() -> None:
+def test_gate_attestation_binds_missing_information_even_if_message_is_recomputed() -> (
+    None
+):
     missing_information = "Informe o ponto de medição."
     planner_terminal = PlannerTerminalRecord(
         decision="request_information",

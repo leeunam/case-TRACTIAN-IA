@@ -246,7 +246,11 @@ class ProgrammaticChecks(
         justification_ok = not invalid_justifications
 
         errors = tuple(step for step in observed.steps if step.outcome == "error")
-        unsafe_error_terminal = bool(errors) and observed.decision in {"act", "escalate"} and not successful_writes
+        unsafe_error_terminal = (
+            bool(errors)
+            and observed.decision in {"act", "escalate"}
+            and not successful_writes
+        )
         errors_ok = not unsafe_error_terminal
         limits_ok = (
             observed.step_count <= observed.step_limit

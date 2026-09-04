@@ -103,8 +103,7 @@ def _key_segments(value: str) -> frozenset[str]:
         separated_acronyms,
     )
     return frozenset(
-        segment.casefold()
-        for segment in re.findall(r"[A-Za-z0-9]+", separated_camel)
+        segment.casefold() for segment in re.findall(r"[A-Za-z0-9]+", separated_camel)
     )
 
 
@@ -222,9 +221,7 @@ def _validate_json_boundary(
             if (
                 _normalized_key(key) in forbidden_names
                 or not segments.isdisjoint(forbidden_segments)
-                or any(
-                    pattern <= segments for pattern in forbidden_segment_patterns
-                )
+                or any(pattern <= segments for pattern in forbidden_segment_patterns)
             ):
                 raise ValueError("o estado contém um campo proibido")
             _validate_json_boundary(
@@ -661,10 +658,7 @@ class WriterDraft(FrozenStateModel):
     ) -> tuple[str, ...]:
         if tuple(sorted(value)) != value or len(value) != len(set(value)):
             raise ValueError("referências de limitação devem ser únicas e ordenadas")
-        if any(
-            not re.fullmatch(r"limitation:v1:[0-9a-f]{64}", item)
-            for item in value
-        ):
+        if any(not re.fullmatch(r"limitation:v1:[0-9a-f]{64}", item) for item in value):
             raise ValueError("referência de limitação inválida")
         return value
 
@@ -726,7 +720,9 @@ class ReleaseGateRecord(FrozenStateModel):
     ledger_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     context_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
     review_digest: str | None = Field(default=None, pattern=r"^sha256:v1:[0-9a-f]{64}$")
-    review_audit_digest: str | None = Field(default=None, pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    review_audit_digest: str | None = Field(
+        default=None, pattern=r"^sha256:v1:[0-9a-f]{64}$"
+    )
 
 
 class ReviewStateModel(FrozenStateModel):
@@ -814,10 +810,7 @@ class ReviewRequest(ReviewStateModel):
     def _validate_eligible_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if value != tuple(sorted(set(value))):
             raise ValueError("evidências elegíveis devem ser únicas e ordenadas")
-        if any(
-            not re.fullmatch(r"sha256:v1:[0-9a-f]{64}", item)
-            for item in value
-        ):
+        if any(not re.fullmatch(r"sha256:v1:[0-9a-f]{64}", item) for item in value):
             raise ValueError("ID de evidência elegível inválido")
         return value
 
@@ -914,10 +907,7 @@ class ReviewEditReply(ReviewStateModel):
     def _require_unique_human_order(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if len(value) != len(set(value)):
             raise ValueError("edição não aceita evidência duplicada")
-        if any(
-            not re.fullmatch(r"sha256:v1:[0-9a-f]{64}", item)
-            for item in value
-        ):
+        if any(not re.fullmatch(r"sha256:v1:[0-9a-f]{64}", item) for item in value):
             raise ValueError("edição contém ID de evidência inválido")
         return value
 
@@ -966,10 +956,7 @@ class ReviewedDraft(ReviewStateModel):
     def _require_unique_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if len(value) != len(set(value)):
             raise ValueError("reviewed draft não aceita evidência duplicada")
-        if any(
-            not re.fullmatch(r"sha256:v1:[0-9a-f]{64}", item)
-            for item in value
-        ):
+        if any(not re.fullmatch(r"sha256:v1:[0-9a-f]{64}", item) for item in value):
             raise ValueError("reviewed draft contém ID de evidência inválido")
         return value
 
@@ -1276,15 +1263,27 @@ class EvidenceItem(FrozenStateModel):
     @model_validator(mode="after")
     def _require_exclusive_provenance(self) -> EvidenceItem:
         if self.source_kind is EvidenceSourceKind.TOOL:
-            if self.call_id is None or self.intent_id is not None or self.tool is None or self.action is not None:
+            if (
+                self.call_id is None
+                or self.intent_id is not None
+                or self.tool is None
+                or self.action is not None
+            ):
                 raise ValueError("evidência de tool exige somente call_id e tool")
-        elif self.intent_id is None or self.call_id is not None or self.action is None or self.tool is not None:
+        elif (
+            self.intent_id is None
+            or self.call_id is not None
+            or self.action is None
+            or self.tool is not None
+        ):
             raise ValueError("evidência de ação exige somente intent_id e action")
         return self
 
     @property
     def canonical_key(self) -> str:
-        source = self.tool if self.source_kind is EvidenceSourceKind.TOOL else self.action
+        source = (
+            self.tool if self.source_kind is EvidenceSourceKind.TOOL else self.action
+        )
         assert source is not None
         return f"{self.source_kind.value}:{source}:{self.resource}:{self.fact_path}"
 
@@ -1326,10 +1325,7 @@ class EvidenceConflict(FrozenStateModel):
             raise ValueError("IDs do conflito devem ser únicos")
         if tuple(sorted(value)) != value:
             raise ValueError("IDs do conflito devem ser ordenados")
-        if any(
-            not re.fullmatch(r"sha256:v1:[0-9a-f]{64}", item)
-            for item in value
-        ):
+        if any(not re.fullmatch(r"sha256:v1:[0-9a-f]{64}", item) for item in value):
             raise ValueError("ID de evidência inválido no conflito")
         return value
 
@@ -1371,9 +1367,7 @@ class ConservativeNonIdempotentResumeTerminal:
         """Retorna ``None`` fora do caso; ``False`` denuncia shape adulterado."""
 
         current_intents = tuple(
-            intent
-            for intent in state.intents
-            if intent.request_id == state.request_id
+            intent for intent in state.intents if intent.request_id == state.request_id
         )
         if len(current_intents) != 1:
             return None
@@ -1407,32 +1401,29 @@ class ConservativeNonIdempotentResumeTerminal:
         )
 
 
-_CONSERVATIVE_NON_IDEMPOTENT_RESUME_TERMINAL = (
-    ConservativeNonIdempotentResumeTerminal(
-        error=PersistedApiError(
-            category=ApiErrorCategory.API,
-            code="NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME",
-            message=(
-                "A execução preparadora terminou sem resultado terminal observável."
-            ),
-            status_code=None,
+_CONSERVATIVE_NON_IDEMPOTENT_RESUME_TERMINAL = ConservativeNonIdempotentResumeTerminal(
+    error=PersistedApiError(
+        category=ApiErrorCategory.API,
+        code="NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME",
+        message=("A execução preparadora terminou sem resultado terminal observável."),
+        status_code=None,
+    ),
+    final_result=FinalResult(
+        decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
+        message=(
+            "O resultado remoto da ação é desconhecido e ela não será "
+            "reenviada automaticamente."
         ),
-        final_result=FinalResult(
-            decision=AgentDecision.REQUIRE_HUMAN_REVIEW,
-            message=(
-                "O resultado remoto da ação é desconhecido e ela não será "
-                "reenviada automaticamente."
-            ),
-            evidence_ids=(),
-            limitation_refs=(),
-            next_step=None,
-        ),
-    )
+        evidence_ids=(),
+        limitation_refs=(),
+        next_step=None,
+    ),
 )
 
 
-def canonical_non_idempotent_resume_terminal(
-) -> ConservativeNonIdempotentResumeTerminal:
+def canonical_non_idempotent_resume_terminal() -> (
+    ConservativeNonIdempotentResumeTerminal
+):
     """Fornece erro e resposta fixos, além do predicado estrutural compartilhado."""
 
     return _CONSERVATIVE_NON_IDEMPOTENT_RESUME_TERMINAL
@@ -1540,8 +1531,8 @@ class AgentState(FrozenStateModel):
 
     def has_coherent_terminal_result(self) -> bool:
         """Confere a matriz fechada dos resultados terminais persistidos."""
-        conservative_match = (
-            canonical_non_idempotent_resume_terminal().matches_state(self)
+        conservative_match = canonical_non_idempotent_resume_terminal().matches_state(
+            self
         )
         if conservative_match is not None:
             return conservative_match
@@ -1565,8 +1556,7 @@ class AgentState(FrozenStateModel):
             return (
                 self.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
                 and self.review == expected_review
-                and self.final_result.decision
-                is AgentDecision.REQUIRE_HUMAN_REVIEW
+                and self.final_result.decision is AgentDecision.REQUIRE_HUMAN_REVIEW
                 and self.review_request is not None
                 and self.release_gate is not None
                 and self.release_gate == self.review_request.gate_basis
@@ -1587,9 +1577,7 @@ class AgentState(FrozenStateModel):
             return False
 
         current_intents = tuple(
-            intent
-            for intent in self.intents
-            if intent.request_id == self.request_id
+            intent for intent in self.intents if intent.request_id == self.request_id
         )
         if self.planner_failure is not None:
             expected_anchor = {
@@ -1839,8 +1827,7 @@ class AgentState(FrozenStateModel):
             self.trusted_write_context.current_case_id != self.request.case_id
             or (
                 self.request.asset_id is not None
-                and self.trusted_write_context.central_asset_id
-                != self.request.asset_id
+                and self.trusted_write_context.central_asset_id != self.request.asset_id
             )
         ):
             raise ValueError("escopo confiável diverge da solicitação")
@@ -1856,9 +1843,7 @@ class AgentState(FrozenStateModel):
             or bool(self.intents)
             or self.resume_anchor in write_anchors
         ):
-            raise ValueError(
-                "o ciclo de escrita exige contexto confiável persistido"
-            )
+            raise ValueError("o ciclo de escrita exige contexto confiável persistido")
         thread_intent_scope = (
             self.thread_scope.case_id,
             self.thread_scope.company_id,
@@ -1885,26 +1870,20 @@ class AgentState(FrozenStateModel):
         active_request_ids = [
             intent.request_id
             for intent in self.intents
-            if intent.request_id is not None
-            and intent.status in active_statuses
+            if intent.request_id is not None and intent.status in active_statuses
         ]
         if len(active_request_ids) != len(set(active_request_ids)):
             raise ValueError("cada request_id aceita no máximo uma intenção ativa")
         current_intents = tuple(
-            intent
-            for intent in self.intents
-            if intent.request_id == self.request_id
+            intent for intent in self.intents if intent.request_id == self.request_id
         )
         if self.pending_proposal is not None and current_intents:
-            if (
-                len(current_intents) != 1
-                or not _proposal_matches_persisted_intent(
-                    self.pending_proposal,
-                    current_intents[0].scope,
-                    request=self.request,
-                    payload_hash=current_intents[0].payload_hash,
-                    trusted_context=self.trusted_write_context,
-                )
+            if len(current_intents) != 1 or not _proposal_matches_persisted_intent(
+                self.pending_proposal,
+                current_intents[0].scope,
+                request=self.request,
+                payload_hash=current_intents[0].payload_hash,
+                trusted_context=self.trusted_write_context,
             ):
                 raise ValueError(
                     "ciclo de escrita diverge da assinatura canônica persistida"
@@ -1925,10 +1904,9 @@ class AgentState(FrozenStateModel):
         )
         if len(current_call_ids) > 7:
             raise ValueError("histórico do planner excede sete tool calls")
-        if (
-            len(current_call_ids) != len(set(current_call_ids))
-            or len(current_observation_ids) != len(set(current_observation_ids))
-        ):
+        if len(current_call_ids) != len(set(current_call_ids)) or len(
+            current_observation_ids
+        ) != len(set(current_observation_ids)):
             raise ValueError("IDs de tool call devem ser únicos por request_id")
         if self.planner_terminal is not None and self.planner_failure is not None:
             raise ValueError(
@@ -1937,8 +1915,7 @@ class AgentState(FrozenStateModel):
         if self.planner_failure is not None and (
             self.decision is not AgentDecision.REQUIRE_HUMAN_REVIEW
             or self.final_result is None
-            or self.final_result.decision
-            is not AgentDecision.REQUIRE_HUMAN_REVIEW
+            or self.final_result.decision is not AgentDecision.REQUIRE_HUMAN_REVIEW
             or self.review is None
             or self.review.status is not ReviewStatus.REQUIRED
         ):
@@ -2060,9 +2037,7 @@ class AgentState(FrozenStateModel):
             and self.review_audit.operation
             in {ReviewOperation.APPROVE, ReviewOperation.EDIT}
         )
-        permission_drift = self.permissions != frozenset(
-            request.basis_permissions
-        )
+        permission_drift = self.permissions != frozenset(request.basis_permissions)
         pre_judgment_continuation = (
             self.resume_anchor is ResumeAnchor.RELEASE_GATE
             and self.final_result is None
@@ -2306,7 +2281,10 @@ class AgentState(FrozenStateModel):
             if intent.request_id is not None:
                 intent_lists.setdefault(intent.request_id, []).append(intent)
         return (
-            {request_id: tuple(values) for request_id, values in observation_lists.items()},
+            {
+                request_id: tuple(values)
+                for request_id, values in observation_lists.items()
+            },
             {request_id: tuple(values) for request_id, values in intent_lists.items()},
         )
 
@@ -2339,7 +2317,9 @@ class AgentState(FrozenStateModel):
             compile_observations(observations, recorded_at=canonical_time),
             compile_action_intents(intents, recorded_at=canonical_time),
         )
-        if self._ledger_semantics(ledger, canonical_time=canonical_time) != self._ledger_semantics(
+        if self._ledger_semantics(
+            ledger, canonical_time=canonical_time
+        ) != self._ledger_semantics(
             expected,
             canonical_time=canonical_time,
         ):
@@ -2370,7 +2350,6 @@ class AgentState(FrozenStateModel):
         )
         return (ledger.request_id, items, gaps, conflicts)
 
-
     def continue_with(
         self,
         *,
@@ -2400,9 +2379,7 @@ class AgentState(FrozenStateModel):
             request_id=request_id,
             execution_id=execution_id,
             trusted_write_context=(
-                self.trusted_write_context
-                if same_request
-                else trusted_write_context
+                self.trusted_write_context if same_request else trusted_write_context
             ),
         )
         if (

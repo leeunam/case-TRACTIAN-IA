@@ -1,4 +1,5 @@
 """Tools de leitura para baseline e sinais técnicos de um ativo."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -41,7 +42,9 @@ def _validate_optional_point_id(value: object) -> PointId | None:
 
 def _assert_read_scope(asset_id: str, runtime: ReadToolRuntime) -> None:
     if "read" not in runtime.permissions:
-        raise PermissionError("A permissão 'read' é necessária para consultar dados técnicos.")
+        raise PermissionError(
+            "A permissão 'read' é necessária para consultar dados técnicos."
+        )
     if asset_id != runtime.central_asset_id:
         raise ValueError("A consulta deve usar o ativo central confiável.")
 
@@ -75,16 +78,22 @@ def _assert_degraded_scope(
             if "asset_id" in current:
                 asset_id = current["asset_id"]
                 if asset_id is None or asset_id != runtime.central_asset_id:
-                    raise ValueError("A resposta degradada contém um ativo fora do escopo.")
+                    raise ValueError(
+                        "A resposta degradada contém um ativo fora do escopo."
+                    )
             if "point_id" in current:
                 try:
                     point_id = _validate_optional_point_id(current["point_id"])
                 except ValidationError as exc:
-                    raise ValueError("A resposta degradada contém um ponto inválido.") from exc
+                    raise ValueError(
+                        "A resposta degradada contém um ponto inválido."
+                    ) from exc
                 if point_id is None:
                     raise ValueError("A resposta degradada contém um ponto inválido.")
                 if requested_point_id is not None and point_id != requested_point_id:
-                    raise ValueError("A resposta degradada contém um ponto diferente do solicitado.")
+                    raise ValueError(
+                        "A resposta degradada contém um ponto diferente do solicitado."
+                    )
             pending.extend(current.values())
         elif isinstance(current, list):
             pending.extend(current)
@@ -769,7 +778,9 @@ async def execute_get_data_quality(
     if result.mode is ResponseMode.COMPLETE:
         data_quality = result.data
         if not isinstance(data_quality, _DataQualityWire):
-            raise TypeError("A resposta completa da qualidade dos dados não foi validada.")
+            raise TypeError(
+                "A resposta completa da qualidade dos dados não foi validada."
+            )
         _assert_complete_scope(
             asset_id=data_quality.asset_id,
             point_id=data_quality.point_id,

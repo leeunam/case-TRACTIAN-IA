@@ -20,15 +20,11 @@ from tractian_agent.planner import (
 
 
 def _fake_chat_result(content: str) -> ChatResult:
-    return ChatResult(
-        generations=[ChatGeneration(message=AIMessage(content=content))]
-    )
+    return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
 
 
 def _create_test_model():
-    return GroqModelProvider(
-        api_key=SecretStr("test-groq-key")
-    ).create_chat_model(
+    return GroqModelProvider(api_key=SecretStr("test-groq-key")).create_chat_model(
         ModelConfig(
             model_id="openai/gpt-oss-20b",
             temperature=0.0,
@@ -146,7 +142,9 @@ def test_groq_provider_retries_only_sanitized_output_parse_failures():
     )
     response = httpx.Response(
         400,
-        request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+        request=httpx.Request(
+            "POST", "https://api.groq.com/openai/v1/chat/completions"
+        ),
     )
     parse_error = BadRequestError(
         "provider output omitted",

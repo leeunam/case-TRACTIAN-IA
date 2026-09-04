@@ -402,6 +402,31 @@ Depois do núcleo:
 - use promptfoo para comparar prompts e modelos;
 - não adicione ferramenta apenas por disponibilidade.
 
+## Etapa 16 — central, filas e integrações externas
+
+Separe três fronteiras: a API industrial continua simulando o produto, o
+backend da demonstração orquestra a experiência e o frontend apenas apresenta
+projeções públicas. Persistir mensagem e job na mesma transação evita uma
+mensagem “aceita” sem trabalho correspondente. Lease permite recuperar worker
+interrompido sem dois workers reclamarem o mesmo job.
+
+Uma decisão humana não é uma permissão genérica. Registre pessoa, empresa,
+permissão, validade e digest do escopo exato; preserve o solicitante como dono
+do thread. Revisão técnica e autorização operacional são contratos diferentes.
+
+Use outbox para Slack: grave a notificação junto do pedido de decisão e entregue
+depois. Resultado remoto ambíguo vira `uncertain`, nunca repetição silenciosa.
+Slack só recebe um link; a decisão ocorre no frontend e o backend revalida a
+persona.
+
+No fallback entre modelos, classifique a causa antes da troca. Timeout, rede,
+`429` e `5xx` indicam indisponibilidade. Erro de schema, protocolo, policy ou
+gate é falha de qualidade/segurança e não deve ser mascarado por outro modelo.
+
+Critério de conclusão local: concorrência, replay SSE, decisão única, outbox,
+fallback permitido/proibido, componentes, build e navegador passam sem rede.
+OAuth Slack e providers reais permanecem smokes opt-in separados.
+
 ## Sequência prática de cenários
 
 1. `TKT-CTX-02`: conhecimento e explicação;

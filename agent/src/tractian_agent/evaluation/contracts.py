@@ -28,7 +28,9 @@ class EvaluationOutput(EvaluationModel):
     """Resultado e trajetória observáveis de uma execução do agente."""
 
     case_id: str = Field(min_length=1, pattern=r"^case_[a-z0-9_]+$")
-    ticket_id: str = Field(default="TKT-UNKNOWN", min_length=1, pattern=r"^TKT-[A-Za-z0-9-]+$")
+    ticket_id: str = Field(
+        default="TKT-UNKNOWN", min_length=1, pattern=r"^TKT-[A-Za-z0-9-]+$"
+    )
     decision: Literal[
         "guide",
         "act",
@@ -37,7 +39,9 @@ class EvaluationOutput(EvaluationModel):
         "require_human_review",
         "escalate",
     ] = "require_human_review"
-    message: str = Field(default="Execução sem resultado público.", min_length=1, pattern=r"\S")
+    message: str = Field(
+        default="Execução sem resultado público.", min_length=1, pattern=r"\S"
+    )
     permissions: tuple[
         Literal["read", "action_low", "action_high", "escalate"], ...
     ] = ()
@@ -47,12 +51,15 @@ class EvaluationOutput(EvaluationModel):
     planner_selection_count: int = Field(default=0, ge=0, le=8, strict=True)
     planner_finalization_count: int = Field(default=0, ge=0, le=1, strict=True)
     writer_attempts: int = Field(default=0, ge=0, le=2, strict=True)
-    gate_outcome: Literal[
-        "release",
-        "request_information",
-        "request_confirmation",
-        "require_human_review",
-    ] | None = None
+    gate_outcome: (
+        Literal[
+            "release",
+            "request_information",
+            "request_confirmation",
+            "require_human_review",
+        ]
+        | None
+    ) = None
     evidence_ids: tuple[str, ...] = ()
     limitation_refs: tuple[str, ...] = ()
     failure_codes: tuple[str, ...] = ()

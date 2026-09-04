@@ -17,7 +17,10 @@ from tractian_agent.writer import Writer
 
 from tractian_demo.agent_executor import LiveAgentExecutor
 from tractian_demo.repository import DemoRepository
+from tractian_demo.provider_router import AvailabilityFallbackChatModel, FallbackTracker
 from tractian_demo.settings import DemoSettings
+from tractian_demo.slack_mcp import SlackMcpClient
+from tractian_demo.slack_worker import SlackDeliveryWorker
 from tractian_demo.worker import DemoWorker
 
 
@@ -40,29 +43,72 @@ async def main() -> None:
         timeout_seconds=30.0,
         max_output_tokens=512,
     )
-    provider = _provider(settings.primary_provider, environment)
-    planner = Planner(provider.create_chat_model(model_config))
-    writer = Writer(provider.create_chat_model(model_config))
+    primary = _provider(settings.primary_provider, environment)
+    fallback = _provider(settings.fallback_provider, environment)
+    tracker = FallbackTracker()
+    planner = Planner(
+        AvailabilityFallbackChatModel(
+            primary=primary.create_chat_model(model_config),
+            fallback=fallback.create_chat_model(model_config),
+            tracker=tracker,
+        )
+    )
+    writer = Writer(
+        AvailabilityFallbackChatModel(
+            primary=primary.create_chat_model(model_config),
+            fallback=fallback.create_chat_model(model_config),
+            tracker=tracker,
+        )
+    )
     worker_id = f"worker_{uuid4().hex}"
     try:
         async with (
             open_checkpointer(settings.checkpoint_path) as saver,
             IndustrialApiClient(settings.industrial_api_url) as industrial_client,
-            httpx.AsyncClient(base_url=settings.industrial_api_url, timeout=5) as identity_client,
+            httpx.AsyncClient(
+                base_url=settings.industrial_api_url, timeout=5
+            ) as identity_client,
         ):
             graph = build_agent_graph(saver, planner=planner, writer=writer)
             worker = DemoWorker(
                 repository,
                 LiveAgentExecutor(
-                    graph=graph, industrial_client=industrial_client,
-                    identity_client=identity_client, provider=settings.primary_provider,
+                    graph=graph,
+                    industrial_client=industrial_client,
+                    identity_client=identity_client,
+                    provider=settings.primary_provider,
+                    repository=repository,
+                    fallback_tracker=tracker,
+                    fallback_provider=settings.fallback_provider,
                 ),
                 worker_id=worker_id,
             )
-            while True:
-                worked = await worker.run_once()
-                if not worked:
-                    await asyncio.sleep(0.25)
+            slack_http = httpx.AsyncClient(timeout=20)
+            slack_worker = None
+            if (
+                settings.slack_access_token_configured
+                and settings.slack_tractian_channel
+                and settings.slack_authority_channel
+            ):
+                slack_worker = SlackDeliveryWorker(
+                    repository,
+                    SlackMcpClient(
+                        http=slack_http,
+                        access_token=environment["SLACK_MCP_ACCESS_TOKEN"],
+                    ),
+                    worker_id=f"slack_{worker_id}",
+                    public_app_url=settings.public_app_url,
+                    tractian_channel=settings.slack_tractian_channel,
+                    authority_channel=settings.slack_authority_channel,
+                )
+            try:
+                while True:
+                    worked = await worker.run_once()
+                    delivered = await slack_worker.run_once() if slack_worker else False
+                    if not worked and not delivered:
+                        await asyncio.sleep(0.25)
+            finally:
+                await slack_http.aclose()
     finally:
         repository.close()
 

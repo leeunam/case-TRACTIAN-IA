@@ -84,9 +84,7 @@ def get_checkpoint_owner(
     """Obtém o owner instalado pela fronteira segura de lifecycle."""
     owner = getattr(checkpointer, _OWNER_ATTRIBUTE, None)
     if not isinstance(owner, LocalCheckpointOwner):
-        raise TypeError(
-            "checkpointer não gerenciado; construa-o com open_checkpointer"
-        )
+        raise TypeError("checkpointer não gerenciado; construa-o com open_checkpointer")
     return owner
 
 

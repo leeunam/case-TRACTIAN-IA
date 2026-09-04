@@ -221,13 +221,40 @@ def test_review_contracts_reject_python_coercions_but_round_trip_json():
         assert type(model).model_validate_json(model.model_dump_json()) == model
 
     coercions = (
-        (ReviewRequest, {**request.model_dump(), "eligible_evidence_ids": list(request.eligible_evidence_ids)}),
-        (ReviewInterruptPayload, {**payload.model_dump(), "allowed_operations": list(payload.allowed_operations)}),
-        (ReviewEditReply, {**edit.model_dump(), "evidence_ids": list(edit.evidence_ids)}),
+        (
+            ReviewRequest,
+            {
+                **request.model_dump(),
+                "eligible_evidence_ids": list(request.eligible_evidence_ids),
+            },
+        ),
+        (
+            ReviewInterruptPayload,
+            {
+                **payload.model_dump(),
+                "allowed_operations": list(payload.allowed_operations),
+            },
+        ),
+        (
+            ReviewEditReply,
+            {**edit.model_dump(), "evidence_ids": list(edit.evidence_ids)},
+        ),
         (ReviewedDraft, {**reviewed.model_dump(), "next_step": "monitor"}),
-        (ReviewAudit, {**audit.model_dump(), "received_at": audit.received_at.isoformat()}),
-        (ReviewExpiry, {**expiry.model_dump(), "expired_at": expiry.expired_at.isoformat()}),
-        (ReviewResolution, {**resolution.model_dump(), "received_at": resolution.received_at.isoformat()}),
+        (
+            ReviewAudit,
+            {**audit.model_dump(), "received_at": audit.received_at.isoformat()},
+        ),
+        (
+            ReviewExpiry,
+            {**expiry.model_dump(), "expired_at": expiry.expired_at.isoformat()},
+        ),
+        (
+            ReviewResolution,
+            {
+                **resolution.model_dump(),
+                "received_at": resolution.received_at.isoformat(),
+            },
+        ),
         (ReviewContinuation, {**continuation.model_dump(), "current_permissions": []}),
     )
     for model_type, value in coercions:
@@ -434,16 +461,19 @@ def test_edit_preserves_human_order_but_derives_limitations_and_regates():
 
     assert reviewed.evidence_ids == reply.evidence_ids
     assert reviewed.limitation_refs == ()
-    assert evaluate_release(
-        context.model_copy(
-            update={
-                "draft": reviewed,
-                "review_request": request,
-                "review_audit": audit,
-                "review_resolution": _resolution(request, reply),
-            }
-        )
-    ).outcome is ReleaseGateOutcome.RELEASE
+    assert (
+        evaluate_release(
+            context.model_copy(
+                update={
+                    "draft": reviewed,
+                    "review_request": request,
+                    "review_audit": audit,
+                    "review_resolution": _resolution(request, reply),
+                }
+            )
+        ).outcome
+        is ReleaseGateOutcome.RELEASE
+    )
 
     with pytest.raises(ValueError, match="elegíveis"):
         build_reviewed_draft(
@@ -552,16 +582,19 @@ def test_writer_failure_can_be_structurally_edited_without_model_call():
         reviewed_draft=reviewed,
     )
 
-    assert evaluate_release(
-        context.model_copy(
-            update={
-                "draft": reviewed,
-                "review_request": request,
-                "review_audit": audit,
-                "review_resolution": _resolution(request, reply),
-            }
-        )
-    ).outcome is ReleaseGateOutcome.RELEASE
+    assert (
+        evaluate_release(
+            context.model_copy(
+                update={
+                    "draft": reviewed,
+                    "review_request": request,
+                    "review_audit": audit,
+                    "review_resolution": _resolution(request, reply),
+                }
+            )
+        ).outcome
+        is ReleaseGateOutcome.RELEASE
+    )
 
 
 def test_reject_audit_contains_only_structural_digests_and_expiry_is_exclusive():
@@ -607,9 +640,7 @@ def test_review_request_rejects_request_gate_draft_and_eligible_tamper(
 ):
     request = _request()
     with pytest.raises(ValidationError):
-        type(request).model_validate(
-            {**request.model_dump(), field: replacement}
-        )
+        type(request).model_validate({**request.model_dump(), field: replacement})
 
 
 def test_regate_rejects_audit_tamper():
@@ -622,9 +653,7 @@ def test_regate_rejects_audit_tamper():
         resolution=_resolution(request, reply),
         reviewed_draft=reviewed,
     )
-    tampered = audit.model_copy(
-        update={"reply_digest": "sha256:v1:" + "f" * 64}
-    )
+    tampered = audit.model_copy(update={"reply_digest": "sha256:v1:" + "f" * 64})
 
     result = evaluate_release(
         context.model_copy(

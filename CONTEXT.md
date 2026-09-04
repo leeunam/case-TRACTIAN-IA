@@ -205,3 +205,25 @@ _Evitar_: Percentual de certeza, média geral
 **Verdade de referência**:
 Rótulo ou resultado aceito para comparação, proveniente do gabarito do cenário ou de julgamento humano resolvido.
 _Evitar_: Resposta do juiz virtual, opinião isolada
+
+## Central de demonstração
+
+**Persona simulada**:
+Identidade escolhida na central para demonstrar visibilidade e permissões; o backend a resolve em fixtures confiáveis e nunca aceita permissões enviadas pelo navegador.
+_Evitar_: Usuário autenticado de produção
+
+**Pedido de decisão**:
+Registro persistente de uma escolha humana pendente, ligado a um caso, público, escopo exato, validade e operações permitidas.
+_Evitar_: Intenção de escrita, mensagem do Slack
+
+**Autorização delegada**:
+Atestado consumível uma vez que liga decisor, empresa, permissão, horário e digest do escopo; não troca a pessoa dona do thread.
+_Evitar_: Troca de identidade, revisão técnica
+
+**Outbox**:
+Fila transacional de notificações externas persistidas antes da tentativa de entrega.
+_Evitar_: Aprovação, fila de execução do agente
+
+**Notificação Slack**:
+Aviso sanitizado com link para a central. Nunca resolve a decisão nem executa uma ação.
+_Evitar_: Decisão Slack, comando de aprovação

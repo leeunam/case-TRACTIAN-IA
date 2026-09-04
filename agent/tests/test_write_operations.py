@@ -400,9 +400,7 @@ def test_module_publishes_only_the_five_typed_fixed_operations():
         assert list(inspect.signature(operation).parameters) == parameters
         assert get_type_hints(operation)["return"] == ActionReceipt | ApiError
     assert (
-        inspect.signature(execute_reprocess_analysis)
-        .parameters["idempotency_key"]
-        .kind
+        inspect.signature(execute_reprocess_analysis).parameters["idempotency_key"].kind
         is inspect.Parameter.KEYWORD_ONLY
     )
 

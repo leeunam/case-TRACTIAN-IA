@@ -107,9 +107,7 @@ def _normalize_http_error(response: httpx.Response) -> ApiError:
         else:
             return _invalid_schema(response)
     category = (
-        ApiErrorCategory.API
-        if response.status_code < 500
-        else ApiErrorCategory.SERVER
+        ApiErrorCategory.API if response.status_code < 500 else ApiErrorCategory.SERVER
     )
     return ApiError(
         category=category,
@@ -257,7 +255,9 @@ class IndustrialApiClient:
         body: BaseModel | Mapping[str, JsonValue] | None = None,
         idempotency_key: str | None = None,
     ) -> ApiResult[PayloadT] | ApiError:
-        json_body = body.model_dump(mode="json") if isinstance(body, BaseModel) else body
+        json_body = (
+            body.model_dump(mode="json") if isinstance(body, BaseModel) else body
+        )
         response = await self._send(
             method,
             path,

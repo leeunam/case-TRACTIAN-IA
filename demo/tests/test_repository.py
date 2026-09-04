@@ -21,9 +21,7 @@ def test_duplicate_and_enqueue_survive_sqlite_reopen(tmp_path: Path) -> None:
     repository = DemoRepository(database)
     repository.open(public_cases=[PUBLIC_CASE])
 
-    copied = repository.create_case(
-        CreateCaseRequest(source_case_id="case_public_1")
-    )
+    copied = repository.create_case(CreateCaseRequest(source_case_id="case_public_1"))
     message, execution = repository.enqueue_message(
         case_id=copied.id,
         persona_id="usr_1",
@@ -43,9 +41,7 @@ def test_duplicate_and_enqueue_survive_sqlite_reopen(tmp_path: Path) -> None:
 def test_message_and_execution_are_atomic(tmp_path: Path) -> None:
     repository = DemoRepository(tmp_path / "demo.sqlite3")
     repository.open(public_cases=[PUBLIC_CASE])
-    copied = repository.create_case(
-        CreateCaseRequest(source_case_id="case_public_1")
-    )
+    copied = repository.create_case(CreateCaseRequest(source_case_id="case_public_1"))
 
     with pytest.raises(RuntimeError, match="injected transaction failure"):
         repository.enqueue_message(
@@ -64,9 +60,7 @@ def test_message_and_execution_are_atomic(tmp_path: Path) -> None:
 def test_idempotent_message_replays_same_execution(tmp_path: Path) -> None:
     repository = DemoRepository(tmp_path / "demo.sqlite3")
     repository.open(public_cases=[PUBLIC_CASE])
-    copied = repository.create_case(
-        CreateCaseRequest(source_case_id="case_public_1")
-    )
+    copied = repository.create_case(CreateCaseRequest(source_case_id="case_public_1"))
 
     first = repository.enqueue_message(
         case_id=copied.id,

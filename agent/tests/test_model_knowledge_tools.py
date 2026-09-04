@@ -35,7 +35,8 @@ def _runtime(
         permissions=permissions,
         central_asset_id="asset_M101",
         client=IndustrialApiClient(
-            "https://simulator.test", transport=httpx.MockTransport(handler)  # type: ignore[arg-type]
+            "https://simulator.test",
+            transport=httpx.MockTransport(handler),  # type: ignore[arg-type]
         ),
         seed=seed,
         configured_model_id=configured_model_id,
@@ -70,7 +71,10 @@ def _model_payload(*, model_id: str = "mdl_vib_v3") -> dict[str, object]:
 
 
 def _document_payload(
-    *, document_id: str = "kb_proc_001", document_type: str = "procedure", body: str = "Passos seguros."
+    *,
+    document_id: str = "kb_proc_001",
+    document_type: str = "procedure",
+    body: str = "Passos seguros.",
 ) -> dict[str, object]:
     return {
         "id": document_id,
@@ -92,7 +96,9 @@ async def _model(runtime: ReadToolRuntime):
         await runtime.client.aclose()
 
 
-async def _search(runtime: ReadToolRuntime, query: object = "rolamento", document_type: object = None):
+async def _search(
+    runtime: ReadToolRuntime, query: object = "rolamento", document_type: object = None
+):
     try:
         return await execute_search_knowledge(query, document_type, runtime)
     finally:
@@ -116,9 +122,19 @@ def test_public_schemas_hide_runtime_seed_and_configured_model_id():
     assert set(search_schema["properties"]) == {"query", "document_type"}
     assert search_schema["required"] == ["query"]
     assert set(document_schema["properties"]) == {"document_id"}
-    assert document_schema["properties"]["document_id"]["pattern"] == r"^kb_[A-Za-z0-9_-]{1,64}$"
+    assert (
+        document_schema["properties"]["document_id"]["pattern"]
+        == r"^kb_[A-Za-z0-9_-]{1,64}$"
+    )
     serialized = json.dumps([model_schema, search_schema, document_schema]).lower()
-    for hidden in ("runtime", "identity", "permissions", "client", "seed", "configured_model_id"):
+    for hidden in (
+        "runtime",
+        "identity",
+        "permissions",
+        "client",
+        "seed",
+        "configured_model_id",
+    ):
         assert hidden not in serialized
 
 
@@ -126,9 +142,18 @@ def test_runtime_default_is_strict_frozen_and_configurable():
     runtime = _runtime(lambda request: httpx.Response(200, json={}))
     assert runtime.configured_model_id == "mdl_vib_v3"
     assert runtime.model_dump()["configured_model_id"] == "mdl_vib_v3"
-    assert _runtime(lambda request: httpx.Response(200, json={}), configured_model_id="mdl_other").configured_model_id == "mdl_other"
+    assert (
+        _runtime(
+            lambda request: httpx.Response(200, json={}),
+            configured_model_id="mdl_other",
+        ).configured_model_id
+        == "mdl_other"
+    )
     with pytest.raises(ValidationError):
-        _runtime(lambda request: httpx.Response(200, json={}), configured_model_id="model bad")
+        _runtime(
+            lambda request: httpx.Response(200, json={}),
+            configured_model_id="model bad",
+        )
     with pytest.raises(ValidationError):
         runtime.configured_model_id = "mdl_other"  # type: ignore[misc]
 
@@ -138,7 +163,9 @@ def test_model_uses_only_configured_fixed_endpoint_and_real_payload():
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": _model_payload()})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": _model_payload()}
+        )
 
     result = _run(_model(_runtime(handler)))
 
@@ -157,14 +184,27 @@ def test_search_and_document_use_fixed_paths_params_and_normalized_payloads():
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.url.path == "/knowledge/search":
-            return httpx.Response(200, json={"mode": "complete", "notes": None, "data": {"results": [_document_payload()]}})
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": _document_payload()})
+            return httpx.Response(
+                200,
+                json={
+                    "mode": "complete",
+                    "notes": None,
+                    "data": {"results": [_document_payload()]},
+                },
+            )
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": _document_payload()}
+        )
 
     search_result = _run(_search(_runtime(handler), "rolamento", "procedure"))
     document_result = _run(_document(_runtime(handler)))
 
     assert requests[0].url.path == "/knowledge/search"
-    assert dict(requests[0].url.params) == {"q": "rolamento", "type": "procedure", "seed": "fixed-knowledge"}
+    assert dict(requests[0].url.params) == {
+        "q": "rolamento",
+        "type": "procedure",
+        "seed": "fixed-knowledge",
+    }
     assert search_result.content.results[0].snippet == "Passos seguros."
     assert "body" not in search_result.content.results[0].model_dump()
     assert requests[1].url.path == "/knowledge/kb_proc_001"
@@ -189,7 +229,9 @@ def test_search_and_document_use_fixed_paths_params_and_normalized_payloads():
         ("document", ("kb_" + "x" * 65,)),
     ],
 )
-def test_core_rejects_invalid_arguments_before_http(operation: str, arguments: tuple[object, ...]):
+def test_core_rejects_invalid_arguments_before_http(
+    operation: str, arguments: tuple[object, ...]
+):
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -246,7 +288,9 @@ def test_model_rejects_returned_id_wrong_schema_duplicates_and_naive_timestamp()
     payload = _model_payload(model_id="mdl_other")
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payload}
+        )
 
     with pytest.raises(ValueError, match="modelo diferente"):
         _run(_model(_runtime(handler)))
@@ -258,15 +302,41 @@ def test_model_rejects_returned_id_wrong_schema_duplicates_and_naive_timestamp()
     ):
         bad = _model_payload()
         mutation(bad)
-        result = _run(_model(_runtime(lambda request, bad=bad: httpx.Response(200, json={"mode": "complete", "notes": None, "data": bad}))))
+        result = _run(
+            _model(
+                _runtime(
+                    lambda request, bad=bad: httpx.Response(
+                        200, json={"mode": "complete", "notes": None, "data": bad}
+                    )
+                )
+            )
+        )
         assert result.error is not None
         assert result.error.code == "INVALID_SCHEMA_RESPONSE"
 
 
 def test_search_validates_all_rows_before_limit_filter_ids_and_snippets():
-    documents = [_document_payload(document_id=f"kb_proc_{index}", body=" a\n  b " + "z" * 300) for index in range(11)]
+    documents = [
+        _document_payload(document_id=f"kb_proc_{index}", body=" a\n  b " + "z" * 300)
+        for index in range(11)
+    ]
 
-    result = _run(_search(_runtime(lambda request: httpx.Response(200, json={"mode": "complete", "notes": None, "data": {"results": documents}})), "rolamento", "procedure"))
+    result = _run(
+        _search(
+            _runtime(
+                lambda request: httpx.Response(
+                    200,
+                    json={
+                        "mode": "complete",
+                        "notes": None,
+                        "data": {"results": documents},
+                    },
+                )
+            ),
+            "rolamento",
+            "procedure",
+        )
+    )
 
     assert result.content.total_results == 11
     assert result.content.returned_results == 10
@@ -277,10 +347,39 @@ def test_search_validates_all_rows_before_limit_filter_ids_and_snippets():
 
     duplicate = [_document_payload(), _document_payload()]
     with pytest.raises(ValueError, match="duplicado"):
-        _run(_search(_runtime(lambda request: httpx.Response(200, json={"mode": "complete", "notes": None, "data": {"results": duplicate}})), "rolamento"))
+        _run(
+            _search(
+                _runtime(
+                    lambda request: httpx.Response(
+                        200,
+                        json={
+                            "mode": "complete",
+                            "notes": None,
+                            "data": {"results": duplicate},
+                        },
+                    )
+                ),
+                "rolamento",
+            )
+        )
     wrong_type = [_document_payload(document_type="guidance")]
     with pytest.raises(ValueError, match="filtro"):
-        _run(_search(_runtime(lambda request: httpx.Response(200, json={"mode": "complete", "notes": None, "data": {"results": wrong_type}})), "rolamento", "procedure"))
+        _run(
+            _search(
+                _runtime(
+                    lambda request: httpx.Response(
+                        200,
+                        json={
+                            "mode": "complete",
+                            "notes": None,
+                            "data": {"results": wrong_type},
+                        },
+                    )
+                ),
+                "rolamento",
+                "procedure",
+            )
+        )
 
 
 def test_degraded_search_filter_requires_type_even_for_row_outside_prompt_limit():
@@ -313,17 +412,35 @@ def test_degraded_stable_search_projects_full_rows_without_bodies(mode: str):
     data: dict[str, object] = {"results": [_document_payload()]}
     if mode == "conflict":
         data["conflict"] = True
-    result = _run(_search(_runtime(lambda request: httpx.Response(200, json={"mode": mode, "notes": "degradado", "data": data}))))
+    result = _run(
+        _search(
+            _runtime(
+                lambda request: httpx.Response(
+                    200, json={"mode": mode, "notes": "degradado", "data": data}
+                )
+            )
+        )
+    )
 
     assert result.content.mode.value == mode
     assert result.content.results[0]["id"] == "kb_proc_001"
     assert "body" not in result.content.results[0]
-    assert result.artifact.outcome.partial_data == ({"conflict": True} if mode == "conflict" else {})
+    assert result.artifact.outcome.partial_data == (
+        {"conflict": True} if mode == "conflict" else {}
+    )
 
 
 @pytest.mark.parametrize("mode", ["complete", "partial", "unavailable", "conflict"])
 @pytest.mark.parametrize(
-    ("length", "content_returned", "content_omitted", "content_truncated", "artifact_returned", "artifact_omitted", "artifact_truncated"),
+    (
+        "length",
+        "content_returned",
+        "content_omitted",
+        "content_truncated",
+        "artifact_returned",
+        "artifact_omitted",
+        "artifact_truncated",
+    ),
     [
         (8_000, 8_000, 0, False, 8_000, 0, False),
         (8_001, 8_000, 1, True, 8_001, 0, False),
@@ -354,16 +471,18 @@ def test_document_body_limits_have_exact_nested_and_top_level_semantics(
             )
         )
     )
-    content_document = (
-        result.content if mode == "complete" else result.content.document
-    )
+    content_document = result.content if mode == "complete" else result.content.document
     artifact_document = result.artifact.outcome.document
     content_data = (
         content_document.model_dump(mode="json")
         if mode == "complete"
         else content_document
     )
-    artifact_data = artifact_document.model_dump(mode="json") if mode == "complete" else artifact_document
+    artifact_data = (
+        artifact_document.model_dump(mode="json")
+        if mode == "complete"
+        else artifact_document
+    )
 
     assert len(content_data["body"]) == content_returned
     assert content_data["returned_body_characters"] == content_returned
@@ -380,22 +499,70 @@ def test_document_body_limits_have_exact_nested_and_top_level_semantics(
 
 
 def test_degraded_model_projects_only_known_fields_and_api_errors_are_exact():
-    result = _run(_model(_runtime(lambda request: httpx.Response(200, json={"mode": "partial", "notes": "parcial", "data": {"id": "mdl_vib_v3", "processing_state": "delayed"}}))))
+    result = _run(
+        _model(
+            _runtime(
+                lambda request: httpx.Response(
+                    200,
+                    json={
+                        "mode": "partial",
+                        "notes": "parcial",
+                        "data": {"id": "mdl_vib_v3", "processing_state": "delayed"},
+                    },
+                )
+            )
+        )
+    )
     assert result.content.mode.value == "partial"
     assert result.content.model == {"id": "mdl_vib_v3", "processing_state": "delayed"}
     with pytest.raises(ValueError, match="campo de topo"):
-        _run(_model(_runtime(lambda request: httpx.Response(200, json={"mode": "partial", "notes": None, "data": {"id": "mdl_vib_v3", "raw": "no"}}))))
+        _run(
+            _model(
+                _runtime(
+                    lambda request: httpx.Response(
+                        200,
+                        json={
+                            "mode": "partial",
+                            "notes": None,
+                            "data": {"id": "mdl_vib_v3", "raw": "no"},
+                        },
+                    )
+                )
+            )
+        )
 
-    error = ApiError(category=ApiErrorCategory.API, code="NOT_FOUND", message="Não encontrado.", status_code=404)
-    result = _run(_document(_runtime(lambda request: httpx.Response(404, json={"code": "NOT_FOUND", "message": "Não encontrado."}))))
+    error = ApiError(
+        category=ApiErrorCategory.API,
+        code="NOT_FOUND",
+        message="Não encontrado.",
+        status_code=404,
+    )
+    result = _run(
+        _document(
+            _runtime(
+                lambda request: httpx.Response(
+                    404, json={"code": "NOT_FOUND", "message": "Não encontrado."}
+                )
+            )
+        )
+    )
     assert result.error == error
     assert result.artifact.outcome.error == error
 
 
 def test_adapters_return_json_safe_content_and_artifact():
-    runtime = _runtime(lambda request: httpx.Response(200, json={"mode": "complete", "notes": None, "data": _model_payload()}))
+    runtime = _runtime(
+        lambda request: httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": _model_payload()}
+        )
+    )
     tool_runtime = ToolRuntime(
-        state={}, context=runtime, config={}, stream_writer=lambda _: None, tool_call_id=None, store=None
+        state={},
+        context=runtime,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id=None,
+        store=None,
     )
 
     async def invoke():

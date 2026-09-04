@@ -72,9 +72,7 @@ class ExperimentConfig(EvaluationModel):
             raise ValueError("componentes versionados devem ser únicos")
         if len({item.provider for item in self.providers}) != len(self.providers):
             raise ValueError("providers devem ser únicos")
-        if len({item.provider for item in self.live_agents}) != len(
-            self.live_agents
-        ):
+        if len({item.provider for item in self.live_agents}) != len(self.live_agents):
             raise ValueError("providers live devem ser únicos")
         if {item.provider for item in self.live_agents} != {
             item.provider for item in self.providers

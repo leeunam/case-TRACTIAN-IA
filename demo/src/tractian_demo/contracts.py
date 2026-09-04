@@ -44,6 +44,10 @@ class DemoCase(DemoModel):
     initial_message: str = Field(min_length=1, pattern=r"\S")
     source_case_id: str | None = None
     immutable: bool
+    simulation_mode: Literal["standard", "complete", "degraded", "custom_seed"] = (
+        "standard"
+    )
+    seed: str | None = None
     created_at: datetime
 
 
@@ -53,16 +57,26 @@ class CreateCaseRequest(DemoModel):
     requester_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
     asset_id: str | None = Field(default=None, min_length=1, pattern=r"^\S+$")
     message: str | None = Field(default=None, min_length=1, pattern=r"\S")
+    simulation_mode: Literal["standard", "complete", "degraded", "custom_seed"] = (
+        "standard"
+    )
+    seed: str | None = Field(
+        default=None, min_length=1, max_length=100, pattern=r"^\S+$"
+    )
 
     @model_validator(mode="after")
     def exactly_one_mode(self) -> "CreateCaseRequest":
         custom = (self.company_id, self.requester_id, self.asset_id, self.message)
+        if self.simulation_mode == "custom_seed" and self.seed is None:
+            raise ValueError("seed explícita é obrigatória no modo custom_seed")
+        if self.simulation_mode != "custom_seed" and self.seed is not None:
+            raise ValueError("seed explícita só é aceita no modo custom_seed")
         if self.source_case_id is not None:
-            if any(value is not None for value in custom):
-                raise ValueError("a cópia não aceita campos personalizados")
             return self
         if any(value is None for value in custom):
-            raise ValueError("caso personalizado exige empresa, pessoa, ativo e mensagem")
+            raise ValueError(
+                "caso personalizado exige empresa, pessoa, ativo e mensagem"
+            )
         return self
 
 
@@ -87,6 +101,8 @@ class Execution(DemoModel):
     attempt: int = Field(default=0, ge=0)
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
+    resume_decision_id: str | None = None
+    resume_kind: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -139,8 +155,12 @@ class AgentRunProjection(DemoModel):
 
     assistant_message: str = Field(min_length=1, pattern=r"\S")
     decision: Literal[
-        "guide", "act", "escalate", "request_information",
-        "request_confirmation", "require_human_review",
+        "guide",
+        "act",
+        "escalate",
+        "request_information",
+        "request_confirmation",
+        "require_human_review",
     ]
     trace_id: str = Field(min_length=1, pattern=r"^\S+$")
     provider: Literal["groq", "nvidia-nim"]
@@ -148,3 +168,59 @@ class AgentRunProjection(DemoModel):
     evidence_count: int = Field(ge=0)
     limitation_count: int = Field(ge=0)
     tool_names: tuple[str, ...]
+    decision_candidate: "DecisionCandidate | None" = None
+
+
+class DecisionCandidate(DemoModel):
+    audience: Literal["requester", "tractian", "authority"]
+    kind: Literal["action_confirmation", "action_authorization", "technical_review"]
+    summary: str = Field(min_length=1, max_length=300, pattern=r"\S")
+    scope: dict[str, object]
+    required_permission: str | None = None
+    resume_kind: Literal[
+        "confirmation", "delegated_action", "technical_review", "acknowledgement"
+    ]
+    expires_at: datetime
+
+
+class DecisionRequest(DemoModel):
+    id: str = Field(pattern=r"^decision_\S+$")
+    case_id: str
+    execution_id: str
+    company_id: str
+    audience: Literal["requester", "tractian", "authority"]
+    kind: str
+    status: DecisionStatus
+    subject_digest: str = Field(pattern=r"^sha256:v1:[0-9a-f]{64}$")
+    summary: str
+    scope: dict[str, object]
+    required_permission: str | None
+    resume_kind: str
+    allowed_operations: tuple[Literal["approve", "reject"], ...] = ("approve", "reject")
+    expires_at: datetime
+    created_at: datetime
+    resolved_at: datetime | None = None
+    resolved_by: str | None = None
+
+
+class ResolveDecisionRequest(DemoModel):
+    persona_id: str = Field(min_length=1, pattern=r"^\S+$")
+    resolution: Literal["approve", "reject"]
+
+
+class OutboxEvent(DemoModel):
+    id: str = Field(pattern=r"^notification_\S+$")
+    decision_id: str
+    audience: Literal["tractian", "authority"]
+    status: DeliveryStatus
+    payload: dict[str, object]
+    attempt: int = Field(ge=0)
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    external_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class RetryNotificationRequest(DemoModel):
+    persona_id: str = Field(min_length=1, pattern=r"^\S+$")

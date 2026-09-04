@@ -38,5 +38,8 @@ class DemoWorker:
                 execution.id, error_code="AGENT_EXECUTION_FAILED"
             )
             return True
-        self._repository.complete_execution(execution.id, projection)
+        if projection.decision_candidate is not None:
+            self._repository.wait_for_decision(execution.id, projection)
+        else:
+            self._repository.complete_execution(execution.id, projection)
         return True

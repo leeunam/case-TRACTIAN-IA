@@ -99,8 +99,7 @@ def _scores(result: JudgeCaseReport) -> tuple[float, ...]:
         verdict.score
         for judgment in (result.blind_result, result.trajectory)
         for verdict in (
-            getattr(judgment, field_name)
-            for field_name in type(judgment).model_fields
+            getattr(judgment, field_name) for field_name in type(judgment).model_fields
         )
     )
 
@@ -195,10 +194,7 @@ async def run_offline_judge_records(
     for case_id, repetitions in grouped.items():
         score_rows = tuple(_scores(result) for result in repetitions)
         max_delta = max(
-            (
-                max(values) - min(values)
-                for values in zip(*score_rows, strict=True)
-            ),
+            (max(values) - min(values) for values in zip(*score_rows, strict=True)),
             default=0.0,
         )
         threshold_signatures = {

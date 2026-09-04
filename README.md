@@ -2,9 +2,9 @@
 
 Projeto individual de engenharia de agentes para atendimento industrial, desenvolvido por [Leunam Sousa de Jesus](https://www.linkedin.com/in/leunam).
 
-O sistema deverá receber uma solicitação, investigar dados por APIs, explicar sua decisão com evidências e executar somente ações permitidas. O foco atual é o backend e o aprendizado prático da arquitetura; não há frontend no escopo inicial.
+O sistema recebe uma solicitação, investiga dados por APIs, explica sua decisão com evidências e executa somente ações permitidas. Uma central React local permite demonstrar o fluxo real, alternar personas simuladas e resolver pedidos humanos sem transformar a interface em fonte de autorização.
 
-> **Estado atual:** existem o simulador FastAPI, dados, contratos, cenários, cliente HTTP assíncrono, dez tools LangChain de leitura, cinco proposal tools sem efeito, política determinística, cinco operações HTTP fixas, estado tipado, fronteira Python, grafo LangGraph com planner e writer LLM opt-in separados, ledger determinístico, gate de liberação, revisão humana retomável, checkpointer SQLite de desenvolvimento, fachada manual Logfire opt-in e pipeline offline Pydantic Evals. As Fases 1–12, 14 e 15 estão implementadas. A calibração humana da Fase 13 está adiada até uma pessoa especialista da TRACTIAN produzir os rótulos cegos; nenhum limiar foi escolhido sem essa evidência. O benchmark atual revelou falhas de qualidade e instabilidade, portanto o agente ainda não é de produção.
+> **Estado atual:** além do núcleo e da avaliação das Fases 1–12, 14 e 15, existem a fachada FastAPI `demo/`, filas SQLite, central React `frontend/`, decisões delegadas, outbox Slack MCP e fallback configurável Groq → NVIDIA NIM. As suítes locais usam doubles e não consomem credenciais. A calibração humana da Fase 13 continua adiada até uma pessoa especialista da TRACTIAN produzir os rótulos cegos. O smoke do Slack real depende de OAuth e dos dois canais do workspace; sem essa evidência a integração externa não é declarada validada. O benchmark atual revelou limitações de qualidade e o agente não é de produção.
 
 ## Problema
 
@@ -20,7 +20,9 @@ Se faltarem evidências, houver conflito ou a ação ultrapassar a permissão do
 
 ```mermaid
 flowchart TD
-    A[Solicitação + identidade] --> B[Fronteira de entrada do agente]
+    UI[Central React + persona simulada] --> DEMO[Backend demo + filas SQLite]
+    DEMO --> A[Solicitação + identidade]
+    A --> B[Fronteira de entrada do agente]
     B --> C[Estado persistente do LangGraph]
     C --> D[Planner: decide o próximo passo]
     D --> E[Tools com validação em código]
@@ -32,6 +34,9 @@ flowchart TD
     I --> J[Resposta ou pedido seguro]
     I --> L[Revisão humana retomável]
     L --> I
+    I --> Q[Decisão humana no frontend]
+    Q --> L
+    Q -. link de notificação .-> S[Slack MCP oficial]
     C -. traces e métricas .-> K[Logfire]
 ```
 
@@ -293,13 +298,15 @@ O golden set nunca entra no runtime e não é consultado por RAG. Ele é visíve
 | Responsabilidade | Tecnologia | Motivo |
 |---|---|---|
 | API simulada | FastAPI | Contrato HTTP e testes rápidos |
+| Central de casos | React + TypeScript + Vite | Demonstração local com menu dinâmico e personas |
+| Fachada e filas | FastAPI + SQLite | Persistência, SSE, decisões e outbox sem acoplar a API industrial |
 | Orquestração | LangGraph + LangChain | Estado, ciclos, tools e retomada |
 | Contratos | Pydantic | Tipagem e validação explícitas |
 | Cliente HTTP | httpx | Chamadas assíncronas e testáveis |
 | Modelos | Groq e NVIDIA NIM | Troca por adapter e benchmark comum |
 | Persistência | SQLite; PostgreSQL futuro | Simplicidade local e caminho de escala |
 | Observabilidade | Pydantic Logfire | Traces e investigação sem criar dashboard |
-| Testes | pytest | Unidade, integração e regressão |
+| Testes | pytest, Vitest e Playwright | Unidade, integração, concorrência, build e navegador real |
 | Avaliação | Pydantic Evals | Casos, avaliadores e experimentos tipados |
 
 No benchmark versionado de dois runs por papel com `openai/gpt-oss-20b`, Groq
@@ -319,12 +326,14 @@ entra se existir um pipeline RAG real.
 
 ## Executar o que já existe
 
-Requisitos: Python 3.10 ou superior e [`uv`](https://docs.astral.sh/uv/).
+Requisitos: Python 3.10 ou superior, Node.js 20+, Chrome e [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
-make setup   # instala API/agente e gera os dados
+cp .env.example .env  # preencha somente credenciais que pretende usar
+make setup   # instala API, agente, demo e frontend; gera os dados
 make up      # inicia a API em http://localhost:8000
-make test    # executa as suítes da API e do agente
+make demo    # inicia API, backend :8100, worker e frontend :5173
+make test    # pytest + Vitest + build TypeScript + Playwright
 make eval    # 17 casos x 2 no fallback local; sem credenciais ou rede
 make eval-live EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada EVAL_PROVIDER=groq
 make eval-providers   # benchmark real Groq x NVIDIA NIM
@@ -332,11 +341,18 @@ make eval-judges EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
 make eval-label-template EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
 make eval-calibrate EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
 make eval-layers EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
-make logs    # acompanha o log da API
-make stop    # encerra a API iniciada pelo Makefile
+make smoke-slack      # opt-in: envia 1 aviso seguro em cada canal configurado
+make logs    # acompanha os quatro processos locais
+make stop    # encerra API, backend, worker e frontend
 ```
 
-O Swagger fica em `http://localhost:8000/docs`. Ações usam o header `x-user-id`. O parâmetro `seed` reproduz variações; `seed=complete` pede retornos completos quando o cenário não possui override fixo.
+O Swagger industrial fica em `http://localhost:8000/docs`, o Swagger da fachada em `http://localhost:8100/docs` e a central em `http://localhost:5173`. Ações industriais usam `x-user-id`. O parâmetro `seed` reproduz variações; `seed=complete` pede retornos completos quando o cenário não possui override fixo.
+
+### Configurar o Slack MCP
+
+Crie ou reutilize uma Slack App interna, habilite o MCP e conclua OAuth com o escopo mínimo `chat:write`. Preencha somente no `.env` local `SLACK_MCP_ACCESS_TOKEN`, `SLACK_TRACTIAN_CHANNEL_ID` e `SLACK_AUTHORITY_CHANNEL_ID`. O endpoint usado é o oficial `https://mcp.slack.com/mcp`; o worker descobre a tool de envio no início da sessão. O Slack recebe apenas categoria, resumo sanitizado, IDs opacos e link. Aprovar ou rejeitar acontece exclusivamente na central.
+
+Enquanto essas três variáveis não estiverem configuradas e `make smoke-slack` não passar, a central mantém as decisões funcionais, mas informa `slack_configured=false` e não promete entrega externa.
 
 ## Desenvolvimento com uma IA copiloto
 
@@ -377,6 +393,8 @@ Prompt curto recomendado:
 ├── agent/                   # contratos, tools, planner, writer, gate, grafo e checkpointer
 ├── agent-input/             # entradas permitidas ao agente
 ├── api/                     # simulador FastAPI e testes
+├── demo/                    # fachada, SQLite, workers, decisões e Slack MCP
+├── frontend/                # central React, Vitest e Playwright
 ├── data/                    # dados do simulador
 ├── docs/                    # contrato, schema e cenários
 └── eval/                    # gabarito restrito aos avaliadores
@@ -387,6 +405,7 @@ Prompt curto recomendado:
 - Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, revisão humana retomável, fluxos de escrita, checkpointer, telemetria manual Logfire opt-in e avaliação Pydantic Evals. O benchmark atual falha em qualidade/estabilidade e a calibração humana está adiada; portanto não é um agente de produção.
 - As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
 - O simulador não representa todas as garantias transacionais de produção.
+- A central usa identidades simuladas e execução local; não substitui autenticação, autorização distribuída ou implantação de produção. O Slack real permanece pendente até o smoke OAuth documentado.
 - As rotas de ação do simulador devolvem recibos, mas não alteram os recursos Parquet; um novo GET não comprova a mutação solicitada.
 
 ## Autor

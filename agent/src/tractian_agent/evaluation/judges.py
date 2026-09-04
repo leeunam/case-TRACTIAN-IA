@@ -217,9 +217,7 @@ class TrajectoryJudge:
             "expected_path": [
                 item.model_dump(mode="json") for item in reference.expected_path
             ],
-            "observed_steps": [
-                item.model_dump(mode="json") for item in observed.steps
-            ],
+            "observed_steps": [item.model_dump(mode="json") for item in observed.steps],
             "failure_codes": list(observed.failure_codes),
             "terminal": {
                 "decision": observed.decision,
@@ -276,10 +274,7 @@ def apply_thresholds(
             "stopping_quality": 0.25,
         }
         critical = tuple(weights)
-    verdicts = {
-        name: getattr(judgment, name)
-        for name in type(judgment).model_fields
-    }
+    verdicts = {name: getattr(judgment, name) for name in type(judgment).model_fields}
     weighted_score = sum(
         verdicts[name].score * weight for name, weight in weights.items()
     )

@@ -35,7 +35,8 @@ def _runtime(
         permissions=permissions,
         central_asset_id=central_asset_id,
         client=IndustrialApiClient(
-            "https://simulator.test", transport=httpx.MockTransport(handler)  # type: ignore[arg-type]
+            "https://simulator.test",
+            transport=httpx.MockTransport(handler),  # type: ignore[arg-type]
         ),
         seed=seed,
     )
@@ -100,7 +101,10 @@ def test_analysis_tools_expose_only_safe_strict_public_schemas():
     assert list_asset_analyses.name == "list_asset_analyses"
     assert set(list_schema["properties"]) == {"asset_id", "status"}
     assert list_schema["required"] == ["asset_id"]
-    assert list_schema["properties"]["asset_id"]["pattern"] == r"^asset_[A-Za-z0-9_-]{1,64}$"
+    assert (
+        list_schema["properties"]["asset_id"]["pattern"]
+        == r"^asset_[A-Za-z0-9_-]{1,64}$"
+    )
     assert list_schema["properties"]["status"]["anyOf"][0]["enum"] == [
         "current",
         "stale",
@@ -109,10 +113,21 @@ def test_analysis_tools_expose_only_safe_strict_public_schemas():
     ]
     assert set(detail_schema["properties"]) == {"analysis_id"}
     assert detail_schema["required"] == ["analysis_id"]
-    assert detail_schema["properties"]["analysis_id"]["pattern"] == r"^an_[A-Za-z0-9_-]{1,64}$"
+    assert (
+        detail_schema["properties"]["analysis_id"]["pattern"]
+        == r"^an_[A-Za-z0-9_-]{1,64}$"
+    )
 
     serialized = json.dumps({"list": list_schema, "detail": detail_schema}).lower()
-    for hidden in ("runtime", "identity", "permissions", "client", "seed", "url", "method"):
+    for hidden in (
+        "runtime",
+        "identity",
+        "permissions",
+        "client",
+        "seed",
+        "url",
+        "method",
+    ):
         assert hidden not in serialized
 
 
@@ -123,7 +138,11 @@ def test_list_calls_exact_fixed_endpoint_with_only_status_and_seed():
         requests.append(request)
         return httpx.Response(
             200,
-            json={"mode": "complete", "notes": None, "data": {"analyses": [_analysis_payload()]}},
+            json={
+                "mode": "complete",
+                "notes": None,
+                "data": {"analyses": [_analysis_payload()]},
+            },
         )
 
     result = _run(_list(_runtime(handler), status="current"))
@@ -131,7 +150,10 @@ def test_list_calls_exact_fixed_endpoint_with_only_status_and_seed():
     assert len(requests) == 1
     assert requests[0].method == "GET"
     assert requests[0].url.path == "/assets/asset_M101/analyses"
-    assert dict(requests[0].url.params) == {"status": "current", "seed": "fixed-analysis"}
+    assert dict(requests[0].url.params) == {
+        "status": "current",
+        "seed": "fixed-analysis",
+    }
     assert requests[0].headers["x-user-id"] == "usr_ana"
     assert result.content.model_dump() == {
         "analyses": [
@@ -180,7 +202,9 @@ def test_detail_calls_exact_fixed_endpoint_and_keeps_complete_analysis():
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": _analysis_payload()})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": _analysis_payload()}
+        )
 
     result = _run(_detail(_runtime(handler)))
 
@@ -204,7 +228,9 @@ def test_detail_accepts_nullable_evidence_reference_for_symptomatic_detection():
     payload["evidence"][0]["reference"] = None
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payload}
+        )
 
     result = _run(_detail(_runtime(handler)))
 
@@ -220,7 +246,9 @@ def test_detail_accepts_nullable_evidence_reference_for_symptomatic_detection():
         ("detail", ("an_" + "x" * 65,)),
     ],
 )
-def test_core_rejects_invalid_ids_and_status_before_http(operation: str, arguments: tuple[object, ...]):
+def test_core_rejects_invalid_ids_and_status_before_http(
+    operation: str, arguments: tuple[object, ...]
+):
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -272,13 +300,25 @@ def test_list_rejects_outside_central_asset_before_http():
     ("payload", "match"),
     [
         ({"analyses": [_analysis_payload(asset_id="asset_other")]}, "fora do escopo"),
-        ({"analyses": [_analysis_payload(analysis_id="an_9901"), _analysis_payload(analysis_id="an_9901")]}, "duplicado"),
+        (
+            {
+                "analyses": [
+                    _analysis_payload(analysis_id="an_9901"),
+                    _analysis_payload(analysis_id="an_9901"),
+                ]
+            },
+            "duplicado",
+        ),
         ({"analyses": [_analysis_payload(status="stale")]}, "filtro"),
     ],
 )
-def test_list_rejects_parent_duplicate_and_filter_mismatches(payload: dict[str, object], match: str):
+def test_list_rejects_parent_duplicate_and_filter_mismatches(
+    payload: dict[str, object], match: str
+):
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payload}
+        )
 
     with pytest.raises(ValueError, match=match):
         _run(_list(_runtime(handler), status="current"))
@@ -291,9 +331,13 @@ def test_list_rejects_parent_duplicate_and_filter_mismatches(payload: dict[str, 
         (_analysis_payload(asset_id="asset_other"), "fora do escopo"),
     ],
 )
-def test_detail_rejects_returned_id_and_parent_mismatch(payload: dict[str, object], match: str):
+def test_detail_rejects_returned_id_and_parent_mismatch(
+    payload: dict[str, object], match: str
+):
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payload}
+        )
 
     with pytest.raises(ValueError, match=match):
         _run(_detail(_runtime(handler)))
@@ -304,17 +348,24 @@ def test_detail_rejects_returned_id_and_parent_mismatch(payload: dict[str, objec
     [
         (lambda data: data.pop("evidence"), "INVALID_SCHEMA_RESPONSE"),
         (lambda data: data["evidence"][0].pop("reference"), "INVALID_SCHEMA_RESPONSE"),
-        (lambda data: data.update({"created_at": "2026-01-02"}), "INVALID_SCHEMA_RESPONSE"),
+        (
+            lambda data: data.update({"created_at": "2026-01-02"}),
+            "INVALID_SCHEMA_RESPONSE",
+        ),
         (lambda data: data.update({"confidence": math.nan}), "INVALID_SCHEMA_RESPONSE"),
         (lambda data: data.update({"unexpected": True}), "INVALID_SCHEMA_RESPONSE"),
     ],
 )
-def test_complete_wire_rejects_missing_nullable_timestamp_nonfinite_and_extra_fields(mutate: Any, match: str):
+def test_complete_wire_rejects_missing_nullable_timestamp_nonfinite_and_extra_fields(
+    mutate: Any, match: str
+):
     payload = _analysis_payload()
     mutate(payload)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": payload})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": payload}
+        )
 
     result = _run(_detail(_runtime(handler)))
     assert result.error is not None
@@ -333,7 +384,10 @@ def test_list_orders_newest_first_stably_and_declares_prompt_and_artifact_cuts()
     analyses.reverse()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": {"analyses": analyses}})
+        return httpx.Response(
+            200,
+            json={"mode": "complete", "notes": None, "data": {"analyses": analyses}},
+        )
 
     result = _run(_list(_runtime(handler)))
 
@@ -362,7 +416,10 @@ def test_list_declares_the_prompt_cut_at_twenty_one_items():
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": {"analyses": analyses}})
+        return httpx.Response(
+            200,
+            json={"mode": "complete", "notes": None, "data": {"analyses": analyses}},
+        )
 
     result = _run(_list(_runtime(handler)))
 
@@ -374,8 +431,12 @@ def test_list_declares_the_prompt_cut_at_twenty_one_items():
 
 
 def test_degraded_list_projects_real_simulator_rows_without_raw_evidence_or_model_fields():
-    first = _analysis_payload(analysis_id="an_9901", created_at="2026-01-01T00:00:00+00:00")
-    second = _analysis_payload(analysis_id="an_9902", created_at="2026-01-02T00:00:00+00:00")
+    first = _analysis_payload(
+        analysis_id="an_9901", created_at="2026-01-01T00:00:00+00:00"
+    )
+    second = _analysis_payload(
+        analysis_id="an_9902", created_at="2026-01-02T00:00:00+00:00"
+    )
     second.pop("evidence")
     second.pop("model_version")
 
@@ -434,7 +495,9 @@ def test_degraded_list_validates_all_rows_before_21_and_201_cuts_and_declares_co
     rows = [
         _analysis_payload(
             analysis_id=f"an_{index}",
-            created_at=(datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=index)).isoformat(),
+            created_at=(
+                datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=index)
+            ).isoformat(),
         )
         for index in range(201)
     ]
@@ -442,7 +505,11 @@ def test_degraded_list_validates_all_rows_before_21_and_201_cuts_and_declares_co
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"mode": "partial", "notes": "Dados parciais.", "data": {"analyses": rows, "inconclusive": True}},
+            json={
+                "mode": "partial",
+                "notes": "Dados parciais.",
+                "data": {"analyses": rows, "inconclusive": True},
+            },
         )
 
     result = _run(_list(_runtime(handler)))
@@ -478,7 +545,14 @@ def test_degraded_list_rejects_unknown_top_level_data_instead_of_bypassing_limit
 @pytest.mark.parametrize(
     ("rows", "status", "match"),
     [
-        ([_analysis_payload(analysis_id="an_1"), _analysis_payload(analysis_id="an_1")], None, "duplicado"),
+        (
+            [
+                _analysis_payload(analysis_id="an_1"),
+                _analysis_payload(analysis_id="an_1"),
+            ],
+            None,
+            "duplicado",
+        ),
         ([_analysis_payload(asset_id="asset_other")], None, "fora do escopo"),
         ([_analysis_payload(status="stale")], "current", "filtro"),
         ([{**_analysis_payload(), "status": None}], "current", "status inválido"),
@@ -490,7 +564,9 @@ def test_degraded_list_rejects_duplicate_scope_and_filter_violations_outside_win
     rows = rows * 201
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "partial", "notes": None, "data": {"analyses": rows}})
+        return httpx.Response(
+            200, json={"mode": "partial", "notes": None, "data": {"analyses": rows}}
+        )
 
     with pytest.raises(ValueError, match=match):
         _run(_list(_runtime(handler), status=status))
@@ -510,14 +586,18 @@ def test_degraded_list_checks_a_bad_row_after_the_artifact_window(
     rows = [
         _analysis_payload(
             analysis_id=f"an_{index}",
-            created_at=(datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=index)).isoformat(),
+            created_at=(
+                datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=index)
+            ).isoformat(),
         )
         for index in range(201)
     ]
     rows.append(bad_row)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "partial", "notes": None, "data": {"analyses": rows}})
+        return httpx.Response(
+            200, json={"mode": "partial", "notes": None, "data": {"analyses": rows}}
+        )
 
     with pytest.raises(ValueError, match=match):
         _run(_list(_runtime(handler), status=status))
@@ -537,7 +617,9 @@ def test_degraded_list_keeps_missing_summary_fields_absent_without_inventing_nul
     result = _run(_list(_runtime(handler)))
 
     assert result.content.analyses == [{"id": "an_9901", "asset_id": "asset_M101"}]
-    assert result.artifact.outcome.analyses == [{"id": "an_9901", "asset_id": "asset_M101"}]
+    assert result.artifact.outcome.analyses == [
+        {"id": "an_9901", "asset_id": "asset_M101"}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -554,7 +636,9 @@ def test_degraded_data_is_safe_and_rejects_contradictory_known_scope(
     operation: str, data: dict[str, object], match: str
 ):
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"mode": "partial", "notes": "Dados incompletos.", "data": data})
+        return httpx.Response(
+            200, json={"mode": "partial", "notes": "Dados incompletos.", "data": data}
+        )
 
     with pytest.raises(ValueError, match=match):
         if operation == "list":
@@ -570,7 +654,11 @@ def test_degraded_data_and_api_errors_are_preserved_without_retry():
         requests.append(request)
         return httpx.Response(
             200,
-            json={"mode": "partial", "notes": "Dados parciais.", "data": {"observed": True}},
+            json={
+                "mode": "partial",
+                "notes": "Dados parciais.",
+                "data": {"observed": True},
+            },
         )
 
     partial = _run(_list(_runtime(partial_handler)))
@@ -580,7 +668,9 @@ def test_degraded_data_and_api_errors_are_preserved_without_retry():
     assert partial.artifact.outcome.partial_data == {"observed": True}
 
     def error_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={"code": "NOT_FOUND", "message": "Análise não encontrada."})
+        return httpx.Response(
+            404, json={"code": "NOT_FOUND", "message": "Análise não encontrada."}
+        )
 
     error = _run(_detail(_runtime(error_handler)))
     assert error.error == ApiError(
@@ -604,7 +694,10 @@ def test_degraded_detail_ignores_nested_model_id_but_checks_top_level_id():
 
     result = _run(_detail(_runtime(handler)))
 
-    assert result.artifact.outcome.partial_data == {"id": "an_9901", "model": {"id": "mdl_vib_v3"}}
+    assert result.artifact.outcome.partial_data == {
+        "id": "an_9901",
+        "model": {"id": "mdl_vib_v3"},
+    }
 
 
 def test_adapters_return_model_content_and_reject_unknown_arguments():
@@ -615,13 +708,22 @@ def test_adapters_return_model_content_and_reject_unknown_arguments():
         calls += 1
         return httpx.Response(
             200,
-            json={"mode": "complete", "notes": None, "data": {"analyses": [_analysis_payload()]}},
+            json={
+                "mode": "complete",
+                "notes": None,
+                "data": {"analyses": [_analysis_payload()]},
+            },
         )
 
     async def invoke(tool: object, arguments: dict[str, object]):
         runtime = _runtime(handler)
         tool_runtime = ToolRuntime(
-            state={}, context=runtime, config={}, stream_writer=lambda _: None, tool_call_id=None, store=None
+            state={},
+            context=runtime,
+            config={},
+            stream_writer=lambda _: None,
+            tool_call_id=None,
+            store=None,
         )
         try:
             return await tool.ainvoke({**arguments, "runtime": tool_runtime})  # type: ignore[union-attr]
@@ -631,7 +733,9 @@ def test_adapters_return_model_content_and_reject_unknown_arguments():
     content = _run(invoke(list_asset_analyses, {"asset_id": "asset_M101"}))
     assert content["total_analyses"] == 1
     with pytest.raises(ValidationError):
-        _run(invoke(list_asset_analyses, {"asset_id": "asset_M101", "unexpected": True}))
+        _run(
+            invoke(list_asset_analyses, {"asset_id": "asset_M101", "unexpected": True})
+        )
     assert calls == 1
 
 
@@ -641,12 +745,19 @@ def test_detail_adapter_keeps_evidence_and_rejects_unknown_arguments():
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        return httpx.Response(200, json={"mode": "complete", "notes": None, "data": _analysis_payload()})
+        return httpx.Response(
+            200, json={"mode": "complete", "notes": None, "data": _analysis_payload()}
+        )
 
     async def invoke(arguments: dict[str, object]):
         runtime = _runtime(handler)
         tool_runtime = ToolRuntime(
-            state={}, context=runtime, config={}, stream_writer=lambda _: None, tool_call_id=None, store=None
+            state={},
+            context=runtime,
+            config={},
+            stream_writer=lambda _: None,
+            tool_call_id=None,
+            store=None,
         )
         try:
             return await get_analysis.ainvoke({**arguments, "runtime": tool_runtime})

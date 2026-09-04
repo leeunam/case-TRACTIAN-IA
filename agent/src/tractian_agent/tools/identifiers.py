@@ -1,4 +1,5 @@
 """Identificadores aceitos nas tools, com formatos deliberadamente restritos."""
+
 from typing import Annotated
 
 from pydantic import StringConstraints
