@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-
 from tractian_demo.slack_mcp import SlackMcpClient, SlackMcpProtocolError
 from tractian_demo.slack_worker import SlackDeliveryWorker
 
@@ -76,6 +75,81 @@ async def test_slack_mcp_discovers_send_tool_and_returns_external_id() -> None:
     assert external_id == "123.456"
     assert requests[-1]["params"]["name"] == "slack_send_message"
     assert "xoxp-not-persisted" not in str(requests)
+
+
+@pytest.mark.anyio
+async def test_slack_mcp_reads_external_id_from_official_content_payload() -> None:
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                headers={"mcp-session-id": "s"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": {"name": "slack", "version": "1"},
+                    },
+                },
+            ),
+            httpx.Response(202),
+            httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "slack_send_message",
+                                "inputSchema": {
+                                    "properties": {
+                                        "channel_id": {},
+                                        "message": {},
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    {
+                                        "message_link": (
+                                            "https://workspace.slack.com/archives/C1/p123456"
+                                        ),
+                                        "message_context": {
+                                            "message_ts": "123.456",
+                                            "channel_id": "C1",
+                                        },
+                                    }
+                                ),
+                            }
+                        ]
+                    },
+                },
+            ),
+        ]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: next(responses))
+    ) as http:
+        external_id = await SlackMcpClient(
+            http=http, access_token="token"
+        ).send_message(channel_id="C1", text="safe")
+
+    assert external_id == "123.456"
 
 
 @pytest.mark.anyio

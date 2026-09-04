@@ -585,11 +585,12 @@ foi escolhido e o golden set não foi alterado.
 
 **Aceite:** a recomendação se baseia no benchmark versionado e nas condições reais do teste.
 
-**Aceite verificado (03/09/2026):** os dois providers executaram duas vezes os
+**Aceite verificado e repetido em 04/09/2026:** os dois providers executaram duas vezes os
 mesmos probes, modelo `openai/gpt-oss-20b`, contexto de 8.000 caracteres e
 contratos reais. Groq passou planner e writer com estabilidade; NVIDIA NIM
 passou writer, mas falhou saída estruturada/estabilidade do planner. As
-latências totais foram 1.735/1.039 ms na Groq e 6.361/21.335 ms na NVIDIA para
+latências totais da repetição mais recente foram 1.574/1.002 ms na Groq e
+5.422/19.437 ms na NVIDIA para
 planner/writer. Groq foi recomendado nessas condições. Tokens foram registrados;
 custo ficou indisponível, sem estimativa inventada, pois a configuração não
 congela uma tarifa confiável.
@@ -636,6 +637,14 @@ busca válida e finalização segura no teto de sete tools. A prova 34/34 sem
 120B, GPT-OSS 20B e Qwen 3.8 foram esgotadas durante as rodadas. Não interpretar
 exit code zero do runner como qualidade aprovada.
 
+**Repetição live (04/09/2026):** a rodada armazenada em
+`agent/.run/evaluation/tractian-eval-v6` executou os 34 runs (o identificador
+versionado do manifesto continua `tractian-eval-v5`). Os checks de argumentos,
+erros, formato, IDs, justificativa, permissões, limite e tools passaram 34/34;
+decisão passou 2/34, trajetória 0/34 e 33 runs registraram `model_failure`.
+Assim, a repetição reforça que o pipeline funciona, mas mantém abertos os dois
+critérios abaixo e não classifica o agente como pronto para produção.
+
 - [x] Comprovar chamadas reais separadas de planner e writer e paths em cascata.
 - [x] Tornar pacing e retries do live explícitos, limitados e reproduzíveis.
 - [ ] Reexecutar `tractian-eval-v5` com cota suficiente e exigir zero `model_failure`.
@@ -643,9 +652,9 @@ exit code zero do runner como qualidade aprovada.
 
 ## Especificação aprovada — central de casos, filas e Slack MCP
 
-**Estado em 04/09/2026:** desenho aprovado; implementação ainda não iniciada.
-Nenhum item das Fases 16–19 pode ser marcado apenas com mockup ou teste
-isolado. Esta seção é vinculante para a implementação test-first.
+**Estado em 04/09/2026:** implementação local concluída; smoke do transporte
+Slack real comprovado nos dois canais. Nenhum item das Fases 16–19 é marcado
+apenas com mockup ou teste isolado. Esta seção permanece como contrato do aceite.
 
 ### Objetivo e limites
 
@@ -896,30 +905,41 @@ persona, decisões e projeções sanitizadas de eventos e evidências.
 
 ## Fase 18 — decisões delegadas e Slack MCP
 
-**Estado:** implementação e testes locais concluídos; smoke externo pendente de
-OAuth/canais. Revisão técnica e autorização delegada permanecem contratos
-distintos. O adapter usa o MCP oficial por Streamable HTTP, descobre a tool de
-envio e nunca persiste o token.
+**Estado:** implementação, testes locais e smoke externo concluídos. Revisão
+técnica e autorização delegada permanecem contratos distintos. O adapter usa o
+MCP oficial por Streamable HTTP, descobre a tool de envio, interpreta o
+comprovante oficial em `content[].text` e nunca persiste o token.
 
 - [x] Preservar solicitante/`ThreadScope` e validar o atestado do decisor.
 - [x] Provar a matriz de roteamento e pedidos separados por público.
 - [x] Implementar outbox, worker, sanitização e reenvio manual seguro.
-- [ ] Comprovar um smoke opt-in por canal sem persistir segredos.
+- [x] Comprovar um smoke opt-in por canal sem persistir segredos.
+
+**Evidência externa (04/09/2026):** após habilitar o Slack MCP e autorizar
+`chat:write`, `make smoke-slack` enviou uma notificação segura para o canal da
+equipe TRACTIAN e outra para o canal de autoridade, confirmando um `message_ts`
+distinto para cada uma. Um ciclo RED→GREEN adicionou regressão para o formato
+real do MCP (`message_context.message_ts` serializado em `content[].text`); os
+7 testes focados passaram. Tokens, canais e links não foram persistidos no Git.
 
 ## Fase 19 — fallback, integração e entrega
 
-**Estado:** implementação local concluída; smokes externos restantes continuam
-opt-in. A ordem vem de configuração e o roteador opera dentro das interfaces do
+**Estado:** implementação local concluída; Slack real e conectividade/contratos
+dos dois providers foram exercitados. Continua pendente provocar uma falha de
+disponibilidade real da Groq e comprovar o fallback ao vivo pelo roteador. A
+ordem vem de configuração e o roteador opera dentro das interfaces do
 planner/writer, registrando provider e motivo fechado na execução.
 
 - [x] Aplicar fallback somente aos códigos de disponibilidade aprovados.
 - [x] Provar por testes Groq → NIM e deixar a ordem inteiramente configurável.
 - [x] Rodar suítes individuais, cascata e concorrência locais.
-- [ ] Rodar os smokes externos opt-in de Slack e NVIDIA NIM.
+- [x] Rodar os smokes externos opt-in de Slack e NVIDIA NIM.
+- [ ] Comprovar o fallback ao vivo Groq → NIM por uma falha de disponibilidade
+      permitida, sem usar falha de qualidade como gatilho.
 - [x] Atualizar toda documentação somente após cada evidência de aceite.
 
 **Evidência local final (04/09/2026):** `make test` passou com **99 testes da
-API + 1.813 do agente + 25 do backend demo + 4 do frontend**, seguido do build
+API + 1.813 do agente + 26 do backend demo + 4 do frontend**, seguido do build
 Vite e de **2 fluxos Playwright** no Chrome. O smoke de inicialização confirmou
 HTTP 200 na API, fachada e SPA com os quatro processos de `make demo`; `make
 stop` encerrou todos. `make eval` reproduziu 17 casos × 2. Como esperado no
@@ -929,11 +949,18 @@ formato, IDs, justificativa, permissões, erros e limite de passos passaram em
 34/34. Isso é evidência de reprodutibilidade, não de qualidade aprovada.
 
 O caminho ao vivo Groq já foi exercitado pela central e persistiu provider,
-trace e resposta conservadora. Não há credenciais/canais Slack configurados
-neste checkout e não foi provocado erro real da Groq durante esta rodada;
-portanto, entrega Slack real e fallback NIM real permanecem corretamente
-pendentes. A calibração da Fase 13 continua `skipped` até especialistas da
-TRACTIAN produzirem rótulos cegos.
+trace e resposta conservadora. O benchmark externo repetido executou Groq e
+NVIDIA NIM com dois runs por papel e manteve Groq como recomendação: o planner
+NIM falhou português, saída estruturada e estabilidade, enquanto seu writer
+passou. O smoke Slack real passou nos dois canais. Ainda não foi provocado erro
+real de disponibilidade da Groq; portanto, o fallback NIM pelo roteador ao vivo
+permanece corretamente pendente. A calibração da Fase 13 continua `skipped` até
+especialistas da TRACTIAN produzirem rótulos cegos.
+
+Na repetição final, o selector asyncio padrão do host não despertou callbacks
+vindos das threads do `TestClient` e do `aiosqlite`. Os testes passaram a usar
+`uvloop` explicitamente em Unix; o runtime de produção não foi alterado. A
+execução canônica de `make test` terminou com código zero e as contagens acima.
 
 ## Registro histórico do plano SDD — Fases 5 e 4
 

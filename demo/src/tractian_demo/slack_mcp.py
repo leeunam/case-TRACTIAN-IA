@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
 import json
+from typing import Any
 
 import httpx
-
 
 SLACK_MCP_ENDPOINT = "https://mcp.slack.com/mcp"
 
@@ -133,6 +132,29 @@ class SlackMcpClient:
         external_id = (
             structured.get("message_ts") if isinstance(structured, dict) else None
         )
+        if not external_id:
+            content = result.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict) or item.get("type") != "text":
+                        continue
+                    try:
+                        parsed = json.loads(str(item.get("text", "")))
+                    except json.JSONDecodeError:
+                        continue
+                    context = (
+                        parsed.get("message_context")
+                        if isinstance(parsed, dict)
+                        else None
+                    )
+                    candidate = (
+                        context.get("message_ts")
+                        if isinstance(context, dict)
+                        else None
+                    )
+                    if isinstance(candidate, str) and candidate:
+                        external_id = candidate
+                        break
         if not isinstance(external_id, str) or not external_id:
             raise SlackMcpProtocolError("SLACK_EXTERNAL_ID_MISSING")
         return external_id

@@ -13,8 +13,6 @@ from threading import Event, Lock
 from uuid import UUID
 
 import pytest
-from fastapi.testclient import TestClient
-
 from app import main as main_module
 from app import store as runtime_store
 from app.idempotency import (
@@ -25,8 +23,12 @@ from app.idempotency import (
 )
 from app.main import app
 from app.models import AssetConfigUpdate
+from fastapi.testclient import TestClient
 
-client = TestClient(app)
+# O backend uvloop mantém os testes síncronos determinísticos também em hosts
+# onde o seletor asyncio padrão não desperta corretamente entre threads.
+TEST_CLIENT_OPTIONS = {"backend_options": {"use_uvloop": True}}
+client = TestClient(app, **TEST_CLIENT_OPTIONS)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_ROOTS = (
@@ -877,6 +879,7 @@ def test_reprocess_unknown_reservation_decision_fails_closed(
     client_without_server_exceptions = TestClient(
         app,
         raise_server_exceptions=False,
+        **TEST_CLIENT_OPTIONS,
     )
 
     response = client_without_server_exceptions.post(
@@ -908,6 +911,7 @@ def test_reprocess_failure_marks_outcome_uncertain_and_blocks_retry(monkeypatch)
     client_without_server_exceptions = TestClient(
         app,
         raise_server_exceptions=False,
+        **TEST_CLIENT_OPTIONS,
     )
 
     first_response = client_without_server_exceptions.post(
@@ -1140,6 +1144,7 @@ def test_reprocess_retry_after_response_loss_replays_committed_response(
     client_without_server_exceptions = TestClient(
         app,
         raise_server_exceptions=False,
+        **TEST_CLIENT_OPTIONS,
     )
 
     lost_response = client_without_server_exceptions.post(

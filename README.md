@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema recebe uma solicitação, investiga dados por APIs, explica sua decisão com evidências e executa somente ações permitidas. Uma central React local permite demonstrar o fluxo real, alternar personas simuladas e resolver pedidos humanos sem transformar a interface em fonte de autorização.
 
-> **Estado atual:** além do núcleo e da avaliação das Fases 1–12, 14 e 15, existem a fachada FastAPI `demo/`, filas SQLite, central React `frontend/`, decisões delegadas, outbox Slack MCP e fallback configurável Groq → NVIDIA NIM. As suítes locais usam doubles e não consomem credenciais. A calibração humana da Fase 13 continua adiada até uma pessoa especialista da TRACTIAN produzir os rótulos cegos. O smoke do Slack real depende de OAuth e dos dois canais do workspace; sem essa evidência a integração externa não é declarada validada. O benchmark atual revelou limitações de qualidade e o agente não é de produção.
+> **Estado atual:** além do núcleo e da avaliação das Fases 1–12, 14 e 15, existem a fachada FastAPI `demo/`, filas SQLite, central React `frontend/`, decisões delegadas, outbox Slack MCP e fallback configurável Groq → NVIDIA NIM. As suítes locais usam doubles e não consomem credenciais. O smoke opt-in do Slack real foi comprovado nos dois canais em 04/09/2026. A calibração humana da Fase 13 continua adiada até uma pessoa especialista da TRACTIAN produzir os rótulos cegos. O benchmark atual revelou limitações de qualidade e o agente não é de produção.
 
 ## Problema
 
@@ -256,15 +256,17 @@ de decisão e nenhuma reproduziu a trajetória esperada. Isso é evidência de q
 o pipeline detecta regressões, não de qualidade do agente.
 
 Uma auditoria de estabilização posterior executou ainda `tractian-eval-v2`,
-`v3` e `v4`. Ela comprovou chamadas reais do planner e do writer, corrigiu
+`v3`, `v4` e uma nova rodada armazenada em `tractian-eval-v6` (o identificador
+versionado interno continua `tractian-eval-v5`). Ela comprovou chamadas reais do planner e do writer, corrigiu
 repetição de busca, finalização no teto de tools, parsing malformado e isolamento
 de pacing. Também demonstrou um limite externo: cada modelo do plano gratuito
 da Groq tem 200 mil tokens/dia, insuficientes para concluir no mesmo período as
 34 trajetórias longas com todas as chamadas. As rodadas terminaram com falhas de
 cota e **não** são evidência de 34/34 fluxos aprovados. A configuração `v5`
-restaura o GPT-OSS 20B suportado e reproduz o controle de cota; para uma prova
-live completa é preciso aguardar a renovação, elevar a cota ou autorizar outro
-provider. O perfil local, os checks e os testes não dependem dessa cota.
+restaura o GPT-OSS 20B suportado e reproduz o controle de cota. A rodada mais
+recente produziu 34 execuções: 33 registraram `model_failure`, 2 passaram a
+dimensão de decisão e nenhuma passou a trajetória ou o conjunto integral. O
+perfil local, os checks e os testes não dependem dessa cota.
 
 Os juízes Groq `openai/gpt-oss-120b`, rubricas `v2`, JSON mode validado por
 Pydantic e pacing de dez segundos avaliaram os mesmos 34 runs. Nenhuma saída
@@ -309,11 +311,12 @@ O golden set nunca entra no runtime e não é consultado por RAG. Ele é visíve
 | Testes | pytest, Vitest e Playwright | Unidade, integração, concorrência, build e navegador real |
 | Avaliação | Pydantic Evals | Casos, avaliadores e experimentos tipados |
 
-No benchmark versionado de dois runs por papel com `openai/gpt-oss-20b`, Groq
+Na repetição mais recente do benchmark versionado, com dois runs por papel e
+`openai/gpt-oss-20b`, Groq
 passou português, tool calling, saída estruturada e estabilidade no planner e
 writer. NVIDIA NIM passou o writer, mas falhou a saída estruturada/estabilidade
-do planner. A latência total observada foi 1,735 s/1,039 s para planner/writer
-na Groq e 6,361 s/21,335 s na NVIDIA. Groq é a recomendação sob essas condições;
+do planner. A latência total observada foi 1,574 s/1,002 s para planner/writer
+na Groq e 5,422 s/19,437 s na NVIDIA. Groq é a recomendação sob essas condições;
 o custo não foi comparado por ausência de tarifa congelada.
 
 LangSmith e Phoenix não foram adicionados: Pydantic Evals já organiza o
@@ -352,7 +355,7 @@ O Swagger industrial fica em `http://localhost:8000/docs`, o Swagger da fachada 
 
 Crie ou reutilize uma Slack App interna, habilite o MCP e conclua OAuth com o escopo mínimo `chat:write`. Preencha somente no `.env` local `SLACK_MCP_ACCESS_TOKEN`, `SLACK_TRACTIAN_CHANNEL_ID` e `SLACK_AUTHORITY_CHANNEL_ID`. O endpoint usado é o oficial `https://mcp.slack.com/mcp`; o worker descobre a tool de envio no início da sessão. O Slack recebe apenas categoria, resumo sanitizado, IDs opacos e link. Aprovar ou rejeitar acontece exclusivamente na central.
 
-Enquanto essas três variáveis não estiverem configuradas e `make smoke-slack` não passar, a central mantém as decisões funcionais, mas informa `slack_configured=false` e não promete entrega externa.
+Enquanto essas três variáveis não estiverem configuradas e `make smoke-slack` não passar, a central mantém as decisões funcionais, mas informa `slack_configured=false` e não promete entrega externa. O smoke real de 04/09/2026 passou nos dois canais e confirmou um `message_ts` para cada envio. Em outro workspace, repita o comando. Depois do OAuth, revise os escopos concedidos e remova os que não forem necessários; esta integração usa somente `chat:write`.
 
 ## Desenvolvimento com uma IA copiloto
 
@@ -405,7 +408,7 @@ Prompt curto recomendado:
 - Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, revisão humana retomável, fluxos de escrita, checkpointer, telemetria manual Logfire opt-in e avaliação Pydantic Evals. O benchmark atual falha em qualidade/estabilidade e a calibração humana está adiada; portanto não é um agente de produção.
 - As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
 - O simulador não representa todas as garantias transacionais de produção.
-- A central usa identidades simuladas e execução local; não substitui autenticação, autorização distribuída ou implantação de produção. O Slack real permanece pendente até o smoke OAuth documentado.
+- A central usa identidades simuladas e execução local; não substitui autenticação, autorização distribuída ou implantação de produção. O transporte Slack real foi validado nos dois canais, mas o percurso completo frontend → fila → link → decisão → retomada ainda precisa de aceite externo ponta a ponta.
 - As rotas de ação do simulador devolvem recibos, mas não alteram os recursos Parquet; um novo GET não comprova a mutação solicitada.
 
 ## Autor

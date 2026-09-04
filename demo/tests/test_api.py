@@ -2,7 +2,6 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-
 from tractian_demo.app import create_app
 from tractian_demo.contracts import Persona
 from tractian_demo.settings import DemoSettings
@@ -45,7 +44,10 @@ def client(tmp_path: Path):
             ),
         )
 
-    with TestClient(create_app(settings(tmp_path), persona_loader=personas)) as client:
+    with TestClient(
+        create_app(settings(tmp_path), persona_loader=personas),
+        backend_options={"use_uvloop": True},
+    ) as client:
         yield client
 
 
