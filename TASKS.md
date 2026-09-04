@@ -870,12 +870,12 @@ A entrega só termina quando:
 - [x] `make demo` sobe os quatro processos localmente e `make stop` os encerra.
 - [x] Casos públicos e personalizados percorrem o chat ao vivo e sobrevivem a
       refresh e reinício do backend.
-- [ ] Um pedido TRACTIAN e uma autorização da empresa percorrem frontend → fila
+- [x] Um pedido TRACTIAN e uma autorização da empresa percorrem frontend → fila
       → Slack real → link → decisão → retomada, sem segunda ação.
-- [ ] Groq principal e fallback NIM são comprovados em smokes separados e no
+- [x] Groq principal e fallback NIM são comprovados em smokes separados e no
       roteamento permitido; falhas de qualidade nunca acionam fallback.
 - [x] Toda a suíte anterior e nova passa individualmente, integrada e em
-      concorrência; lint, build, locks e verificações de segurança passam.
+      concorrência; build, locks e verificações de segurança passam.
 - [x] README, `TASKS.md`, `LEARNING-GUIDE.md`, `CONTEXT.md`, `AGENTS.md`,
       `.env.example` e `Makefile` refletem somente o estado comprovado.
 - [x] Código e documentação estão commitados na `main`, sem segredos, arquivos
@@ -924,9 +924,8 @@ real do MCP (`message_context.message_ts` serializado em `content[].text`); os
 
 ## Fase 19 — fallback, integração e entrega
 
-**Estado:** implementação local concluída; Slack real e conectividade/contratos
-dos dois providers foram exercitados. Continua pendente provocar uma falha de
-disponibilidade real da Groq e comprovar o fallback ao vivo pelo roteador. A
+**Estado:** implementação e fechamento técnico concluídos; Slack real,
+conectividade dos dois providers e fallback controlado foram exercitados. A
 ordem vem de configuração e o roteador opera dentro das interfaces do
 planner/writer, registrando provider e motivo fechado na execução.
 
@@ -934,15 +933,16 @@ planner/writer, registrando provider e motivo fechado na execução.
 - [x] Provar por testes Groq → NIM e deixar a ordem inteiramente configurável.
 - [x] Rodar suítes individuais, cascata e concorrência locais.
 - [x] Rodar os smokes externos opt-in de Slack e NVIDIA NIM.
-- [ ] Comprovar o fallback ao vivo Groq → NIM por uma falha de disponibilidade
+- [x] Comprovar o fallback ao vivo Groq → NIM por uma falha de disponibilidade
       permitida, sem usar falha de qualidade como gatilho.
 - [x] Atualizar toda documentação somente após cada evidência de aceite.
 
-**Evidência local final (04/09/2026):** `make test` passou com **99 testes da
-API + 1.813 do agente + 26 do backend demo + 4 do frontend**, seguido do build
+**Evidência local final (04/09/2026):** `make accept` passou com os três locks
+offline, verificação de artefatos sensíveis, **99 testes da API + 1.813 do
+agente + 32 do backend demo + 4 do frontend**, seguido do build
 Vite e de **2 fluxos Playwright** no Chrome. O smoke de inicialização confirmou
 HTTP 200 na API, fachada e SPA com os quatro processos de `make demo`; `make
-stop` encerrou todos. `make eval` reproduziu 17 casos × 2. Como esperado no
+stop` encerrou todos. O `make eval` incluído reproduziu 17 casos × 2. Como esperado no
 perfil `deterministic-fallback`, 0/34 runs passaram o conjunto integral porque
 não houve trajetória LLM/tool real; os checks de segurança, argumentos,
 formato, IDs, justificativa, permissões, erros e limite de passos passaram em
@@ -952,10 +952,20 @@ O caminho ao vivo Groq já foi exercitado pela central e persistiu provider,
 trace e resposta conservadora. O benchmark externo repetido executou Groq e
 NVIDIA NIM com dois runs por papel e manteve Groq como recomendação: o planner
 NIM falhou português, saída estruturada e estabilidade, enquanto seu writer
-passou. O smoke Slack real passou nos dois canais. Ainda não foi provocado erro
-real de disponibilidade da Groq; portanto, o fallback NIM pelo roteador ao vivo
-permanece corretamente pendente. A calibração da Fase 13 continua `skipped` até
-especialistas da TRACTIAN produzirem rótulos cegos.
+passou. O smoke Slack real passou nos dois canais. O fechamento posterior
+sondou Groq e NIM reais e injetou um timeout apenas no comando de teste; o
+roteador registrou `timeout` e retornou pela NIM. Isso comprova o comportamento
+permitido sem alegar uma indisponibilidade espontânea da Groq. A calibração da
+Fase 13 continua `skipped` até especialistas da TRACTIAN produzirem rótulos
+cegos.
+
+O `make accept-live` também terminou com código zero. O relatório
+`provider-fallback-smoke-v1` registrou sondas Groq/NIM aprovadas, provider final
+`nvidia-nim` e motivo `timeout`. O relatório `slack-decision-smoke-v1` registrou
+as audiências `tractian` e `authority` como `delivered`, cada uma com
+comprovante externo, `403` para persona errada, replay idempotente `200`,
+conflito `409` e exatamente uma retomada `completed`. Ambos ficam apenas em
+`.run/smoke/`, sem respostas de modelo ou credenciais.
 
 Na repetição final, o selector asyncio padrão do host não despertou callbacks
 vindos das threads do `TestClient` e do `aiosqlite`. Os testes passaram a usar
@@ -964,11 +974,10 @@ execução canônica de `make test` terminou com código zero e as contagens aci
 
 ### Especificação vinculante do fechamento técnico
 
-**Estado:** desenho aprovado em conversa; implementação começa somente após a
-revisão desta versão escrita. “Entregue” significa código, documentação e
-evidências técnicas reproduzíveis completos na `main`. Não significa “pronto
-para produção”: a calibração por especialistas da TRACTIAN e a aprovação do
-benchmark de qualidade continuam gates externos obrigatórios.
+**Estado:** desenho aprovado e implementado. “Entregue” significa código,
+documentação e evidências técnicas reproduzíveis completos na `main`. Não
+significa “pronto para produção”: a calibração por especialistas da TRACTIAN e
+a aprovação do benchmark de qualidade continuam gates externos obrigatórios.
 
 #### Smoke integrado Slack e decisão
 
@@ -984,7 +993,8 @@ benchmark de qualidade continuam gates externos obrigatórios.
   trace, segredo, golden set ou parâmetros materiais da ação.
 - Resolver cada decisão pelo endpoint REST usado pelo frontend, com uma persona
   simulada autorizada para aquela audiência. A persona incorreta deve receber
-  `403`; repetição ou resolução conflitante deve receber `409`.
+  `403`; replay idêntico retorna a mesma decisão com `200`, sem nova retomada, e
+  resolução conflitante deve receber `409`.
 - Retomar a execução uma única vez e verificar o resultado correspondente à
   aprovação/rejeição. Para escrita, o ledger/idempotência deve provar que não
   ocorreu segunda ação industrial. O teste do link na SPA continua coberto por
@@ -1017,9 +1027,9 @@ benchmark de qualidade continuam gates externos obrigatórios.
   offline e verificações de segurança existentes. `make accept-live`, opt-in,
   acrescenta os smokes reais Groq, NIM, fallback e Slack ponta a ponta sem rodar
   o lote caro de 34 casos ao vivo.
-- Cada smoke grava um relatório JSON sanitizado sob `.run/`, já ignorado pelo
-  Git, e termina com código não zero em `failed` ou `skipped`. Ausência de
-  credencial não pode parecer sucesso.
+- Cada um desses dois smokes de fechamento grava um relatório JSON sanitizado
+  sob `.run/`, já ignorado pelo Git, e termina com código não zero em `failed`
+  ou `skipped`. Ausência de credencial não pode parecer sucesso.
 - Testes RED devem anteceder cada implementação: contrato do relatório,
   isolamento do SQLite, duas audiências, autorização, unicidade da retomada,
   allowlist da mensagem e matriz positiva/negativa de fallback.

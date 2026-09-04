@@ -427,6 +427,19 @@ Critério de conclusão local: concorrência, replay SSE, decisão única, outbo
 fallback permitido/proibido, componentes, build e navegador passam sem rede.
 OAuth Slack e providers reais permanecem smokes opt-in separados.
 
+O fechamento técnico usa dois smokes reproduzíveis. O primeiro cria decisões
+sintéticas para TRACTIAN e autoridade em SQLite temporário, entrega o link pelo
+Slack MCP e resolve pelo mesmo endpoint REST usado pela central; replay igual é
+idempotente e conflito falha. O segundo sonda Groq e NIM reais e injeta um
+timeout somente na fronteira de teste para atravessar o roteador. Isso comprova
+o comportamento sob indisponibilidade sem fingir que houve uma queda espontânea
+do provider. Respostas dos modelos, tokens e escopos materiais não entram nos
+relatórios.
+
+Critério de fechamento técnico: `make accept` e `make accept-live` passam. Esse
+resultado não substitui a calibração humana nem a meta de qualidade do
+benchmark, que continuam gates para produção.
+
 ## Sequência prática de cenários
 
 1. `TKT-CTX-02`: conhecimento e explicação;

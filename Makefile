@@ -30,7 +30,7 @@ MAKEFLAGS += --no-print-directory
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup deps data up up-api demo up-demo up-worker up-frontend stop logs test test-e2e smoke-groq smoke-slack eval eval-live eval-providers eval-judges eval-label-template eval-calibrate eval-layers clean clean-data
+.PHONY: help setup deps data up up-api demo up-demo up-worker up-frontend stop logs test test-e2e verify-locks verify-repository accept accept-live smoke-groq smoke-fallback smoke-slack-e2e eval eval-live eval-providers eval-judges eval-label-template eval-calibrate eval-layers clean clean-data
 
 help: ## Mostra esta ajuda
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -132,12 +132,36 @@ test: ## Executa todas as suítes, build e fluxo no Chrome
 test-e2e: ## Executa somente o fluxo Playwright da central
 	@cd $(ROOT)/frontend && npm run test:e2e
 
-smoke-groq: ## Compara modelos Groq com dados sintéticos; requer GROQ_API_KEY
-	@cd $(ROOT)/agent && $(AGENT_PY) -m tractian_agent.groq_smoke
+verify-locks: ## Confere locks Python sem rede e a instalação frontend
+	@cd $(ROOT)/api && uv lock --check --offline
+	@cd $(ROOT)/agent && uv lock --check --offline
+	@cd $(ROOT)/demo && uv lock --check --offline
+	@cd $(ROOT)/frontend && npm ls --depth=0 >/dev/null
 
-smoke-slack: ## Envia uma notificação segura em cada canal Slack (opt-in)
+verify-repository: ## Rejeita whitespace e artefatos sensíveis versionados
+	@git diff --check HEAD
+	@if git ls-files | grep -Eq '(^|/)(\.env|.*\.sqlite3|.*\.log)$$'; then \
+		echo "✗ .env, SQLite ou log não pode estar versionado"; exit 1; \
+	fi
+	@echo "✓ repositório sem artefatos sensíveis conhecidos"
+
+accept: verify-locks verify-repository test eval ## Aceite completo local, sem credenciais
+	@echo "✓ aceite técnico local concluído"
+
+accept-live: accept smoke-fallback smoke-slack-e2e ## Aceite local mais smokes reais opt-in
+	@echo "✓ aceite técnico externo concluído"
+
+smoke-groq: ## Compara modelos Groq com dados sintéticos; requer GROQ_API_KEY
+	@set -a; . $(ROOT)/.env; set +a; cd $(ROOT)/agent && \
+		$(AGENT_PY) -m tractian_agent.groq_smoke
+
+smoke-slack-e2e: ## Valida fila, Slack real, decisão REST e retomada (opt-in)
 	@set -a; . $(ROOT)/.env; set +a; cd $(ROOT)/demo && \
-		$(DEMO_PY) -m tractian_demo.slack_smoke
+		$(DEMO_PY) -m tractian_demo.delivery_smoke
+
+smoke-fallback: ## Sonda Groq/NIM e prova fallback por timeout controlado (opt-in)
+	@set -a; . $(ROOT)/.env; set +a; cd $(ROOT)/demo && \
+		$(DEMO_PY) -m tractian_demo.fallback_smoke
 
 eval: ## Executa 17 casos x 2, checks e lote humano sem LLM/rede
 	@cd $(ROOT)/agent && $(AGENT_PY) -m tractian_agent.evaluation offline \

@@ -25,7 +25,15 @@ Só marque uma tarefa após executar seu critério de aceite. Registre decisões
 
 ## Estado atual
 
-Existem o simulador FastAPI, o agente LangGraph completo, o pipeline Pydantic Evals, a fachada `demo/` com filas SQLite, a central React `frontend/`, decisões delegadas, outbox Slack MCP e fallback configurável Groq/NVIDIA NIM. As Fases 1–12 e 14–19 têm implementação local; a calibração humana da Fase 13 está adiada por ausência de especialista da TRACTIAN. O Slack real só está comprovado quando o smoke opt-in passar com OAuth e dois canais. O benchmark atual falha em qualidade e estabilidade. Nunca descreva calibração, integração externa não testada ou agente de produção como funcional.
+Existem o simulador FastAPI, o agente LangGraph completo, o pipeline Pydantic
+Evals, a fachada `demo/` com filas SQLite, a central React `frontend/`, decisões
+delegadas, outbox Slack MCP e fallback configurável Groq/NVIDIA NIM. As Fases
+1–12 e 14–19 têm implementação e aceite técnico; a calibração humana da Fase 13
+está adiada por ausência de especialista da TRACTIAN. Os smokes opt-in
+comprovaram os dois canais Slack até a retomada e o fallback por indisponibilidade
+controlada. O benchmark atual falha em qualidade e estabilidade. Nunca
+descreva calibração, uma integração externa não repetida no ambiente atual ou o
+agente de produção como funcional.
 
 ## Invariantes
 
@@ -58,7 +66,8 @@ Não crie outro `.md` se a informação pertencer a um desses documentos. Preser
 ## Verificação mínima
 
 ```bash
-make test
+make accept
 ```
 
-Quando agente ou avaliação realmente existirem, acrescente seus comandos ao `Makefile` e ao README.
+Use `make accept-live` somente com credenciais locais para repetir os smokes
+Groq/NIM e Slack. O comando não substitui os gates externos de produção.

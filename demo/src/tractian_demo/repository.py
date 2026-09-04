@@ -863,6 +863,14 @@ class DemoRepository:
             updated_at=_dt(row["updated_at"]),
         )
 
+    def get_outbox_for_decision(self, decision_id: str) -> OutboxEvent:
+        row = self.connection.execute(
+            "SELECT id FROM outbox_events WHERE decision_id=?", (decision_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError("NOTIFICATION_NOT_FOUND")
+        return self.get_outbox(row["id"])
+
     def finish_outbox(
         self,
         outbox_id: str,

@@ -4,7 +4,7 @@ Projeto individual de engenharia de agentes para atendimento industrial, desenvo
 
 O sistema recebe uma solicitação, investiga dados por APIs, explica sua decisão com evidências e executa somente ações permitidas. Uma central React local permite demonstrar o fluxo real, alternar personas simuladas e resolver pedidos humanos sem transformar a interface em fonte de autorização.
 
-> **Estado atual:** além do núcleo e da avaliação das Fases 1–12, 14 e 15, existem a fachada FastAPI `demo/`, filas SQLite, central React `frontend/`, decisões delegadas, outbox Slack MCP e fallback configurável Groq → NVIDIA NIM. As suítes locais usam doubles e não consomem credenciais. O smoke opt-in do Slack real foi comprovado nos dois canais em 04/09/2026. A calibração humana da Fase 13 continua adiada até uma pessoa especialista da TRACTIAN produzir os rótulos cegos. O benchmark atual revelou limitações de qualidade e o agente não é de produção.
+> **Estado atual:** a entrega técnica está completa: além do núcleo e da avaliação das Fases 1–12, 14 e 15, existem a fachada FastAPI `demo/`, filas SQLite, central React `frontend/`, decisões delegadas, outbox Slack MCP e fallback configurável Groq → NVIDIA NIM. As suítes locais usam doubles e não consomem credenciais. Em 04/09/2026, os smokes opt-in comprovaram o percurso dos dois canais Slack até decisão/retomada e o fallback Groq → NIM sob timeout controlado. A calibração humana da Fase 13 continua adiada até especialistas da TRACTIAN produzirem os rótulos cegos. O benchmark atual revelou limitações de qualidade; entrega técnica completa não significa agente pronto para produção.
 
 ## Problema
 
@@ -198,8 +198,8 @@ O smoke opt-in `make smoke-groq` compara `openai/gpt-oss-120b` e
 ausente nula. Por padrão há uma rodada por modelo e a estabilidade é declarada
 como `not_measured`; defina
 `GROQ_SMOKE_RUNS=2` ou maior para comparar as assinaturas dos contratos entre
-rodadas. Ele exige `GROQ_API_KEY` já disponível no ambiente, não lê `.env` e só
-imprime métricas agregadas seguras. Sem a chave, sai com código zero e
+rodadas. O alvo do Makefile carrega o `.env` local e o módulo recebe apenas o
+ambiente; ele só imprime métricas agregadas seguras. Sem a chave, sai com código zero e
 `status=skipped reason=missing_groq_api_key`, sem tocar a rede. No aceite desta
 entrega, o smoke ao vivo inicialmente ficou **skipped** porque a chave não
 estava disponível. Na verificação manual posterior, o 120b passou os dois
@@ -337,6 +337,7 @@ make setup   # instala API, agente, demo e frontend; gera os dados
 make up      # inicia a API em http://localhost:8000
 make demo    # inicia API, backend :8100, worker e frontend :5173
 make test    # pytest + Vitest + build TypeScript + Playwright
+make accept  # locks + segurança + todas as suítes + avaliação offline
 make eval    # 17 casos x 2 no fallback local; sem credenciais ou rede
 make eval-live EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada EVAL_PROVIDER=groq
 make eval-providers   # benchmark real Groq x NVIDIA NIM
@@ -344,7 +345,9 @@ make eval-judges EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
 make eval-label-template EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
 make eval-calibrate EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
 make eval-layers EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
-make smoke-slack      # opt-in: envia 1 aviso seguro em cada canal configurado
+make smoke-fallback   # opt-in: Groq + NIM + timeout controlado pelo roteador
+make smoke-slack-e2e  # opt-in: fila + Slack + REST + retomada nos dois perfis
+make accept-live      # aceite local completo + os dois smokes reais anteriores
 make logs    # acompanha os quatro processos locais
 make stop    # encerra API, backend, worker e frontend
 ```
@@ -355,7 +358,14 @@ O Swagger industrial fica em `http://localhost:8000/docs`, o Swagger da fachada 
 
 Crie ou reutilize uma Slack App interna, habilite o MCP e conclua OAuth com o escopo mínimo `chat:write`. Preencha somente no `.env` local `SLACK_MCP_ACCESS_TOKEN`, `SLACK_TRACTIAN_CHANNEL_ID` e `SLACK_AUTHORITY_CHANNEL_ID`. O endpoint usado é o oficial `https://mcp.slack.com/mcp`; o worker descobre a tool de envio no início da sessão. O Slack recebe apenas categoria, resumo sanitizado, IDs opacos e link. Aprovar ou rejeitar acontece exclusivamente na central.
 
-Enquanto essas três variáveis não estiverem configuradas e `make smoke-slack` não passar, a central mantém as decisões funcionais, mas informa `slack_configured=false` e não promete entrega externa. O smoke real de 04/09/2026 passou nos dois canais e confirmou um `message_ts` para cada envio. Em outro workspace, repita o comando. Depois do OAuth, revise os escopos concedidos e remova os que não forem necessários; esta integração usa somente `chat:write`.
+Enquanto essas três variáveis não estiverem configuradas e `make smoke-slack-e2e` não passar, a central mantém as decisões funcionais, mas informa `slack_configured=false` e não promete entrega externa. O smoke usa um SQLite temporário, cria pedidos sintéticos para TRACTIAN e autoridade, entrega os links reais, resolve pelo mesmo REST usado pela SPA e prova uma única retomada. Em 04/09/2026, ambos os canais devolveram `message_ts`, a persona errada recebeu `403`, o replay idempotente recebeu `200`, o conflito recebeu `409` e cada decisão gerou uma retomada concluída. O relatório sanitizado fica em `.run/smoke/slack-e2e.json`. Em outro workspace, repita o comando. Depois do OAuth, revise os escopos concedidos e remova os que não forem necessários; esta integração usa somente `chat:write`.
+
+`make smoke-fallback` faz uma sonda mínima real em cada provider e atravessa o
+roteador com um timeout injetado exclusivamente pelo smoke. A evidência fica em
+`.run/smoke/provider-fallback.json`; ela prova a classificação e a troca para
+NIM sem alegar uma queda espontânea da Groq. Erro de schema, protocolo, policy
+ou qualidade continua falhando sem fallback. `make accept-live` reúne o aceite
+local e os dois smokes; ele não executa o benchmark ao vivo de 34 casos.
 
 ## Desenvolvimento com uma IA copiloto
 
@@ -408,7 +418,7 @@ Prompt curto recomendado:
 - Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, revisão humana retomável, fluxos de escrita, checkpointer, telemetria manual Logfire opt-in e avaliação Pydantic Evals. O benchmark atual falha em qualidade/estabilidade e a calibração humana está adiada; portanto não é um agente de produção.
 - As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
 - O simulador não representa todas as garantias transacionais de produção.
-- A central usa identidades simuladas e execução local; não substitui autenticação, autorização distribuída ou implantação de produção. O transporte Slack real foi validado nos dois canais, mas o percurso completo frontend → fila → link → decisão → retomada ainda precisa de aceite externo ponta a ponta.
+- A central usa identidades simuladas e execução local; não substitui autenticação, autorização distribuída ou implantação de produção. O percurso fila → Slack real → link da central → decisão REST → retomada foi validado nos dois perfis com casos sintéticos; uma implantação pública ainda exigirá identidade corporativa e URL acessível fora da máquina local.
 - As rotas de ação do simulador devolvem recibos, mas não alteram os recursos Parquet; um novo GET não comprova a mutação solicitada.
 
 ## Autor
