@@ -1,0 +1,66 @@
+:root {
+  --font-heading: "Inter Tight", "Arial Narrow", sans-serif;
+  --font-body: "Inter", "Segoe UI", sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  --slate-50: #f8fafc;
+  --slate-100: #f1f5f9;
+  --slate-200: #e2e8f0;
+  --slate-300: #cbd5e1;
+  --slate-400: #94a3b8;
+  --slate-500: #64748b;
+  --slate-600: #475569;
+  --slate-700: #334155;
+  --slate-800: #1e293b;
+  --slate-900: #0f172a;
+  --slate-950: #020617;
+
+  --blue-50: #eff6ff;
+  --blue-100: #dbeafe;
+  --blue-200: #bfdbfe;
+  --blue-300: #93c5fd;
+  --blue-400: #60a5fa;
+  --blue-500: #3b82f6;
+  --blue-600: #2563eb;
+  --blue-700: #1d4ed8;
+  --blue-800: #1e40af;
+  --blue-900: #1e3a8a;
+  --blue-950: #172554;
+
+  --white: #ffffff;
+  --black: #000000;
+  --success: #22c55e;
+  --success-soft: #86efac;
+  --success-surface: #052e16;
+  --warning: #f59e0b;
+  --warning-soft: #fcd34d;
+  --warning-surface: #451a03;
+  --danger: #ef4444;
+  --danger-soft: #fca5a5;
+  --danger-surface: #450a0a;
+
+  --color-background: var(--slate-950);
+  --color-surface: var(--slate-900);
+  --color-surface-raised: var(--slate-800);
+  --color-surface-active: var(--blue-950);
+  --color-border: var(--slate-700);
+  --color-border-soft: var(--slate-800);
+  --color-text: var(--slate-50);
+  --color-text-muted: var(--slate-400);
+  --color-text-subtle: var(--slate-300);
+  --color-action: var(--blue-600);
+  --color-action-hover: var(--blue-500);
+  --color-focus: var(--blue-400);
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --content-width: 1060px;
+}

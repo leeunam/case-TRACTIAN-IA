@@ -1,16 +1,17 @@
 import { FormEvent, useEffect, useState } from "react";
 import { api } from "./api";
 import type { CaseDetail, CaseEvent, Decision, DemoCase, DemoConfig, Panel, Persona } from "./types";
+import tractianWordmark from "./assets/tractian-wordmark.svg";
 import "./styles.css";
 
-const navigation: { id: Panel; label: string; glyph: string }[] = [
-  { id: "chat", label: "Chat", glyph: "⌁" },
-  { id: "cases", label: "Casos", glyph: "▤" },
-  { id: "context", label: "Contexto", glyph: "◎" },
-  { id: "evidence", label: "Evidências", glyph: "◇" },
-  { id: "timeline", label: "Timeline", glyph: "↳" },
-  { id: "decisions", label: "Decisões", glyph: "✓" },
-  { id: "simulation", label: "Simulação", glyph: "⚙" },
+const navigation: { id: Panel; label: string }[] = [
+  { id: "chat", label: "Chat" },
+  { id: "cases", label: "Casos" },
+  { id: "context", label: "Contexto" },
+  { id: "evidence", label: "Evidências" },
+  { id: "timeline", label: "Timeline" },
+  { id: "decisions", label: "Decisões" },
+  { id: "simulation", label: "Simulação" },
 ];
 
 const profileLabel = { requester: "Solicitante", tractian: "Equipe TRACTIAN", authority: "Autoridade da empresa" };
@@ -70,6 +71,7 @@ export default function App() {
   const persona = personas.find((item) => item.id === personaId);
   const execution = detail?.executions.at(-1);
   const status = execution?.status ?? (detail?.case.immutable ? "modelo público" : "pronto");
+  const statusClass = status.replaceAll(" ", "-");
 
   async function selectCase(id: string) {
     setCaseId(id); setDetail(await api.case(id)); setEvents([]); setPanel("chat");
@@ -84,25 +86,25 @@ export default function App() {
 
   return <div className="app-shell">
     <header className="topbar">
-      <div className="brand"><span className="brand-mark">T</span><div><b>TRACTIAN</b><small>Case Intelligence</small></div></div>
-      <div className="case-heading"><span className="eyebrow">Caso ativo</span><strong>{detail?.case.ticket_id ?? "Selecione"}</strong><span className={`status status-${status}`}>{status.replace("_", " ")}</span></div>
-      <div className="provider"><span className="pulse" /> Groq principal <span>→ {config.fallback_provider} fallback</span></div>
-      <label className="persona">Persona
+      <div className="brand"><img src={tractianWordmark} alt="TRACTIAN" /></div>
+      <div className="case-heading"><span className="case-label">Caso ativo</span><strong>{detail?.case.ticket_id ?? "Selecione"}</strong><span className={`status status-${statusClass}`}>{status.replace("_", " ")}</span></div>
+      <div className="provider"><span className="pulse" aria-hidden="true" /><strong className="provider-primary">{config.primary_provider} principal</strong><span>{config.fallback_provider} em espera</span></div>
+      <label className="persona"><span>Persona</span>
         <select aria-label="Persona simulada" value={personaId} onChange={(event) => setPersonaId(event.target.value)}>
           {personas.map((item) => <option key={item.id} value={item.id}>{item.name} · {profileLabel[item.profile]}</option>)}
         </select>
       </label>
     </header>
-    <div className="demo-warning">{config.warning}</div>
+    <div className="demo-warning"><span aria-hidden="true">i</span>{config.warning}</div>
     <main className="workspace">
       <section className="content">
         {error && <div className="error" role="alert">{error}<button onClick={() => setError("")}>fechar</button></div>}
         {detail && <PanelContent panel={panel} detail={detail} persona={persona} personas={personas} cases={cases} events={events} decisions={decisions} onSelect={selectCase} onDuplicate={duplicate} onCreated={(created) => { setCases((old) => [created, ...old]); void selectCase(created.id); }} onRefresh={() => refreshCase(detail.case.id)} onDecisionsRefresh={refreshDecisions} onError={setError} />}
       </section>
       <nav className="right-rail" data-testid="right-menu" aria-label="Áreas da central">
-        <div className="rail-caption">Navegação</div>
-        {navigation.map((item) => <button key={item.id} className={panel === item.id ? "active" : ""} aria-label={item.label} onClick={() => setPanel(item.id)}><span>{item.glyph}</span>{item.label}</button>)}
-        <div className="rail-foot"><span className="pulse" /> Serviços locais</div>
+        <div className="rail-caption">Áreas</div>
+        {navigation.map((item) => <button key={item.id} className={panel === item.id ? "active" : ""} aria-label={item.label} aria-current={panel === item.id ? "page" : undefined} onClick={() => setPanel(item.id)}>{item.label}</button>)}
+        <div className="rail-foot"><span className="pulse" aria-hidden="true" /> Serviços locais</div>
       </nav>
     </main>
   </div>;
@@ -111,7 +113,7 @@ export default function App() {
 function PanelContent(props: { panel: Panel; detail: CaseDetail; persona?: Persona; personas: Persona[]; cases: DemoCase[]; events: CaseEvent[]; decisions: Decision[]; onSelect(id: string): void; onDuplicate(): void; onCreated(value: DemoCase): void; onRefresh(): void; onDecisionsRefresh(): Promise<void>; onError(message: string): void }) {
   const { panel, detail, persona } = props;
   if (panel === "chat") return <Chat detail={detail} persona={persona} onDuplicate={props.onDuplicate} onRefresh={props.onRefresh} onError={props.onError} />;
-  if (panel === "cases") return <Page title="Central de casos" subtitle="Casos públicos são modelos somente leitura; duplique ou personalize uma cópia."><NewCaseForm key={detail.case.id} base={detail.case} personas={props.personas} onCreated={props.onCreated} onError={props.onError} /><div className="case-grid">{props.cases.map((item) => <button className={`case-card ${item.id === detail.case.id ? "selected" : ""}`} key={item.id} onClick={() => props.onSelect(item.id)}><span>{item.immutable ? "Público" : "Minha simulação"}</span><b>{item.ticket_id}</b><p>{item.initial_message}</p><small>{item.asset_id}</small></button>)}</div></Page>;
+  if (panel === "cases") return <Page title="Central de casos" subtitle="Casos públicos são modelos somente leitura; duplique ou personalize uma cópia."><NewCaseForm key={detail.case.id} base={detail.case} personas={props.personas} onCreated={props.onCreated} onError={props.onError} /><div className="case-grid">{props.cases.map((item) => <button className={`case-card ${item.id === detail.case.id ? "selected" : ""}`} aria-pressed={item.id === detail.case.id} key={item.id} onClick={() => props.onSelect(item.id)}><span className="case-kind">{item.immutable ? "Público" : "Minha simulação"}</span><b>{item.ticket_id}</b><p>{item.initial_message}</p><small>{item.asset_id}</small></button>)}</div></Page>;
   if (panel === "context") return <Page title="Contexto do caso" subtitle="Escopo confiável usado pelo agente."><dl className="facts"><div><dt>Empresa</dt><dd>{detail.case.company_id}</dd></div><div><dt>Solicitante original</dt><dd>{detail.case.requester_id}</dd></div><div><dt>Ativo central</dt><dd>{detail.case.asset_id}</dd></div><div><dt>Thread</dt><dd>{detail.case.id}</dd></div></dl></Page>;
   if (panel === "evidence") {
     const tools = [...props.events].reverse().find((item) => item.kind === "tools.completed")?.payload.tool_names as string[] | undefined;
@@ -146,8 +148,8 @@ function Chat({ detail, persona, onDuplicate, onRefresh, onError }: { detail: Ca
 
 function Decisions({ persona, decisions, onResolved, onError }: { persona?: Persona; decisions: Decision[]; onResolved(): Promise<void>; onError(message: string): void }) {
   const label = persona ? profileLabel[persona.profile] : "Persona";
-  return <Page title="Decisões pendentes" subtitle={`${label}: a permissão é validada novamente no backend.`}>{decisions.length ? decisions.map((item) => <article className="decision" key={item.id}><span>{item.kind}</span><h3>{item.summary}</h3><p>Expira em {new Date(item.expires_at).toLocaleString()}</p><div>{item.allowed_operations.map((operation) => <button key={operation} onClick={() => api.resolve(item.id, persona!.id, operation as "approve" | "reject").then(onResolved).catch((reason: Error) => onError(reason.message))}>{operation === "approve" ? "Aprovar" : "Rejeitar"}</button>)}</div></article>) : <div className="locked"><b>🔒 Sem decisões permitidas para esta persona</b><p>Solicitantes, equipe TRACTIAN e autoridade da empresa enxergam caixas diferentes.</p></div>}</Page>;
+  return <Page title="Decisões pendentes" subtitle={`${label}: a permissão é validada novamente no backend.`}>{decisions.length ? decisions.map((item) => <article className="decision" key={item.id}><span>{item.kind}</span><h3>{item.summary}</h3><p>Expira em {new Date(item.expires_at).toLocaleString()}</p><div className="decision-actions">{item.allowed_operations.map((operation) => <button className={`decision-${operation}`} key={operation} onClick={() => api.resolve(item.id, persona!.id, operation as "approve" | "reject").then(onResolved).catch((reason: Error) => onError(reason.message))}>{operation === "approve" ? "Aprovar" : "Rejeitar"}</button>)}</div></article>) : <div className="locked"><b>Sem decisões permitidas para esta persona</b><p>Solicitantes, equipe TRACTIAN e autoridade da empresa enxergam caixas diferentes.</p></div>}</Page>;
 }
 
-function Page({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) { return <div className="page"><div className="page-title"><span className="eyebrow">Case workspace</span><h1>{title}</h1><p>{subtitle}</p></div>{children}</div>; }
-function Empty({ text }: { text: string }) { return <div className="empty"><span>◇</span><p>{text}</p></div>; }
+function Page({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) { return <div className="page"><div className="page-title"><h1>{title}</h1><p>{subtitle}</p></div>{children}</div>; }
+function Empty({ text }: { text: string }) { return <div className="empty"><span aria-hidden="true">◇</span><p>{text}</p></div>; }
