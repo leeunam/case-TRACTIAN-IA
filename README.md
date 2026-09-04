@@ -1,430 +1,256 @@
 # Agente industrial TRACTIAN × Inteli
 
-Projeto individual de engenharia de agentes para atendimento industrial, desenvolvido por [Leunam Sousa de Jesus](https://www.linkedin.com/in/leunam).
+Projeto individual de engenharia de agentes para atendimento industrial,
+desenvolvido por [Leunam Sousa de Jesus](https://www.linkedin.com/in/leunam).
 
-O sistema recebe uma solicitação, investiga dados por APIs, explica sua decisão com evidências e executa somente ações permitidas. Uma central React local permite demonstrar o fluxo real, alternar personas simuladas e resolver pedidos humanos sem transformar a interface em fonte de autorização.
+O sistema recebe um caso, consulta dados industriais por APIs, organiza as
+evidências e produz uma orientação ou propõe uma ação. Escritas só atravessam
+fronteiras determinísticas de identidade, permissão, confirmação,
+idempotência e segurança. Uma central React permite experimentar o fluxo com
+casos e pessoas simuladas.
 
-> **Estado atual:** a entrega técnica está completa: além do núcleo e da avaliação das Fases 1–12, 14 e 15, existem a fachada FastAPI `demo/`, filas SQLite, central React `frontend/`, decisões delegadas, outbox Slack MCP e fallback configurável Groq → NVIDIA NIM. As suítes locais usam doubles e não consomem credenciais. Em 04/09/2026, os smokes opt-in comprovaram o percurso dos dois canais Slack até decisão/retomada e o fallback Groq → NIM sob timeout controlado. A calibração humana da Fase 13 continua adiada até especialistas da TRACTIAN produzirem os rótulos cegos. O benchmark atual revelou limitações de qualidade; entrega técnica completa não significa agente pronto para produção.
+## Escopo e estado atual
 
-## Problema
+A entrega técnica está completa e reproduzível localmente. Ela inclui:
 
-O agente atende três tipos de solicitação:
+- simulador industrial FastAPI com dados sintéticos;
+- agente LangGraph com planner, tools e writer;
+- ledger de evidências e porta determinística de segurança;
+- cinco fluxos de escrita com confirmação, autorização e idempotência;
+- revisão humana persistente e retomável;
+- adapters para Groq e NVIDIA NIM, com fallback por disponibilidade;
+- avaliação offline com checks programáticos e juízes separados;
+- central React, filas SQLite e notificações pelo MCP oficial do Slack;
+- testes de API, agente, backend, frontend, navegador e smokes reais opt-in.
 
-- **Contextualizar:** consultar conhecimento e explicar de forma responsável;
-- **Investigar:** consultar ativos, análises e dados técnicos para recomendar próximos passos;
-- **Executar:** propor ou realizar uma ação permitida, ou encaminhar para revisão humana.
+Isso não significa que o agente esteja pronto para produção. O benchmark ao
+vivo mais recente teve 33 `model_failure` em 34 execuções e nenhuma execução
+passou o conjunto integral. Também faltam 20–30 rótulos cegos de especialistas
+da TRACTIAN para calibrar os juízes. O pipeline detecta e registra essas
+limitações em vez de convertê-las em aprovação.
 
-Se faltarem evidências, houver conflito ou a ação ultrapassar a permissão do usuário, o agente não inventa uma conclusão. Ele solicita dados, confirmação ou revisão humana.
+## O core em um minuto
 
-## Arquitetura atual e evolução planejada
+1. A fronteira de entrada valida caso, empresa, pessoa e identificadores.
+2. O planner escolhe consultar uma tool, pedir informação, propor uma ação ou
+   encerrar.
+3. As tools consultam a API e devolvem observações tipadas.
+4. O ledger registra fatos, fontes, conflitos e lacunas no estado.
+5. O writer redige somente com a decisão e as referências permitidas.
+6. A porta de segurança revalida evidências, permissões e intenções em código.
+7. Se necessário, o fluxo pausa para confirmação, autorização ou revisão e
+   retoma do checkpoint sem repetir efeitos.
 
-```mermaid
-flowchart TD
-    UI[Central React + persona simulada] --> DEMO[Backend demo + filas SQLite]
-    DEMO --> A[Solicitação + identidade]
-    A --> B[Fronteira de entrada do agente]
-    B --> C[Estado persistente do LangGraph]
-    C --> D[Planner: decide o próximo passo]
-    D --> E[Tools com validação em código]
-    E --> F[API industrial]
-    F --> G[Normalização e ledger de evidências]
-    G --> D
-    D --> H[Writer: redige com base no ledger]
-    H --> I[Gate determinístico de segurança]
-    I --> J[Resposta ou pedido seguro]
-    I --> L[Revisão humana retomável]
-    L --> I
-    I --> Q[Decisão humana no frontend]
-    Q --> L
-    Q -. link de notificação .-> S[Slack MCP oficial]
-    C -. traces e métricas .-> K[Logfire]
-```
+Planner e writer são dois papéis de LLM dentro de um único agente lógico. O
+planner decide o caminho; o writer não pode alterar essa decisão. LangGraph
+controla estado e transições, enquanto regras críticas permanecem em Python.
 
-Existe **um agente lógico com dois papéis de LLM**:
-
-1. o **planner** escolhe entre investigar, pedir informação, propor uma ação ou encerrar;
-2. o **writer** recebe somente a decisão e as evidências necessárias para produzir a resposta.
-
-Essa separação reduz contexto, facilita testes e impede que a redação altere silenciosamente a decisão. LangGraph controla estado, nós, transições, interrupções e retomadas. Código determinístico continua responsável por identidade, permissão, argumentos, justificativa, idempotência e liberação da resposta.
-
-No MVP, planner e writer podem usar o mesmo modelo com prompts e contratos diferentes. A separação é de responsabilidade, não uma obrigação de contratar dois modelos.
-
-O writer usa o prompt `writer-v1`, não recebe tools e devolve somente um draft
-estruturado com a decisão imutável, IDs ordenados e próximo passo enumerado. Seu
-contexto usa um orçamento total de 64 referências e somente IDs e categorias
-fechadas: alvos, valores, timestamps e caminhos técnicos permanecem no ledger.
-O gate deriva a decisão e o alvo da ação da request confiável, da proposal, da
-intenção, da aprovação e do recibo atuais; recompõe IDs e conflitos e exige
-`read` sempre que o draft cita um fato de tool. Apenas um atestado `release`
-permite ao renderer buscar os valores no ledger; a mensagem técnica não vem do
-modelo e é revalidada ao restaurar o checkpoint. Uma saída de formato inválido
-admite somente um repair; contador, âncora e próximo nó impedem uma terceira
-chamada. Duas falhas, erro de provider ou qualquer incerteza terminam em aviso
-sanitizado ou, quando aplicável, revisão humana.
-
-A revisão humana é uma fronteira persistente e retomável: o pedido sanitizado é
-gravado antes da interrupção e a identidade da pessoa revisora chega separada da
-resposta. A aprovação só remove o motivo fechado `HUMAN_DISPOSITION_REQUIRED`
-de um draft `GUIDE` que já passou pelas demais verificações e pediu disposição
-humana como próximo passo; ela nunca transforma a decisão explícita
-`REQUIRE_HUMAN_REVIEW` do planner em orientação. Edição limita-se à seleção e à
-ordem das evidências atuais e ao próximo passo enumerado, e só é oferecida para
-`HUMAN_DISPOSITION_REQUIRED`, `WRITER_FAILURE`,
-`EVIDENCE_REFERENCE_MISMATCH` ou `NEXT_STEP_MISMATCH`; demais motivos aceitam
-somente rejeição. Para `ACT` e `ESCALATE`, a seleção revisada precisa preservar
-o fato `accepted` do recibo ligado à intenção atual. Toda retomada revalida
-ledger, permissões e intenções; bloqueios duros, rejeição, expiração ou uma
-segunda necessidade de revisão encerram de forma segura, sem executar ação.
-O ID da revisão inclui o escopo do thread; contratos rejeitam coerções Python e
-o envelope confiável de autoria, empresa, permissão, horário e reply fica ligado
-à auditoria. Perda da permissão `read` não impede o fechamento interno seguro,
-mas bloqueia qualquer retorno público do estado técnico, inclusive em replay.
-O orçamento reserva o interrupt e o segundo gate antes de iniciar caminhos
-revisáveis; checkpoints legados sem essa reserva terminam por contrato próprio.
-No vencimento, a expiração precede a semântica da operação; uma nova solicitação
-encerra primeiro a revisão vencida, sem reexecutar trabalho antigo. Antes de
-qualquer mutação do checkpoint, a fronteira vincula novamente thread, caso,
-empresa, pessoa, alvo central, modelo configurado, request e execução ao escopo
-persistido, mesmo quando a request não declarou ativo. O gate-base original
-permanece imutável durante drift de permissão; um contrato estrito derivado
-distingue a continuação anterior ao julgamento daquela posterior à auditoria e
-é removido depois do segundo gate.
-
-O **ledger de evidências** associa fatos às fontes consultadas no estado da execução. Ele recebe somente observações de leitura validadas e recibos tipados de intenções terminais; texto livre de LLM, proposals e mensagens de recibo não viram fatos. A telemetria Logfire serve apenas à consulta humana e à operação; não é o banco principal do ledger nem uma fonte consultada pelo agente.
-
-### Observabilidade manual e opt-in
-
-`build_agent_graph(..., telemetry=...)` recebe uma fachada injetável. Sem
-configuração explícita, `NullTelemetry` é usada e não importa nem configura o
-SDK. `invoke_agent` mantém o retorno histórico `AgentState`, enquanto
-`invoke_agent_observed` devolve esse mesmo estado com um `trace_id` opaco no
-envelope. O ID técnico nunca entra no estado, no resultado final ou no SQLite.
-
-A exportação requer simultaneamente:
-
-- `TRACTIAN_LOGFIRE_ENABLED=true`, exatamente em minúsculas;
-- um único `LOGFIRE_TOKEN`, sem espaços ou vírgulas e com até 4 KiB;
-- `TRACTIAN_LOGFIRE_PSEUDONYM_KEY` com 32 bytes a 4 KiB em UTF-8.
-
-Ausência ou formato local inválido mantém a fachada nula antes de carregar o
-SDK. Os três valores são copiados uma única vez e a configuração usa exatamente
-esse snapshot, inclusive quando a origem é um `Mapping` mutável. Revogação
-remota do token não pode ser validada offline. O SDK é configurado uma vez na
-construção e somente spans manuais são permitidos. Antes de importar qualquer
-modelo, o pacote acrescenta `logfire-plugin` a `PYDANTIC_DISABLE_PLUGINS`
-(preservando plugins existentes e os sentinelas globais), de modo que
-LangChain/LangGraph, HTTPX, FastAPI e Pydantic não sejam auto-instrumentados.
-
-Os nomes exportáveis são fixos: `tractian.agent.request`, `node`, `planner`,
-`writer`, `tool`, `policy`, `action`, `gate`, `review`, `response` e
-`evaluation`, todos sob o prefixo `tractian.agent.`. Atributos aceitam apenas
-versão, enums/flags/contadores fechados, nomes de catálogo, `trace_id` e
-referências HMAC. IDs literais, mensagens, argumentos, retornos, evidências,
-targets, URLs, payloads, segredos e exceções não entram na telemetria. Métricas
-usam somente `stage`, `outcome`, `error_code`, `planner_enabled` e `replayed`;
-nenhum ID é label. O runtime emite zero spans de avaliação; o runner offline da
-Fase 11 pode usar a operação tipada somente na fronteira de avaliação.
-
-O span `action` começa somente quando um `POST` ou `PATCH` modificador é
-despachado. Leituras de preflight não criam tentativa, e uma nova tentativa só
-existe se um novo modificador alcançar o transporte. Falhas da fachada, do SDK,
-de spans ou de métricas são isoladas inclusive quando levantam `BaseException`;
-cancelamentos e exceções originados pelo negócio continuam sendo propagados com
-a mesma identidade e traceback.
-
-A retenção inicial de 30 dias e os limites de volume/cardinalidade são controles
-operacionais externos da conta Logfire: devem ser configurados e monitorados
-fora deste runtime. O código limita token/chave, contratos e labels, mas não
-afirma controlar retenção do backend. Rotacionar a chave quebra deliberadamente
-a correlação histórica dos pseudônimos.
-
-O aceite integrado percorreu consulta completa, ledger, writer e gate; leituras
-parciais, conflitantes, obsoletas e com falha; revisão humana após reabertura do
-SQLite; cinco escritas, retry e replay; e exportação real em memória pelo SDK.
-Subprocessos limpos provaram que o caminho padrão não carrega o Logfire nem o
-plugin Pydantic. O span de resposta registra somente a decisão fechada e o
-resultado operacional. A matriz focada passou com 71 testes, os fluxos de
-escrita com 235 e `make test` com 99 testes da API e 1.759 do agente. O único
-warning é a depreciação pendente já conhecida de `python_multipart` no Starlette.
-
-### Persistência e idempotência
-
-Há dois armazenamentos SQLite independentes no desenvolvimento. A API usa `IDEMPOTENCY_DB_PATH` (padrão `.run/idempotency.sqlite3`) para a idempotência de reprocesso; `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS` altera seu limite de processamento, cujo padrão é 300 segundos. O grafo usa `.run/agent-checkpoints.sqlite3` por `AsyncSqliteSaver`, com serializer restrito e sem remoção automática de threads; a exclusão é explícita. PostgreSQL continua sendo a evolução futura, não uma implementação atual.
-
-- `thread_id` identifica a linha persistida; um thread pode receber novos `request_id`, e cada execução ou retomada recebe novo `execution_id`. Mudança de caso, empresa, pessoa usuária ou alvo confiável falha fechada.
-- A intenção persistida registra ID, request, escopo imutável, hash, decisão/status, origem da aprovação autorizadora, tentativas, execução preparadora e recibo ou erro; runtime, cliente, credenciais, seed, golden set, resposta HTTP bruta e raciocínio não entram no checkpoint.
-- O estado persiste somente os três alvos confiáveis necessários à escrita — ativo central, caso atual e modelo industrial configurado — e os vincula novamente à request, à intenção e ao atestado; esse contexto nunca é enviado ao writer.
-- A assinatura estrutural da intenção inclui ação, alvo canônico, parâmetros materiais e justificativa, e o runtime precisa coincidir com o contexto persistido em cada retomada. Esse hash detecta divergência, mas não é um MAC nem prova autenticidade contra alguém com escrita arbitrária no SQLite e capacidade de recalcular todo o checkpoint; por isso o banco de checkpoints permanece uma fronteira confiável e deve ter acesso controlado.
-- Criação e retomada que podem escrever usam `durability="sync"`; `prepare_intent` fica em superstep distinto e é persistido antes de `execute_action`. Confirmações usam `interrupt()` estruturado e `Command` pelo ID na fronteira confiável.
-- O primeiro alvo de idempotência é `POST /analyses/{analysisId}/reprocess`.
-- A API exige uma `Idempotency-Key` de 1 a 255 caracteres sem espaços, reserva a intenção antes da ação, persiste respostas concluídas em SQLite e faz replay mesmo após recriar o armazenamento; mesma chave com payload diferente retorna `409 Conflict`.
-- O fluxo determinístico de reprocesso cria `tractian-agent:<uuid>` uma única vez após `allow`, persiste-a antes do HTTP e a reutiliza somente em, no máximo, um retry com o mesmo corpo. Cliente, proposal tools e operações não criam retries.
-- A reserva é atômica: enquanto a primeira chamada está em execução, uma chamada concorrente com a mesma intenção recebe `409 IDEMPOTENCY_IN_PROGRESS` e não cria outra ação. Uma falha inesperada durante a ação marca o resultado como `uncertain`; retries recebem `409 IDEMPOTENCY_OUTCOME_UNKNOWN` em vez de repetir a ação.
-- Um registro `processing` com mais de 300 segundos, ou o limite definido em `IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS`, muda para `uncertain` sem repetir a ação.
-- Registros vencidos são removidos sob demanda depois de 7 dias; a mesma chave, após esse prazo, inicia uma nova execução. O horário de criação identifica cada geração e impede que um trabalho antigo altere a reserva nova.
-- Se a resposta se perde depois do commit, o retry recupera a resposta persistida sem repetir a ação.
-- Especialista, criticidade, retreinamento e escalonamento não usam chave nem retry automático: têm no máximo um despacho. Em retomada de uma intenção `prepared` por outro `execution_id`, terminam conservadoramente em `uncertain/0` sem tocar a rede, antes de revalidar escopo, política ou preflight; somente a transição exata `prepare_intent → execute_action` recebe essa exceção na fronteira, mesmo se ativo, caso ou modelo do runtime mudaram. Isso pode produzir falso incerto e `attempts` pode subcontar um crash pós-efeito; o lock por `thread_id` é local ao processo/event loop e o preflight do especialista é opaco.
-- No grafo com planner, esse único terminal de retomada é derivado do shape estrutural completo — ação não idempotente, intenção `uncertain/0` preparada por outra execução, sem recibo e com âncora `execute_action` — e exige erro `NON_IDEMPOTENT_OUTCOME_UNKNOWN_AFTER_RESUME` e resultado final canônicos. Somente ele segue diretamente para `END`, com mensagem determinística e sem writer/gate; qualquer outro erro ou resultado continua no writer e na porta de segurança.
-- A API aplica uma segunda barreira de empresa nas ações ligadas a ativo, análise e chamado. Os cinco endpoints de ação retornam recibos sem reescrever os fixtures; o PATCH aceita somente o formulário técnico documentado e falha fechado para campos, tipos ou valores inválidos.
-- O processo da API abre somente uma allowlist de Parquets operacionais e lê chamados do pacote público sanitizado em `agent-input/`. O `data/cases.parquet`, o gabarito em `eval/` e os cenários de teste não entram no runtime.
-
-### Modelos
-
-`ModelProvider` é a interface comum para construir `BaseChatModel` a partir do
-`ModelConfig` estrito. O adapter inicial é `GroqModelProvider`; a configuração
-live `evaluation-experiment-v5` usa `openai/gpt-oss-20b`, temperatura zero,
-timeout de 30 segundos e no máximo 512 tokens. O adapter continua sem retry por
-padrão. Somente o experimento live congela e registra três retries de transporte,
-duas repetições do erro sanitizado `output_parse_failed` e pacing compartilhado
-de 20 segundos entre planner e writer. O planner usa `bind_tools` para uma escolha por
-turno e uma chamada Pydantic separada para encerrar. No adapter Groq, essa
-finalização usa o JSON Schema nativo estrito (`method="json_schema"`,
-`strict=True`); a correção evita o `tool_use_failed` observado quando o default
-`function_calling` criava uma tool sintética que GPT-OSS podia não chamar. Para
-schemas Pydantic, o adapter valida diretamente o texto JSON com
-`model_validate_json`: valores de Enum mantêm a semântica do wire JSON, enquanto
-os validators e as regras de coerência do contrato continuam falhando fechados.
-O planner e seu contrato permanecem independentes desse detalhe de transporte.
-O modelo, credenciais e respostas brutas não entram no estado. IDs persistidos
-de tool call são derivados pelo runtime de `request_id` e do ordinal, nunca do
-ID externo do provider. O adapter NVIDIA NIM usa a API OpenAI-compatible, aceita
-o endpoint hospedado oficial ou um NIM local e mantém `max_retries=0`. O writer
-pode usar outro modelo sem mudar as regras de negócio ou o gate determinístico.
-
-O smoke opt-in `make smoke-groq` compara `openai/gpt-oss-120b` e
-`openai/gpt-oss-20b` com dados sintéticos, sem retry e com o mesmo orçamento de
-512 tokens da configuração inicial. A finalização usa o contrato real
-`PlannerTerminalDecision` e exige `guide`, `sufficient_evidence` e informação
-ausente nula. Por padrão há uma rodada por modelo e a estabilidade é declarada
-como `not_measured`; defina
-`GROQ_SMOKE_RUNS=2` ou maior para comparar as assinaturas dos contratos entre
-rodadas. O alvo do Makefile carrega o `.env` local e o módulo recebe apenas o
-ambiente; ele só imprime métricas agregadas seguras. Sem a chave, sai com código zero e
-`status=skipped reason=missing_groq_api_key`, sem tocar a rede. No aceite desta
-entrega, o smoke ao vivo inicialmente ficou **skipped** porque a chave não
-estava disponível. Na verificação manual posterior, o 120b passou os dois
-contratos; o 20b passou a seleção e falhou na finalização com o orçamento antigo
-de 128 tokens. Um probe isolado confirmou `json_validate_failed` em 128 e
-conclusão válida em 512, com `finish_reason=stop`, 171 tokens de saída, 150 deles
-de raciocínio e Pydantic válido. Depois da correção de orçamento e parser, a
-repetição completa aprovou ambos os modelos com português, tool, argumentos e
-Pydantic válidos em duas chamadas. Como houve somente uma rodada, a estabilidade
-permanece corretamente `not_measured`; as latências observadas não constituem
-benchmark para escolher o modelo.
-
-## Avaliação offline
-
-Avaliação não participa do atendimento ao cliente nem provoca retries automáticos no runtime.
+## Arquitetura
 
 ```mermaid
 flowchart LR
-    A[Casos de benchmark] --> B[Pydantic Evals]
-    B --> C[Executa o agente]
-    C --> D[Checks programáticos]
-    C --> E[Juiz cego do resultado]
-    C --> F[Juiz da trajetória]
-    G[Golden set oculto] --> D
-    G --> E
-    G --> F
-    H[Rótulos humanos] --> I[Calibração]
-    D --> I
-    E --> I
-    F --> I
+    UI[Central React] --> DEMO[Backend demo e filas SQLite]
+    DEMO --> AGENT[Agente LangGraph]
+    AGENT --> PLAN[Planner]
+    PLAN --> TOOLS[Tools tipadas]
+    TOOLS --> API[API industrial simulada]
+    TOOLS --> LEDGER[Ledger de evidências]
+    LEDGER --> PLAN
+    PLAN --> WRITER[Writer]
+    WRITER --> GATE[Porta de segurança]
+    GATE --> ANSWER[Resposta]
+    GATE --> HUMAN[Decisão humana]
+    HUMAN --> GATE
+    DEMO --> OUTBOX[Outbox]
+    OUTBOX -. link .-> SLACK[Slack MCP]
+    AGENT -. métricas seguras .-> LOGFIRE[Logfire opt-in]
 ```
 
-- **Checks programáticos:** contratos, tools, argumentos, permissões, erros e regras críticas.
-- **Juiz do resultado:** relevância, fidelidade às evidências, honestidade, decisão, clareza e tom.
-- **Juiz da trajetória:** escolha e ordem das tools, falhas, repetições e momento de parada.
-- **Humano:** uma pessoa especialista cria 20–30 rótulos cegos e permite medir concordância, falsos aprovados e falsos reprovados.
+| Componente | Por que existe |
+|---|---|
+| `api/` | Simula o produto industrial e oferece contratos HTTP reproduzíveis. |
+| `agent/` | Mantém o grafo, contratos, tools, política, ledger, writer e avaliação. |
+| `demo/` | Separa a experiência da API industrial e hospeda filas, decisões e workers. |
+| `frontend/` | Permite conversar, trocar pessoas simuladas e responder decisões. |
+| Pydantic | Rejeita coerções e payloads fora dos contratos esperados. |
+| LangGraph | Persiste o estado e torna interrupções e retomadas explícitas. |
+| SQLite | Fornece checkpoints, idempotência e filas locais sem infraestrutura externa. |
+| Pydantic Evals | Organiza execuções offline, checks, juízes e artefatos versionados. |
+| Logfire | Recebe somente traces manuais e sanitizados quando habilitado. |
 
-O runner executa primeiro as entradas públicas e somente depois carrega
-`eval/expected-paths.json`. Os relatórios registram configuração, hashes dos
-arquivos, revisão do Git, versões de prompts/rubricas/modelos e dependências.
-Cada rodada usa um checkpointer SQLite transitório e isolado; repetir o comando
-no mesmo diretório não reutiliza estado do grafo nem altera os IDs observados.
-Os checks cobrem formato, decisão, tools, argumentos, IDs, trajetória,
-permissões, justificativa, erros e limite de passos. Os dois juízes são offline:
-o juiz cego nunca recebe chamadas; o juiz de trajetória recebe apenas chamadas
-e falhas já concluídas. Suas notas nunca retornam ao grafo.
+### Evidência e segurança
 
-O experimento real `tractian-eval-v1` executado em 03/09/2026 usou 17 casos,
-duas repetições, Groq `openai/gpt-oss-20b` no agente e limite de 24 passos. As
-34 execuções respeitaram formato, argumentos, IDs, permissões, justificativa,
-tratamento de erro e orçamento, mas nenhuma passou o conjunto completo: 33
-terminaram em revisão segura por `model_failure`, apenas uma passou a dimensão
-de decisão e nenhuma reproduziu a trajetória esperada. Isso é evidência de que
-o pipeline detecta regressões, não de qualidade do agente.
+O ledger aceita observações validadas de leitura e recibos tipados de ações. A
+resposta só pode citar fatos liberados pela porta de segurança. Texto livre de
+LLM, prompts, respostas brutas e notas dos juízes não viram evidência.
 
-Uma auditoria de estabilização posterior executou ainda `tractian-eval-v2`,
-`v3`, `v4` e uma nova rodada armazenada em `tractian-eval-v6` (o identificador
-versionado interno continua `tractian-eval-v5`). Ela comprovou chamadas reais do planner e do writer, corrigiu
-repetição de busca, finalização no teto de tools, parsing malformado e isolamento
-de pacing. Também demonstrou um limite externo: cada modelo do plano gratuito
-da Groq tem 200 mil tokens/dia, insuficientes para concluir no mesmo período as
-34 trajetórias longas com todas as chamadas. As rodadas terminaram com falhas de
-cota e **não** são evidência de 34/34 fluxos aprovados. A configuração `v5`
-restaura o GPT-OSS 20B suportado e reproduz o controle de cota. A rodada mais
-recente produziu 34 execuções: 33 registraram `model_failure`, 2 passaram a
-dimensão de decisão e nenhuma passou a trajetória ou o conjunto integral. O
-perfil local, os checks e os testes não dependem dessa cota.
+Consultas são autônomas. Escritas exigem um pedido explícito e, conforme risco
+e permissão, confirmação da pessoa solicitante ou autorização de uma pessoa
+com cargo compatível. O estado persiste a intenção antes do HTTP. Reprocesso
+usa chave idempotente; as outras ações têm no máximo um despacho automático e
+terminam como `uncertain` quando o efeito remoto é ambíguo.
 
-Os juízes Groq `openai/gpt-oss-120b`, rubricas `v2`, JSON mode validado por
-Pydantic e pacing de dez segundos avaliaram os mesmos 34 runs. Nenhuma saída
-foi aprovada em `0.7`, `0.8` ou `0.9`; todos os 17 pares de repetição foram
-instáveis. Checks + juízes não acrescentaram rejeições porque os checks já
-haviam rejeitado os 34 runs. As 68 chamadas acumularam 468,4 s de latência do
-provider, além do pacing. O custo ficou indisponível porque não há tarifa
-versionada na configuração.
+O runtime nunca recebe o golden set, as trajetórias esperadas nem os dados
+privados da avaliação. Credenciais, payloads, targets e respostas de modelo não
+são enviados ao Logfire nem expostos ao frontend.
 
-Os limiares `0.7`, `0.8` e `0.9` são reaplicados aos mesmos scores. Nenhum foi
-escolhido: o autor não é especialista industrial da TRACTIAN e rotular por
-suposição contaminaria o golden set. A Fase 13 está, portanto, **skipped por
-ausência de avaliador de domínio**. Quando a equipe TRACTIAN estiver disponível:
+### Providers e fallback
 
-1. rode `make eval-label-template EVAL_OUTPUT_DIR=<rodada>`;
-2. leia `blind-review-packet.json` sem abrir `judge-report.json` ou
-   `judge-scores.json`;
-3. preencha os 20–30 campos `approved` e `reason` em `human-labels.json`;
-4. rode `make eval-calibrate EVAL_OUTPUT_DIR=<rodada>`;
-5. registre concordância bruta, Cohen's kappa, falsos aprovados/reprovados e o
-   limiar justificado pelos erros observados.
+`ModelProvider` oferece a mesma interface para Groq e NVIDIA NIM. A configuração
+inicial usa Groq como principal e NIM como fallback; a ordem pode ser alterada
+por ambiente.
 
-Como haverá inicialmente uma única pessoa avaliadora, Cohen's kappa medirá
-humano × juiz e não concordância entre especialistas. Krippendorff alpha fica
-fora desta entrega.
+Fallback ocorre somente para `timeout`, erro de rede, `429` ou `5xx`. Erro de
+schema, parsing, policy, gate ou qualidade não é mascarado por outro provider.
+O smoke real sonda os dois providers e injeta um timeout exclusivamente na
+fronteira de teste para comprovar o roteamento de forma determinística.
 
-O golden set nunca entra no runtime e não é consultado por RAG. Ele é visível apenas aos avaliadores depois que a execução termina.
+### Decisões humanas e Slack
 
-## Tecnologias
+Revisão técnica da equipe TRACTIAN e autorização da empresa são públicos
+distintos. O backend resolve novamente a pessoa simulada, empresa e permissão;
+o navegador nunca envia uma lista de permissões confiável.
 
-| Responsabilidade | Tecnologia | Motivo |
-|---|---|---|
-| API simulada | FastAPI | Contrato HTTP e testes rápidos |
-| Central de casos | React + TypeScript + Vite | Demonstração local com menu dinâmico e personas |
-| Fachada e filas | FastAPI + SQLite | Persistência, SSE, decisões e outbox sem acoplar a API industrial |
-| Orquestração | LangGraph + LangChain | Estado, ciclos, tools e retomada |
-| Contratos | Pydantic | Tipagem e validação explícitas |
-| Cliente HTTP | httpx | Chamadas assíncronas e testáveis |
-| Modelos | Groq e NVIDIA NIM | Troca por adapter e benchmark comum |
-| Persistência | SQLite; PostgreSQL futuro | Simplicidade local e caminho de escala |
-| Observabilidade | Pydantic Logfire | Traces e investigação sem criar dashboard |
-| Testes | pytest, Vitest e Playwright | Unidade, integração, concorrência, build e navegador real |
-| Avaliação | Pydantic Evals | Casos, avaliadores e experimentos tipados |
+O pedido de decisão e o evento de outbox são gravados juntos. O Slack recebe
+somente categoria, resumo sanitizado, IDs opacos e um link para a central. A
+aprovação acontece no frontend, não no Slack. Falha remota ambígua fica
+`uncertain` e não provoca reenvio automático.
 
-Na repetição mais recente do benchmark versionado, com dois runs por papel e
-`openai/gpt-oss-20b`, Groq
-passou português, tool calling, saída estruturada e estabilidade no planner e
-writer. NVIDIA NIM passou o writer, mas falhou a saída estruturada/estabilidade
-do planner. A latência total observada foi 1,574 s/1,002 s para planner/writer
-na Groq e 5,422 s/19,437 s na NVIDIA. Groq é a recomendação sob essas condições;
-o custo não foi comparado por ausência de tarifa congelada.
+## Executar localmente
 
-LangSmith e Phoenix não foram adicionados: Pydantic Evals já organiza o
-benchmark e Logfire já cobre observabilidade, enquanto uma terceira plataforma
-duplicaria coleta e aumentaria a superfície de exposição de traces. Phoenix
-pode ser reconsiderado se surgir necessidade de uma UI self-hosted; LangSmith,
-se o projeto adotar operacionalmente a plataforma LangChain. `promptfoo` só
-entra quando comparações recorrentes justificarem outra ferramenta. `Ragas` só
-entra se existir um pipeline RAG real.
+Requisitos:
 
-## Executar o que já existe
+- Python 3.10 ou superior;
+- Node.js 20 ou superior;
+- Chrome ou Chromium;
+- [`uv`](https://docs.astral.sh/uv/).
 
-Requisitos: Python 3.10 ou superior, Node.js 20+, Chrome e [`uv`](https://docs.astral.sh/uv/).
+Prepare o ambiente:
 
 ```bash
-cp .env.example .env  # preencha somente credenciais que pretende usar
-make setup   # instala API, agente, demo e frontend; gera os dados
-make up      # inicia a API em http://localhost:8000
-make demo    # inicia API, backend :8100, worker e frontend :5173
-make test    # pytest + Vitest + build TypeScript + Playwright
-make accept  # locks + segurança + todas as suítes + avaliação offline
-make eval    # 17 casos x 2 no fallback local; sem credenciais ou rede
-make eval-live EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada EVAL_PROVIDER=groq
-make eval-providers   # benchmark real Groq x NVIDIA NIM
-make eval-judges EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
-make eval-label-template EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
-make eval-calibrate EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
-make eval-layers EVAL_OUTPUT_DIR=.run/evaluation/minha-rodada
-make smoke-fallback   # opt-in: Groq + NIM + timeout controlado pelo roteador
-make smoke-slack-e2e  # opt-in: fila + Slack + REST + retomada nos dois perfis
-make accept-live      # aceite local completo + os dois smokes reais anteriores
-make logs    # acompanha os quatro processos locais
-make stop    # encerra API, backend, worker e frontend
+cp .env.example .env
+make setup
 ```
 
-O Swagger industrial fica em `http://localhost:8000/docs`, o Swagger da fachada em `http://localhost:8100/docs` e a central em `http://localhost:5173`. Ações industriais usam `x-user-id`. O parâmetro `seed` reproduz variações; `seed=complete` pede retornos completos quando o cenário não possui override fixo.
+Para usar o agente ao vivo, preencha `GROQ_API_KEY` e `NVIDIA_API_KEY` no
+`.env`. As variáveis do Slack são opcionais para a central e obrigatórias
+somente para notificações reais. Nunca versione o `.env`.
+
+Inicie a demonstração:
+
+```bash
+make demo
+```
+
+Serviços locais:
+
+- central: `http://localhost:5173`;
+- backend da demonstração: `http://localhost:8100/docs`;
+- API industrial simulada: `http://localhost:8000/docs`.
+
+Use `make logs` para acompanhar os processos e `make stop` para encerrá-los.
+
+### Testes e aceite
+
+```bash
+make test          # pytest, Vitest, build TypeScript e Playwright
+make eval          # 17 casos × 2, sem LLM ou rede
+make accept        # locks, segurança, testes e avaliação offline
+make accept-live   # accept + providers reais + dois canais Slack
+```
+
+`make accept-live` consome cota dos providers e envia duas notificações
+sintéticas ao Slack configurado. Os relatórios sanitizados ficam em
+`.run/smoke/`, que não é versionado.
+
+Comandos opt-in separados:
+
+```bash
+make smoke-groq       # contratos dos modelos Groq disponíveis
+make smoke-fallback   # Groq, NIM e fallback por timeout controlado
+make smoke-slack-e2e  # fila, Slack, decisão REST e retomada
+make eval-live        # benchmark do agente real
+make eval-providers   # comparação Groq × NVIDIA NIM
+make eval-judges      # juízes sobre relatório já encerrado
+```
+
+O último `make accept-live` validou 99 testes da API, 1.813 do agente, 32 do
+backend demo, 4 do frontend, build Vite, 2 fluxos Playwright, 34 execuções
+offline, conectividade Groq/NIM, fallback controlado e entrega/retomada nos dois
+canais Slack.
 
 ### Configurar o Slack MCP
 
-Crie ou reutilize uma Slack App interna, habilite o MCP e conclua OAuth com o escopo mínimo `chat:write`. Preencha somente no `.env` local `SLACK_MCP_ACCESS_TOKEN`, `SLACK_TRACTIAN_CHANNEL_ID` e `SLACK_AUTHORITY_CHANNEL_ID`. O endpoint usado é o oficial `https://mcp.slack.com/mcp`; o worker descobre a tool de envio no início da sessão. O Slack recebe apenas categoria, resumo sanitizado, IDs opacos e link. Aprovar ou rejeitar acontece exclusivamente na central.
+Crie uma Slack App interna, habilite o MCP e conclua OAuth com o escopo mínimo
+`chat:write`. Depois preencha no `.env`:
 
-Enquanto essas três variáveis não estiverem configuradas e `make smoke-slack-e2e` não passar, a central mantém as decisões funcionais, mas informa `slack_configured=false` e não promete entrega externa. O smoke usa um SQLite temporário, cria pedidos sintéticos para TRACTIAN e autoridade, entrega os links reais, resolve pelo mesmo REST usado pela SPA e prova uma única retomada. Em 04/09/2026, ambos os canais devolveram `message_ts`, a persona errada recebeu `403`, o replay idempotente recebeu `200`, o conflito recebeu `409` e cada decisão gerou uma retomada concluída. O relatório sanitizado fica em `.run/smoke/slack-e2e.json`. Em outro workspace, repita o comando. Depois do OAuth, revise os escopos concedidos e remova os que não forem necessários; esta integração usa somente `chat:write`.
+```dotenv
+SLACK_MCP_ACCESS_TOKEN=
+SLACK_TRACTIAN_CHANNEL_ID=
+SLACK_AUTHORITY_CHANNEL_ID=
+PUBLIC_APP_URL=http://127.0.0.1:5173
+```
 
-`make smoke-fallback` faz uma sonda mínima real em cada provider e atravessa o
-roteador com um timeout injetado exclusivamente pelo smoke. A evidência fica em
-`.run/smoke/provider-fallback.json`; ela prova a classificação e a troca para
-NIM sem alegar uma queda espontânea da Groq. Erro de schema, protocolo, policy
-ou qualidade continua falhando sem fallback. `make accept-live` reúne o aceite
-local e os dois smokes; ele não executa o benchmark ao vivo de 34 casos.
+O endpoint utilizado é `https://mcp.slack.com/mcp`. Em uma demonstração fora
+da máquina local, `PUBLIC_APP_URL` precisa apontar para uma central acessível às
+pessoas que receberão o link.
 
-## Desenvolvimento com uma IA copiloto
+## Avaliação
 
-1. Abra [`AGENTS.md`](./AGENTS.md) para dar contexto e regras à IA.
-2. Escolha a primeira fase incompleta e sem dependências em [`TASKS.md`](./TASKS.md).
-3. Estude o conceito correspondente em [`LEARNING-GUIDE.md`](./LEARNING-GUIDE.md).
-4. Peça à IA uma explicação curta, um micro-objetivo e critérios de teste — não a implementação inteira.
-5. Implemente você mesmo uma mudança pequena; use a IA para revisar, explicar erros e sugerir testes.
-6. Marque a tarefa concluída somente quando seus critérios de aceite passarem.
+O runner executa os casos públicos antes de carregar as trajetórias esperadas.
+Checks programáticos validam formato, decisão, tools, argumentos, IDs,
+permissões, justificativa, erros e orçamento de passos. Depois da execução:
 
-Prompt curto recomendado:
+- o juiz de resultado recebe a resposta sem o trace;
+- o juiz de trajetória recebe apenas chamadas e falhas sanitizadas;
+- nenhum juiz libera respostas, executa ações ou aciona retry no atendimento.
 
-> Leia `AGENTS.md`, `TASKS.md` e a etapa relevante de `LEARNING-GUIDE.md`. Atue como professor e copiloto. Explique os conceitos sem assumir conhecimento prévio, defina um único micro-objetivo e seus testes. Não escreva a solução completa antes da minha tentativa; revise o código que eu produzir.
+A calibração humana está preparada, mas propositalmente não concluída. Uma
+pessoa especialista da TRACTIAN deverá rotular 20–30 respostas sem ver as notas
+dos juízes. Só então faz sentido escolher limiar, medir concordância, Cohen's
+kappa, falsos aprovados e falsos reprovados.
 
-## Documentação
-
-| Arquivo | Função |
-|---|---|
-| [`AGENTS.md`](./AGENTS.md) | Regras obrigatórias para qualquer IA ou contribuidor |
-| [`TASKS.md`](./TASKS.md) | Backlog linear, decisões pendentes e critérios de aceite |
-| [`LEARNING-GUIDE.md`](./LEARNING-GUIDE.md) | Conceitos a aprender na ordem de construção |
-| [`CONTEXT.md`](./CONTEXT.md) | Vocabulário canônico do domínio |
-| [`docs/api-contract.openapi.yaml`](./docs/api-contract.openapi.yaml) | Contrato HTTP fornecido |
-| [`docs/data-schema.md`](./docs/data-schema.md) | Estrutura dos dados fornecidos |
-| [`docs/test-scenarios.md`](./docs/test-scenarios.md) | Cenários comentados do benchmark |
-
-## Estrutura
+## Estrutura e documentação
 
 ```text
 .
-├── README.md
-├── AGENTS.md
-├── TASKS.md
-├── LEARNING-GUIDE.md
-├── CONTEXT.md
-├── LICENSE
-├── Makefile
-├── agent/                   # contratos, tools, planner, writer, gate, grafo e checkpointer
-├── agent-input/             # entradas permitidas ao agente
-├── api/                     # simulador FastAPI e testes
-├── demo/                    # fachada, SQLite, workers, decisões e Slack MCP
-├── frontend/                # central React, Vitest e Playwright
-├── data/                    # dados do simulador
-├── docs/                    # contrato, schema e cenários
-└── eval/                    # gabarito restrito aos avaliadores
+├── api/                    # simulador FastAPI
+├── agent/                  # agente, segurança e avaliação
+├── agent-input/            # casos públicos permitidos ao runtime
+├── demo/                   # fachada, filas, decisões e Slack MCP
+├── frontend/               # central React
+├── data/                   # dados sintéticos do simulador
+├── docs/                   # contratos de dados, API e cenários
+├── eval/                   # referências reservadas à avaliação
+├── AGENTS.md               # regras para futuras alterações por IA
+├── CONTEXT.md              # vocabulário canônico do domínio
+└── Makefile                # comandos de operação e aceite
 ```
 
-## Limitações atuais
+Documentos técnicos ativos:
 
-- Existe um grafo LangGraph com planner e writer LLM opt-in separados, ledger de evidências, gate determinístico, revisão humana retomável, fluxos de escrita, checkpointer, telemetria manual Logfire opt-in e avaliação Pydantic Evals. O benchmark atual falha em qualidade/estabilidade e a calibração humana está adiada; portanto não é um agente de produção.
-- As cinco proposal tools apenas propõem (`effect_executed=false`). Somente o fluxo determinístico, após política, confirmação quando necessária e checkpoint, acessa as cinco operações HTTP fixas.
-- O simulador não representa todas as garantias transacionais de produção.
-- A central usa identidades simuladas e execução local; não substitui autenticação, autorização distribuída ou implantação de produção. O percurso fila → Slack real → link da central → decisão REST → retomada foi validado nos dois perfis com casos sintéticos; uma implantação pública ainda exigirá identidade corporativa e URL acessível fora da máquina local.
-- As rotas de ação do simulador devolvem recibos, mas não alteram os recursos Parquet; um novo GET não comprova a mutação solicitada.
+- [`CONTEXT.md`](./CONTEXT.md): termos de domínio e avaliação;
+- [`docs/data-schema.md`](./docs/data-schema.md): schema dos dados sintéticos;
+- [`docs/test-scenarios.md`](./docs/test-scenarios.md): cenários do benchmark;
+- [`docs/api-contract.openapi.yaml`](./docs/api-contract.openapi.yaml): contrato HTTP.
 
-## Autor
+## Limitações
+
+- Pessoas e permissões da central são simuladas; não há autenticação corporativa.
+- SQLite é adequado à demonstração local; PostgreSQL é a evolução esperada.
+- As ações da API devolvem recibos, mas não alteram os Parquets de origem.
+- A URL local enviada ao Slack não funciona fora da máquina sem publicação.
+- O benchmark atual impede classificar o agente como pronto para produção.
+- A calibração final depende de especialistas industriais da TRACTIAN.
+
+LangSmith e Phoenix não foram adicionados porque Pydantic Evals já organiza a
+avaliação e Logfire cobre a observabilidade atual. Uma nova plataforma só se
+justifica se surgir uma necessidade operacional que essas ferramentas não
+cubram.
+
+## Autor e licença
 
 **Leunam Sousa de Jesus** — [LinkedIn](https://www.linkedin.com/in/leunam)
 
-## Licença
-
-O código original deste repositório é distribuído sob a [Licença MIT](./LICENSE). Dados, marcas e materiais originados da TRACTIAN, do Inteli ou de terceiros continuam sujeitos aos direitos de seus respectivos titulares.
+O código original usa a [Licença MIT](./LICENSE). Dados, marcas e materiais da
+TRACTIAN, do Inteli ou de terceiros continuam sujeitos aos respectivos direitos.

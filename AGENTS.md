@@ -1,73 +1,57 @@
 # Instruções para agentes de IA
 
-## Leitura obrigatória
+## Antes de alterar
 
-Antes de alterar o projeto, leia:
+Leia:
 
-1. `README.md` — objetivo, arquitetura e estado real;
-2. `TASKS.md` — primeira fase incompleta, decisões e aceite;
-3. `CONTEXT.md` — vocabulário canônico;
-4. a etapa relevante de `LEARNING-GUIDE.md`;
-5. arquivos de `docs/` somente quando a tarefa exigir.
+1. `README.md` para objetivo, arquitetura, comandos e estado real;
+2. `CONTEXT.md` para o vocabulário canônico;
+3. `docs/data-schema.md` ou `docs/test-scenarios.md` somente quando a mudança
+   tocar dados ou avaliação.
 
-## Papel da IA
+## Forma de trabalho
 
-O autor é responsável por implementar o projeto. Atue como professor e copiloto:
+- Explique termos em português simples e não presuma conhecimento técnico.
+- Apresente contrato e testes antes da implementação.
+- Trabalhe em mudanças pequenas e verificáveis.
+- Atualize o README apenas quando escopo, arquitetura, operação ou estado real
+  mudar.
+- Não descreva componente planejado, integração não repetida ou qualidade não
+  medida como funcional.
 
-- explique termos em português simples e não presuma conhecimento técnico;
-- trabalhe em um micro-objetivo por vez;
-- apresente contrato e testes antes da implementação;
-- não entregue a solução inteira antes da tentativa do autor, salvo pedido explícito;
-- revise o código produzido, explique falhas e proponha correções localizadas;
-- mantenha respostas curtas, diretas e completas.
+## Estado e invariantes
 
-Só marque uma tarefa após executar seu critério de aceite. Registre decisões locais em `TASKS.md`; atualize o README apenas quando uma decisão arquitetural global mudar.
+O projeto contém API simulada, agente LangGraph, Pydantic Evals, backend da
+demonstração, central React, decisões delegadas, Slack MCP e adapters Groq/NIM.
+A entrega técnica foi aceita; o benchmark de qualidade e a calibração humana
+ainda impedem a classificação para produção.
 
-## Estado atual
+- Existe um agente lógico com planner e writer separados.
+- Pydantic valida contratos; LangGraph controla fluxo e estado.
+- Segurança do runtime é determinística. Juízes não participam do atendimento.
+- O runtime nunca recebe `eval/expected-paths.json`,
+  `docs/test-scenarios.md` ou `data/cases.parquet`.
+- O golden set não é RAG e só fica disponível após a execução avaliada.
+- Evidências vivem no estado; Logfire não é o banco do ledger.
+- Consultas são autônomas. Escritas exigem pedido explícito e autorização.
+- Retry de ação exige idempotência persistida antes do HTTP.
+- Não envie tokens, chaves, golden set, prompts ou conteúdo sensível ao Logfire,
+  Slack, frontend ou relatórios públicos.
+- Não exponha rubricas, notas de juiz ou trace completo ao cliente.
+- Não introduza RAG, banco vetorial, multiagentes, fine-tuning ou nova
+  infraestrutura sem decisão arquitetural explícita.
 
-Existem o simulador FastAPI, o agente LangGraph completo, o pipeline Pydantic
-Evals, a fachada `demo/` com filas SQLite, a central React `frontend/`, decisões
-delegadas, outbox Slack MCP e fallback configurável Groq/NVIDIA NIM. As Fases
-1–12 e 14–19 têm implementação e aceite técnico; a calibração humana da Fase 13
-está adiada por ausência de especialista da TRACTIAN. Os smokes opt-in
-comprovaram os dois canais Slack até a retomada e o fallback por indisponibilidade
-controlada. O benchmark atual falha em qualidade e estabilidade. Nunca
-descreva calibração, uma integração externa não repetida no ambiente atual ou o
-agente de produção como funcional.
+## Arquivos e verificação
 
-## Invariantes
+Preserve alterações do usuário e evite mudanças fora do escopo. Não crie novos
+Markdown quando a informação pertencer ao README, ao contexto ou aos contratos
+de `docs/`.
 
-- Frontend e Slack estão autorizados somente na central de demonstração descrita nas Fases 16–19; não introduza RAG, banco vetorial, multiagentes ou fine-tuning sem decisão explícita.
-- Há um agente lógico com planner e writer separados; LangGraph controla o fluxo e o estado.
-- Pydantic valida contratos; Pydantic Evals organiza avaliações offline; Logfire recebe observabilidade.
-- SQLite é o checkpointer de desenvolvimento; PostgreSQL é evolução futura.
-- O acesso a modelos usa adapter; Groq e NVIDIA NIM possuem adapters e comparação versionada.
-- Segurança do runtime é determinística. Juízes LLM não liberam respostas, não acionam retry e não fazem parte do atendimento.
-- O runtime nunca recebe `eval/expected-paths.json`, `docs/test-scenarios.md` ou `data/cases.parquet`.
-- O golden set não é RAG e só fica disponível aos avaliadores após a execução.
-- Preserve as colunas atuais dos casos; não crie sidecar ou enriquecimento persistido.
-- Evidências são registradas em código no estado. Logfire não é o banco principal do ledger.
-- Nunca afirme conclusão crítica sem evidência nem esconda falha de tool.
-- Consultas são autônomas. Escritas dependem de pedido explícito autorizado ou confirmação.
-- Ações sujeitas a retry precisam de idempotência persistida antes da chamada.
-- Não envie tokens, chaves, credenciais, golden set ou conteúdo sensível ao Logfire.
-- Não exponha notas, rubricas ou trace completo ao cliente; retorne somente um ID de rastreabilidade quando apropriado.
-
-## Organização documental
-
-- `README.md`: visão externa e arquitetura.
-- `TASKS.md`: backlog, pendências e aceite.
-- `LEARNING-GUIDE.md`: conteúdo didático.
-- `CONTEXT.md`: glossário.
-- `docs/`: contrato e material-base.
-
-Não crie outro `.md` se a informação pertencer a um desses documentos. Preserve código e dados fora da tarefa e atualize referências ao mover caminhos.
-
-## Verificação mínima
+Verificação mínima:
 
 ```bash
 make accept
 ```
 
-Use `make accept-live` somente com credenciais locais para repetir os smokes
-Groq/NIM e Slack. O comando não substitui os gates externos de produção.
+Use `make accept-live` somente quando a tarefa exigir repetir providers e Slack
+reais; o comando consome cota e envia notificações.
