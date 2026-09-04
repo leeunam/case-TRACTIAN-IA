@@ -166,9 +166,12 @@ Há dois armazenamentos SQLite independentes no desenvolvimento. A API usa `IDEM
 ### Modelos
 
 `ModelProvider` é a interface comum para construir `BaseChatModel` a partir do
-`ModelConfig` estrito. O adapter inicial é `GroqModelProvider`, com
-`openai/gpt-oss-120b`, temperatura zero, timeout de 30 segundos, no máximo 512
-tokens e sem retry oculto. O planner usa `bind_tools` para uma escolha por
+`ModelConfig` estrito. O adapter inicial é `GroqModelProvider`; a configuração
+live `evaluation-experiment-v5` usa `openai/gpt-oss-20b`, temperatura zero,
+timeout de 30 segundos e no máximo 512 tokens. O adapter continua sem retry por
+padrão. Somente o experimento live congela e registra três retries de transporte,
+duas repetições do erro sanitizado `output_parse_failed` e pacing compartilhado
+de 20 segundos entre planner e writer. O planner usa `bind_tools` para uma escolha por
 turno e uma chamada Pydantic separada para encerrar. No adapter Groq, essa
 finalização usa o JSON Schema nativo estrito (`method="json_schema"`,
 `strict=True`); a correção evita o `tool_use_failed` observado quando o default
@@ -246,6 +249,17 @@ tratamento de erro e orçamento, mas nenhuma passou o conjunto completo: 33
 terminaram em revisão segura por `model_failure`, apenas uma passou a dimensão
 de decisão e nenhuma reproduziu a trajetória esperada. Isso é evidência de que
 o pipeline detecta regressões, não de qualidade do agente.
+
+Uma auditoria de estabilização posterior executou ainda `tractian-eval-v2`,
+`v3` e `v4`. Ela comprovou chamadas reais do planner e do writer, corrigiu
+repetição de busca, finalização no teto de tools, parsing malformado e isolamento
+de pacing. Também demonstrou um limite externo: cada modelo do plano gratuito
+da Groq tem 200 mil tokens/dia, insuficientes para concluir no mesmo período as
+34 trajetórias longas com todas as chamadas. As rodadas terminaram com falhas de
+cota e **não** são evidência de 34/34 fluxos aprovados. A configuração `v5`
+restaura o GPT-OSS 20B suportado e reproduz o controle de cota; para uma prova
+live completa é preciso aguardar a renovação, elevar a cota ou autorizar outro
+provider. O perfil local, os checks e os testes não dependem dessa cota.
 
 Os juízes Groq `openai/gpt-oss-120b`, rubricas `v2`, JSON mode validado por
 Pydantic e pacing de dez segundos avaliaram os mesmos 34 runs. Nenhuma saída

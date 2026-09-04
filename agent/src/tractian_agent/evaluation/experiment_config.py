@@ -28,8 +28,19 @@ class JudgeModelSpec(EvaluationModel):
     pacing_seconds: float = Field(ge=0, le=60, allow_inf_nan=False)
 
 
+class LiveAgentSpec(EvaluationModel):
+    """Modelos do agente real, separados do benchmark entre providers."""
+
+    provider: Literal["groq", "nvidia-nim"]
+    pacing_seconds: float = Field(ge=0, le=60, allow_inf_nan=False)
+    max_retries: int = Field(ge=0, le=5, strict=True)
+    output_parse_retries: int = Field(ge=0, le=3, strict=True)
+    planner: ModelConfig
+    writer: ModelConfig
+
+
 class ExperimentConfig(EvaluationModel):
-    version: Literal["evaluation-experiment-v1"]
+    version: Literal["evaluation-experiment-v5"]
     experiment_id: str = Field(min_length=1, pattern=r"^[a-z0-9_-]+$")
     public_cases_path: str
     reference_cases_path: str
@@ -39,6 +50,7 @@ class ExperimentConfig(EvaluationModel):
     thresholds: tuple[float, ...] = Field(min_length=1)
     human_sample_size: int = Field(ge=20, le=30, strict=True)
     versions: tuple[VersionPin, ...] = Field(min_length=6)
+    live_agents: tuple[LiveAgentSpec, ...] = Field(min_length=2)
     providers: tuple[ProviderBenchmarkSpec, ...] = Field(min_length=2)
     judges: JudgeModelSpec
 
@@ -60,6 +72,14 @@ class ExperimentConfig(EvaluationModel):
             raise ValueError("componentes versionados devem ser únicos")
         if len({item.provider for item in self.providers}) != len(self.providers):
             raise ValueError("providers devem ser únicos")
+        if len({item.provider for item in self.live_agents}) != len(
+            self.live_agents
+        ):
+            raise ValueError("providers live devem ser únicos")
+        if {item.provider for item in self.live_agents} != {
+            item.provider for item in self.providers
+        }:
+            raise ValueError("providers live e de benchmark devem coincidir")
         return self
 
     def digest(self) -> str:

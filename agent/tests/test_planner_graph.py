@@ -648,7 +648,7 @@ def test_planner_read_pairs_null_and_recording_without_business_drift(
     assert len(state.tool_observations) == 1
     observation = state.tool_observations[0]
     expected_id = hashlib.sha256(
-        ("planner-v1\0req_planner_read\0" + "1").encode("utf-8")
+        ("planner-v2\0req_planner_read\0" + "1").encode("utf-8")
     ).hexdigest()[:24]
     assert observation.call_id == f"call_planner_{expected_id}"
     assert type(observation.artifact.validated_read_artifact()) is AssetToolArtifact

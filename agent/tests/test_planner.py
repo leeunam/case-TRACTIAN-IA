@@ -114,12 +114,14 @@ from tractian_agent.tools.runtime import (
 
 class _RecordingPlannerModel(BaseChatModel):
     selector_response: AIMessage
+    selector_responses: tuple[AIMessage, ...] = ()
     terminal_response: object | None = None
     _events: list[str] = PrivateAttr(default_factory=list)
     _bound_tool_names: tuple[str, ...] = PrivateAttr(default=())
     _selection_messages: list[BaseMessage] = PrivateAttr(default_factory=list)
     _terminal_messages: list[BaseMessage] = PrivateAttr(default_factory=list)
     _structured_schema: type | dict[str, Any] | None = PrivateAttr(default=None)
+    _selection_index: int = PrivateAttr(default=0)
 
     @property
     def _llm_type(self) -> str:
@@ -141,6 +143,10 @@ class _RecordingPlannerModel(BaseChatModel):
         async def select(messages: list[BaseMessage]) -> AIMessage:
             self._events.append("selection_request")
             self._selection_messages = list(messages)
+            if self.selector_responses:
+                response = self.selector_responses[self._selection_index]
+                self._selection_index += 1
+                return response
             return self.selector_response
 
         return RunnableLambda(select)
@@ -1186,6 +1192,57 @@ def test_select_planner_tools_uses_only_ids_observed_for_current_request():
 
     assert "get_analysis" not in names_with_old_only
     assert "get_analysis" in names_with_current
+
+
+def test_select_planner_tools_does_not_offer_search_again_after_success():
+    result = KnowledgeSearchItem(
+        id="kb_bearing_guidance",
+        type="guidance",
+        title="Orientação de rolamentos",
+        tags=[],
+        snippet="Resultado sintético validado.",
+    )
+    call = PersistedToolCall(
+        request_id="req_planner_01",
+        call_id="call_search_once",
+        name="search_knowledge",
+        arguments={"query": "rolamento"},
+    )
+    observation = ToolObservation(
+        request_id=call.request_id,
+        call_id=call.call_id,
+        content=KnowledgeSearchModelContent(
+            results=[result],
+            total_results=1,
+            returned_results=1,
+            omitted_results=0,
+            truncated=False,
+        ).model_dump(mode="json"),
+        artifact=KnowledgeSearchToolArtifact(
+            tool_name=call.name,
+            arguments=call.arguments.to_python(),
+            source=ToolSource(kind="industrial_api", resource="/knowledge/search"),
+            outcome=KnowledgeSearchToolOutcome(
+                mode=ResponseMode.COMPLETE,
+                partial_data={},
+                results=[result],
+                total_results=1,
+                returned_results=1,
+                omitted_results=0,
+            ),
+        ),
+    )
+
+    offered_names = {
+        tool.name
+        for tool in select_planner_tools(
+            _state(tool_calls=(call,), tool_observations=(observation,)),
+            _read_runtime(),
+        )
+    }
+
+    assert "search_knowledge" not in offered_names
+    assert "get_knowledge_document" in offered_names
 
 
 @pytest.mark.parametrize(
@@ -3096,13 +3153,16 @@ def test_select_planner_tools_fails_closed_for_trusted_scope_drift(runtime):
 def test_planner_system_prompt_has_a_versioned_safe_role():
     normalized_prompt = PLANNER_SYSTEM_PROMPT.casefold()
 
-    assert PLANNER_SYSTEM_PROMPT_VERSION == "planner-v1"
+    assert PLANNER_SYSTEM_PROMPT_VERSION == "planner-v2"
     assert PLANNER_SYSTEM_PROMPT_VERSION in PLANNER_SYSTEM_PROMPT
     assert "writer" in normalized_prompt
     assert "no máximo uma tool" in normalized_prompt
     assert "não invente evidência" in normalized_prompt
     assert "não executam efeito" in normalized_prompt
     assert "raciocínio interno" in normalized_prompt
+    assert "não repita" in normalized_prompt
+    assert "ids descobertos" in normalized_prompt
+    assert "encerre" in normalized_prompt
 
 
 def test_planner_limits_are_immutable_and_fixed_to_the_approved_budget():
@@ -3249,7 +3309,7 @@ def test_planner_uses_one_based_sequence_for_persisted_call_ids(prior_count):
     assert isinstance(result, PlannerToolTurn)
     expected_id = hashlib.sha256(
         (
-            "planner-v1\0req_planner_01\0" + str(prior_count + 1)
+            "planner-v2\0req_planner_01\0" + str(prior_count + 1)
         ).encode("utf-8")
     ).hexdigest()[:24]
     assert result.tool_call.call_id == f"call_planner_{expected_id}"
@@ -3485,14 +3545,18 @@ def test_planner_refuses_eighth_tool_call_before_any_http_execution():
         )
 
     assert exc_info.value.code is PlannerErrorCode.TOOL_CALL_LIMIT_EXCEEDED
-    assert model._events == []
+    assert model._events == ["bind_tools", "selection_request"]
 
 
 @pytest.mark.parametrize(
     ("prior_calls", "expected_code", "expected_events"),
     [
         (6, None, ["bind_tools", "selection_request"]),
-        (7, PlannerErrorCode.TOOL_CALL_LIMIT_EXCEEDED, []),
+        (
+            7,
+            PlannerErrorCode.TOOL_CALL_LIMIT_EXCEEDED,
+            ["bind_tools", "selection_request"],
+        ),
         (8, PlannerErrorCode.INVALID_HISTORY, []),
     ],
     ids=["below", "at-limit", "above"],
@@ -3533,6 +3597,34 @@ def test_planner_tool_call_limit_boundaries(
             asyncio.run(invocation)
         assert exc_info.value.code is expected_code
     assert model._events == expected_events
+
+
+def test_planner_at_tool_call_limit_can_finalize_but_cannot_call_another_tool():
+    calls, observations = _planner_history(7)
+    model = _RecordingPlannerModel(
+        selector_response=AIMessage(content="encerrar", tool_calls=[]),
+        terminal_response=PlannerTerminalDecision(
+            decision=PlannerDecisionKind.GUIDE,
+            stop_reason=PlannerStopReason.SUFFICIENT_EVIDENCE,
+        ),
+    )
+
+    result = asyncio.run(
+        Planner(model).ainvoke(
+            _request(),
+            request_id="req_planner_01",
+            usage=PlannerUsage(
+                request_id="req_planner_01",
+                selection_count=7,
+            ),
+            offered_tools=(search_knowledge,),
+            tool_calls=calls,
+            tool_observations=observations,
+        )
+    )
+
+    assert isinstance(result, PlannerDecisionTurn)
+    assert model._bound_tool_names == ()
 
 
 def test_planner_rejects_canonical_repeat_but_allows_distinct_arguments():
@@ -4910,7 +5002,62 @@ def test_planner_fails_closed_for_unsafe_tool_selections(
         )
 
     assert exc_info.value.code is expected_code
-    assert model._events == ["bind_tools", "selection_request"]
+    expected_events = ["bind_tools", "selection_request"]
+    if selector_response.invalid_tool_calls:
+        expected_events *= 2
+        assert exc_info.value.usage == PlannerUsage(
+            request_id="req_planner_01",
+            selection_count=2,
+        )
+    assert model._events == expected_events
+
+
+def test_planner_repairs_one_malformed_provider_tool_call_explicitly():
+    malformed = AIMessage(
+        content="",
+        invalid_tool_calls=[
+            {
+                "name": "get_asset",
+                "args": "not-json",
+                "id": "call_malformed_once",
+                "error": "arguments are not valid JSON",
+                "type": "invalid_tool_call",
+            }
+        ],
+    )
+    corrected = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "get_asset",
+                "args": {"asset_id": "asset_G501"},
+                "id": "call_corrected",
+                "type": "tool_call",
+            }
+        ],
+    )
+    model = _RecordingPlannerModel(
+        selector_response=corrected,
+        selector_responses=(malformed, corrected),
+    )
+
+    result = asyncio.run(
+        Planner(model).ainvoke(
+            _request(),
+            request_id="req_planner_01",
+            usage=PlannerUsage(request_id="req_planner_01"),
+            offered_tools=(get_asset,),
+        )
+    )
+
+    assert isinstance(result, PlannerToolTurn)
+    assert result.usage.selection_count == 2
+    assert model._events == [
+        "bind_tools",
+        "selection_request",
+        "bind_tools",
+        "selection_request",
+    ]
 
 
 def test_planner_fails_closed_for_invalid_terminal_output():

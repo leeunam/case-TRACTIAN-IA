@@ -89,7 +89,7 @@ from tractian_agent.tools.technical import (
 from tractian_agent.tools.timestamps import parse_aware_iso_timestamp
 
 
-PLANNER_SYSTEM_PROMPT_VERSION: Final = "planner-v1"
+PLANNER_SYSTEM_PROMPT_VERSION: Final = "planner-v2"
 PLANNER_SYSTEM_PROMPT: Final = f"""\
 prompt_version: {PLANNER_SYSTEM_PROMPT_VERSION}
 
@@ -100,6 +100,11 @@ redija a resposta destinada ao cliente.
 Use no máximo uma tool por turno e somente uma tool explicitamente oferecida.
 Não invente evidência nem transforme hipótese em fato. Proposal tools apenas
 registram propostas e não executam efeito industrial.
+
+Não repita uma consulta equivalente nem troque apenas as palavras para buscar o
+mesmo fato. Use os IDs descobertos nos retornos para chamar as tools de detalhe
+oferecidas. Se nenhuma tool oferecida puder acrescentar evidência nova, encerre
+o ciclo para produzir a decisão estruturada.
 
 Não revele nem devolva raciocínio interno. Produza somente a chamada de tool
 solicitada pela etapa de seleção ou os campos do schema da etapa terminal.
@@ -1831,14 +1836,18 @@ def select_planner_tools(
     )
     if not runtime_scope_matches:
         raise PlannerProtocolError(PlannerErrorCode.RUNTIME_SCOPE_MISMATCH)
-    authorized = _authorized_targets(
-        _validated_current_interactions(
-            state.request,
-            state.request_id,
-            state.tool_calls,
-            state.tool_observations,
-            configured_model_id=runtime.configured_model_id,
-        ),
+    interactions = _validated_current_interactions(
+        state.request,
+        state.request_id,
+        state.tool_calls,
+        state.tool_observations,
+        configured_model_id=runtime.configured_model_id,
+    )
+    authorized = _authorized_targets(interactions)
+    knowledge_search_completed = any(
+        call.name == "search_knowledge"
+        and observation.artifact.outcome.error is None
+        for call, observation in interactions
     )
     has_scoped_asset = (
         state.request.asset_id is not None
@@ -1850,6 +1859,7 @@ def select_planner_tools(
             tool
             for tool in READ_TOOLS
             if (tool.name not in _ASSET_ARGUMENT_TOOL_NAMES or has_scoped_asset)
+            and (tool.name != "search_knowledge" or not knowledge_search_completed)
             and (tool.name != "get_analysis" or authorized.analysis_ids)
             and (
                 tool.name != "get_knowledge_document"
@@ -2155,11 +2165,11 @@ class Planner:
                 PlannerErrorCode.INVALID_HISTORY,
                 usage=active_usage,
             )
-        if len(calls) == PLANNER_LIMITS.tool_calls:
-            raise PlannerProtocolError(
-                PlannerErrorCode.TOOL_CALL_LIMIT_EXCEEDED,
-                usage=active_usage,
-            )
+        at_tool_call_limit = len(calls) == PLANNER_LIMITS.tool_calls
+        if at_tool_call_limit:
+            tools = ()
+            tool_names = ()
+            tools_by_name = {}
         interactions: list[tuple[AIMessage, ToolMessage, bool]] = []
         authorized_interactions: list[
             tuple[PersistedToolCall, ToolObservation]
@@ -2204,9 +2214,30 @@ class Planner:
             usage=active_usage,
         )
         selection = await self._model.bind_tools(tools).ainvoke(messages)
+        selection_attempts = 1
+        if (
+            isinstance(selection, AIMessage)
+            and selection.invalid_tool_calls
+            and active_usage.selection_count + selection_attempts
+            < PLANNER_LIMITS.selections
+        ):
+            repair_messages = [
+                *messages,
+                SystemMessage(
+                    content=(
+                        "A chamada anterior tinha argumentos malformados e foi "
+                        "descartada. Tente uma vez com JSON válido que respeite "
+                        "exatamente o schema oferecido, ou encerre sem chamar tool."
+                    )
+                ),
+            ]
+            selection = await self._model.bind_tools(tools).ainvoke(
+                repair_messages
+            )
+            selection_attempts += 1
         selection_usage = PlannerUsage(
             request_id=active_usage.request_id,
-            selection_count=active_usage.selection_count + 1,
+            selection_count=active_usage.selection_count + selection_attempts,
             finalization_count=active_usage.finalization_count,
         )
         if not isinstance(selection, AIMessage):
@@ -2251,6 +2282,11 @@ class Planner:
                 decision=terminal_decision,
                 usage=final_usage,
                 context=terminal_context_stats,
+            )
+        if at_tool_call_limit:
+            raise PlannerProtocolError(
+                PlannerErrorCode.TOOL_CALL_LIMIT_EXCEEDED,
+                usage=selection_usage,
             )
         if len(selection.tool_calls) != 1:
             raise PlannerProtocolError(

@@ -17,7 +17,8 @@ def test_versioned_experiment_config_freezes_all_reproducibility_inputs() -> Non
         dirty=False,
     )
 
-    assert config.version == "evaluation-experiment-v1"
+    assert config.version == "evaluation-experiment-v5"
+    assert config.experiment_id == "tractian-eval-v5"
     assert config.repetitions == 2
     assert config.thresholds == (0.7, 0.8, 0.9)
     assert config.human_sample_size == 24
@@ -25,11 +26,20 @@ def test_versioned_experiment_config_freezes_all_reproducibility_inputs() -> Non
         "groq",
         "nvidia-nim",
     }
+    providers = {provider.provider: provider for provider in config.providers}
     assert all(
         provider.planner.model_id == "openai/gpt-oss-20b"
         and provider.writer.model_id == "openai/gpt-oss-20b"
-        for provider in config.providers
+        for provider in providers.values()
     )
+    live_agents = {provider.provider: provider for provider in config.live_agents}
+    assert live_agents["groq"].planner.model_id == "openai/gpt-oss-20b"
+    assert live_agents["groq"].writer.model_id == "openai/gpt-oss-20b"
+    assert live_agents["groq"].pacing_seconds == 20.0
+    assert live_agents["groq"].max_retries == 3
+    assert live_agents["groq"].output_parse_retries == 2
+    assert live_agents["nvidia-nim"].planner.model_id == "openai/gpt-oss-20b"
+    assert live_agents["nvidia-nim"].writer.model_id == "openai/gpt-oss-20b"
     assert config.judges.provider == "groq"
     assert config.judges.blind_result.model_id == "openai/gpt-oss-120b"
     assert config.judges.trajectory.model_id == "openai/gpt-oss-120b"

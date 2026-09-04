@@ -15,7 +15,9 @@ from tractian_agent.evaluation.contracts import BenchmarkInput
 from tractian_agent.evaluation.live_experiment import (
     LiveExperimentOptions,
     UserRuntimeProfile,
+    _apply_model_pacing,
     _fetch_user_profile,
+    _live_rate_limiter,
     run_live_experiment,
 )
 from tractian_agent.planner import (
@@ -104,6 +106,20 @@ class _LocalProvider:
         return _LocalPlannerModel() if self._calls == 1 else _LocalWriterModel()
 
 
+def test_live_model_pacing_is_explicit_and_can_be_disabled() -> None:
+    shared_limiter = _live_rate_limiter(20.0)
+    paced_planner = _apply_model_pacing(_LocalPlannerModel(), shared_limiter)
+    paced_writer = _apply_model_pacing(_LocalWriterModel(), shared_limiter)
+    unpaced = _apply_model_pacing(_LocalWriterModel(), None)
+
+    assert paced_planner.rate_limiter is shared_limiter
+    assert paced_writer.rate_limiter is shared_limiter
+    assert shared_limiter is not None
+    assert shared_limiter.requests_per_second == pytest.approx(1 / 20)
+    assert shared_limiter.max_bucket_size == 1
+    assert unpaced.rate_limiter is None
+
+
 def _case() -> BenchmarkInput:
     return BenchmarkInput(
         id="case_tkt_ctx_02",
@@ -170,10 +186,19 @@ def test_live_experiment_can_repeat_the_same_destination_without_network(
 ) -> None:
     root = Path(__file__).resolve().parents[2]
     output_dir = tmp_path / "live-experiment"
+    provider_options: list[tuple[int, int]] = []
+
+    def local_provider(name, environment, max_retries, output_parse_retries):
+        provider_options.append((max_retries, output_parse_retries))
+        return _LocalProvider()
 
     monkeypatch.setattr(
         "tractian_agent.evaluation.live_experiment._provider",
-        lambda name, environment: _LocalProvider(),
+        local_provider,
+    )
+    monkeypatch.setattr(
+        "tractian_agent.evaluation.live_experiment._apply_model_pacing",
+        lambda model, _: model,
     )
 
     async def local_profile(_, benchmark: BenchmarkInput) -> UserRuntimeProfile:
@@ -219,3 +244,4 @@ def test_live_experiment_can_repeat_the_same_destination_without_network(
     assert first.profile == second.profile == "live-groq"
     assert first.total_runs == second.total_runs == 34
     assert second.programmatic_report_path.exists()
+    assert provider_options == [(3, 2), (3, 2)]

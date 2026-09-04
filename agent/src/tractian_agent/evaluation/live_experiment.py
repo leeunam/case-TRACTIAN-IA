@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
+from langchain_core.language_models import BaseChatModel
+from langchain_core.rate_limiters import BaseRateLimiter, InMemoryRateLimiter
 from pydantic import Field
 
 from tractian_agent.checkpoint import open_checkpointer
@@ -59,12 +61,43 @@ class LiveExperimentOptions:
     api_base_url: str
 
 
-def _provider(name: str, environment: dict[str, str]) -> ModelProvider:
+def _provider(
+    name: str,
+    environment: dict[str, str],
+    max_retries: int,
+    output_parse_retries: int,
+) -> ModelProvider:
     if name == "groq":
-        return GroqModelProvider.from_env(environment)
+        return GroqModelProvider.from_env(
+            environment,
+            max_retries=max_retries,
+            output_parse_retries=output_parse_retries,
+        )
     if name == "nvidia-nim":
+        if max_retries or output_parse_retries:
+            raise ValueError("retries do NVIDIA NIM não foram configurados")
         return NvidiaNimModelProvider.from_env(environment)
     raise ValueError("provider do agente deve ser groq ou nvidia-nim")
+
+
+def _live_rate_limiter(pacing_seconds: float) -> BaseRateLimiter | None:
+    if pacing_seconds == 0:
+        return None
+    return InMemoryRateLimiter(
+        requests_per_second=1 / pacing_seconds,
+        check_every_n_seconds=min(0.1, pacing_seconds),
+        max_bucket_size=1,
+    )
+
+
+def _apply_model_pacing(
+    model: BaseChatModel,
+    rate_limiter: BaseRateLimiter | None,
+) -> BaseChatModel:
+    """Compartilha a mesma cadência entre os papéis do agente."""
+
+    model.rate_limiter = rate_limiter
+    return model
 
 
 async def _fetch_user_profile(
@@ -105,11 +138,27 @@ async def run_live_experiment(
 
     config = load_experiment_config(config_path)
     provider_spec = next(
-        item for item in config.providers if item.provider == options.provider
+        item for item in config.live_agents if item.provider == options.provider
     )
-    model_provider = _provider(options.provider, environment)
-    planner = Planner(model_provider.create_chat_model(provider_spec.planner))
-    writer = Writer(model_provider.create_chat_model(provider_spec.writer))
+    model_provider = _provider(
+        options.provider,
+        environment,
+        provider_spec.max_retries,
+        provider_spec.output_parse_retries,
+    )
+    shared_rate_limiter = _live_rate_limiter(provider_spec.pacing_seconds)
+    planner = Planner(
+        _apply_model_pacing(
+            model_provider.create_chat_model(provider_spec.planner),
+            shared_rate_limiter,
+        )
+    )
+    writer = Writer(
+        _apply_model_pacing(
+            model_provider.create_chat_model(provider_spec.writer),
+            shared_rate_limiter,
+        )
+    )
     public_dataset = load_public_dataset(root / config.public_cases_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 

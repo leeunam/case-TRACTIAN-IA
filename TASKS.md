@@ -617,9 +617,23 @@ não recebe esses objetos. `ruff check src tests`, `git diff --check`, os locks
 offline (80 pacotes no agente e 55 na API) e os 46 testes focados passaram.
 O caminho live também foi repetido localmente, com models e identidade falsos
 nas fronteiras externas, sem rede, e produziu 34 runs nas duas rodadas.
-`make test` passou com 99 testes da API e 1.805 do agente, 1.904 no total,
+`make test` passou com 99 testes da API e 1.811 do agente, 1.910 no total,
 mantendo apenas o warning conhecido de `python_multipart`. A calibração humana
 continua skipped e explicitamente fora deste aceite automático.
+
+**Auditoria live de estabilização (03/09/2026):** o planner e o writer foram
+invocados de verdade em Groq nas configurações `v2`–`v4`. TDD adicionou pacing
+único entre os dois papéis, retries de transporte explícitos e versionados,
+repetição sanitizada para `output_parse_failed`, bloqueio de nova busca após uma
+busca válida e finalização segura no teto de sete tools. A prova 34/34 sem
+`model_failure` não foi atingida: as cotas diárias de 200 mil tokens do GPT-OSS
+120B, GPT-OSS 20B e Qwen 3.8 foram esgotadas durante as rodadas. Não interpretar
+exit code zero do runner como qualidade aprovada.
+
+- [x] Comprovar chamadas reais separadas de planner e writer e paths em cascata.
+- [x] Tornar pacing e retries do live explícitos, limitados e reproduzíveis.
+- [ ] Reexecutar `tractian-eval-v5` com cota suficiente e exigir zero `model_failure`.
+- [ ] Exigir writer bem-sucedido em todo path LLM aplicável antes de declarar os tópicos 1–3 concluídos.
 
 ## Registro histórico do plano SDD — Fases 5 e 4
 

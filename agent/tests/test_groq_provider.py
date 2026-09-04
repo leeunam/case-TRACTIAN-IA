@@ -1,6 +1,8 @@
 import asyncio
 from unittest.mock import AsyncMock, patch
 
+from groq import BadRequestError
+import httpx
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -109,6 +111,67 @@ def test_groq_provider_maps_common_config_without_network():
     assert model.max_retries == 0
     assert model.groq_api_key == SecretStr("test-groq-key")
     assert "test-groq-key" not in repr(model)
+
+
+def test_groq_provider_applies_explicit_retry_budget_without_network():
+    provider = GroqModelProvider(
+        api_key=SecretStr("test-groq-key"),
+        max_retries=3,
+    )
+
+    model = provider.create_chat_model(
+        ModelConfig(
+            model_id="provider/test-model",
+            temperature=0.0,
+            timeout_seconds=10.0,
+            max_output_tokens=512,
+        )
+    )
+
+    assert model.max_retries == 3
+
+
+def test_groq_provider_retries_only_sanitized_output_parse_failures():
+    provider = GroqModelProvider(
+        api_key=SecretStr("test-groq-key"),
+        output_parse_retries=2,
+    )
+    model = provider.create_chat_model(
+        ModelConfig(
+            model_id="provider/test-model",
+            temperature=0.0,
+            timeout_seconds=10.0,
+            max_output_tokens=512,
+        )
+    )
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+    )
+    parse_error = BadRequestError(
+        "provider output omitted",
+        response=response,
+        body={
+            "error": {
+                "type": "invalid_request_error",
+                "code": "output_parse_failed",
+                "failed_generation": "must never be retained",
+            }
+        },
+    )
+    expected = _fake_chat_result("")
+
+    with patch.object(
+        ChatGroq,
+        "_agenerate",
+        new=AsyncMock(side_effect=[parse_error, parse_error, expected]),
+    ) as generate:
+        result = asyncio.run(model._agenerate([]))
+
+    assert result is expected
+    assert generate.await_count == 3
+    assert "must never be retained" not in repr(vars(provider))
+    assert "must never be retained" not in repr(model)
 
 
 def test_groq_provider_uses_strict_json_schema_for_public_structured_output():

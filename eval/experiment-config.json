@@ -1,6 +1,6 @@
 {
-  "version": "evaluation-experiment-v1",
-  "experiment_id": "tractian-eval-v1",
+  "version": "evaluation-experiment-v5",
+  "experiment_id": "tractian-eval-v5",
   "public_cases_path": "agent-input/cases.json",
   "reference_cases_path": "eval/expected-paths.json",
   "repetitions": 2,
@@ -10,7 +10,7 @@
   "human_sample_size": 24,
   "versions": [
     {"component": "dataset", "version": "synthetic-cases-v1"},
-    {"component": "planner_prompt", "version": "planner-v1"},
+    {"component": "planner_prompt", "version": "planner-v2"},
     {"component": "writer_prompt", "version": "writer-v1"},
     {"component": "blind_result_rubric", "version": "blind-result-judge-v2"},
     {"component": "trajectory_rubric", "version": "trajectory-judge-v2"},
@@ -32,6 +32,44 @@
       "max_output_tokens": 4096
     }
   },
+  "live_agents": [
+    {
+      "provider": "groq",
+      "pacing_seconds": 20.0,
+      "max_retries": 3,
+      "output_parse_retries": 2,
+      "planner": {
+        "model_id": "openai/gpt-oss-20b",
+        "temperature": 0.0,
+        "timeout_seconds": 30.0,
+        "max_output_tokens": 512
+      },
+      "writer": {
+        "model_id": "openai/gpt-oss-20b",
+        "temperature": 0.0,
+        "timeout_seconds": 30.0,
+        "max_output_tokens": 512
+      }
+    },
+    {
+      "provider": "nvidia-nim",
+      "pacing_seconds": 0.0,
+      "max_retries": 0,
+      "output_parse_retries": 0,
+      "planner": {
+        "model_id": "openai/gpt-oss-20b",
+        "temperature": 0.0,
+        "timeout_seconds": 30.0,
+        "max_output_tokens": 512
+      },
+      "writer": {
+        "model_id": "openai/gpt-oss-20b",
+        "temperature": 0.0,
+        "timeout_seconds": 30.0,
+        "max_output_tokens": 512
+      }
+    }
+  ],
   "providers": [
     {
       "provider": "groq",
